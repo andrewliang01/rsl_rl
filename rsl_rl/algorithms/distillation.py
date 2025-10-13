@@ -1,7 +1,20 @@
-# Copyright (c) 2021-2025, ETH Zurich and NVIDIA CORPORATION
+# Copyright (c) 2021-2024, The RSL-RL Project Developers.
+# All rights reserved.
+# Original code is licensed under the BSD-3-Clause license.
+#
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
 # All rights reserved.
 #
-# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2025-2026, The Legged Lab Project Developers.
+# All rights reserved.
+#
+# Copyright (c) 2025-2026, The TienKung-Lab Project Developers.
+# All rights reserved.
+# Modifications are licensed under the BSD-3-Clause license.
+#
+# This file contains code derived from the RSL-RL, Isaac Lab, and Legged Lab Projects,
+# with additional modifications by the TienKung-Lab Project,
+# and is distributed under the BSD-3-Clause license.
 
 # torch
 import torch
@@ -25,7 +38,6 @@ class Distillation:
         num_learning_epochs=1,
         gradient_length=15,
         learning_rate=1e-3,
-        max_grad_norm=None,
         loss_type="mse",
         device="cpu",
         # Distributed training parameters
@@ -56,7 +68,6 @@ class Distillation:
         self.num_learning_epochs = num_learning_epochs
         self.gradient_length = gradient_length
         self.learning_rate = learning_rate
-        self.max_grad_norm = max_grad_norm
 
         # initialize the loss function
         if loss_type == "mse":
@@ -129,8 +140,6 @@ class Distillation:
                     loss.backward()
                     if self.is_multi_gpu:
                         self.reduce_parameters()
-                    if self.max_grad_norm:
-                        nn.utils.clip_grad_norm_(self.policy.student.parameters(), self.max_grad_norm)
                     self.optimizer.step()
                     self.policy.detach_hidden_states()
                     loss = 0

@@ -1,7 +1,20 @@
-# Copyright (c) 2021-2025, ETH Zurich and NVIDIA CORPORATION
+# Copyright (c) 2021-2024, The RSL-RL Project Developers.
+# All rights reserved.
+# Original code is licensed under the BSD-3-Clause license.
+#
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
 # All rights reserved.
 #
-# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2025-2026, The Legged Lab Project Developers.
+# All rights reserved.
+#
+# Copyright (c) 2025-2026, The TienKung-Lab Project Developers.
+# All rights reserved.
+# Modifications are licensed under the BSD-3-Clause license.
+#
+# This file contains code derived from the RSL-RL, Isaac Lab, and Legged Lab Projects,
+# with additional modifications by the TienKung-Lab Project,
+# and is distributed under the BSD-3-Clause license.
 
 from __future__ import annotations
 
@@ -25,7 +38,6 @@ class RolloutStorage:
             self.action_sigma = None
             self.hidden_states = None
             self.rnd_state = None
-            self.next_observations = None
 
         def clear(self):
             self.__init__()
@@ -63,9 +75,6 @@ class RolloutStorage:
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
 
-        # next obs
-        self.next_observations = torch.zeros(num_transitions_per_env, num_envs, *obs_shape, device=self.device)
-
         # for distillation
         if training_type == "distillation":
             self.privileged_actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
@@ -102,9 +111,6 @@ class RolloutStorage:
         self.actions[self.step].copy_(transition.actions)
         self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
-
-        # next obs
-        self.next_observations[self.step].copy_(transition.next_observations)
 
         # for distillation
         if self.training_type == "distillation":
@@ -205,8 +211,6 @@ class RolloutStorage:
         actions = self.actions.flatten(0, 1)
         values = self.values.flatten(0, 1)
         returns = self.returns.flatten(0, 1)
-        # next obs
-        next_observations = self.next_observations.flatten(0, 1)
 
         # For PPO
         old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
@@ -231,9 +235,6 @@ class RolloutStorage:
                 privileged_observations_batch = privileged_observations[batch_idx]
                 actions_batch = actions[batch_idx]
 
-                # -- next obs
-                next_observations_batch = next_observations[batch_idx]
-
                 # -- For PPO
                 target_values_batch = values[batch_idx]
                 returns_batch = returns[batch_idx]
@@ -252,7 +253,7 @@ class RolloutStorage:
                 yield obs_batch, privileged_observations_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
                     None,
                     None,
-                ), None, rnd_state_batch, next_observations_batch
+                ), None, rnd_state_batch
 
     # for reinfrocement learning with recurrent networks
     def recurrent_mini_batch_generator(self, num_mini_batches, num_epochs=8):

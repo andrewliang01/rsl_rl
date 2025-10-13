@@ -7,5 +7,6 @@
 
 from .rollout_storage import RolloutStorage
 from .rollout_storage_nextobs import RolloutStorageNextObs
+from .replay_buffer import ReplayBuffer
 
-__all__ = ["RolloutStorage","RolloutStorageNextObs"]
+__all__ = ["RolloutStorage","RolloutStorageNextObs","ReplayBuffer"]

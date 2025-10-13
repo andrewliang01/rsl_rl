@@ -23,8 +23,8 @@ class ActorCritic(nn.Module):
         actor_hidden_dims=[256, 256, 256],
         critic_hidden_dims=[256, 256, 256],
         activation="elu",
-        init_noise_std=1.0,
-        noise_std_type: str = "scalar",
+        init_noise_std=1.0, # 动作分布初始标准差
+        noise_std_type: str = "scalar", # 标准差类型，"scalar"表示直接用数值，"log"表示用对数形式
         **kwargs,
     ):
         if kwargs:
@@ -39,6 +39,10 @@ class ActorCritic(nn.Module):
         mlp_input_dim_a = num_actor_obs
         mlp_input_dim_c = num_critic_obs
         # Policy 构建actor网络
+        # Linear(num_actor_obs，actor_hidden_dims[0]) + elu +
+        # Linear(actor_hidden_dims[0]，actor_hidden_dims[1]) + elu +
+        # Linear(actor_hidden_dims[1]，actor_hidden_dims[2]) + elu +
+        # Linear(actor_hidden_dims[2], num_actions)
         actor_layers = []
         actor_layers.append(nn.Linear(mlp_input_dim_a, actor_hidden_dims[0]))
         actor_layers.append(activation)
@@ -51,6 +55,10 @@ class ActorCritic(nn.Module):
         self.actor = nn.Sequential(*actor_layers)
 
         # Value function 构建critic网络
+        # Linear(num_critic_obs，actor_hidden_dims[0]) + elu +
+        # Linear(critic_hidden_dims[0]，critic_hidden_dims[1]) + elu +
+        # Linear(critic_hidden_dims[1]，critic_hidden_dims[2]) + elu +
+        # Linear(critic_hidden_dims[2], 1)
         critic_layers = []
         critic_layers.append(nn.Linear(mlp_input_dim_c, critic_hidden_dims[0]))
         critic_layers.append(activation)
@@ -77,7 +85,7 @@ class ActorCritic(nn.Module):
 
         # Action distribution (populated in update_distribution)
         self.distribution = None
-        # disable args validation for speedup
+        # 关闭分布参数的合法性检查，提高推理速度（默认会检查均值和标准差的有效性，关闭后更快，但需确保输入合理）
         Normal.set_default_validate_args(False)
 
     @staticmethod
@@ -123,6 +131,7 @@ class ActorCritic(nn.Module):
 
     def act(self, observations, **kwargs):
         self.update_distribution(observations)
+        # 对分布进行采样，得到动作
         return self.distribution.sample()
 
     def get_actions_log_prob(self, actions):
