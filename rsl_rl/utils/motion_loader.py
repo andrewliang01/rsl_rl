@@ -24,9 +24,9 @@ import torch
 
 
 class AMPLoader:
-    JOINT_POS_SIZE = 20
+    JOINT_POS_SIZE = 29
 
-    JOINT_VEL_SIZE = 20
+    JOINT_VEL_SIZE = 29
 
     END_EFFECTOR_POS_SIZE = 12
 
