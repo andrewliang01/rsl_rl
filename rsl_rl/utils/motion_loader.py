@@ -46,7 +46,7 @@ class AMPLoader:
         data_dir="",
         preload_transitions=False,
         num_preload_transitions=1000000,
-        motion_files=glob.glob("datasets/motion_amp_expert/*"),
+        motion_files=None,
     ):
         """Expert dataset provides AMP observations from Dog mocap dataset.
 
