@@ -206,16 +206,11 @@ class AmpOnPolicyRunner:
             )
 
         # start learning
-        # obs, extras = self.env.get_observations()
-        # privileged_obs = extras["observations"].get(self.privileged_obs_type, obs)
-        # amp_obs = self.env.get_amp_obs_for_expert_trans()
-        # obs, privileged_obs, amp_obs = obs.to(self.device), privileged_obs.to(self.device), amp_obs.to(self.device)
-            # start learning
-            obs, extras = self.env.get_observations()
-            privileged_obs = extras["observations"].get(self.privileged_obs_type, obs)
-            # -- MODIFIED: Get AMP observations from the 'extras' dictionary
-            amp_obs = extras["observations"]["amp"]
-            obs, privileged_obs, amp_obs = obs.to(self.device), privileged_obs.to(self.device), amp_obs.to(self.device)
+        obs, extras = self.env.get_observations()
+        privileged_obs = extras["observations"].get(self.privileged_obs_type, obs)
+        # -- MODIFIED: Get AMP observations from the 'extras' dictionary
+        amp_obs = extras["observations"]["amp"]
+        obs, privileged_obs, amp_obs = obs.to(self.device), privileged_obs.to(self.device), amp_obs.to(self.device)
         self.train_mode()  # switch to train mode (for dropout for example)
 
         # Book keeping
@@ -246,39 +241,6 @@ class AmpOnPolicyRunner:
             start = time.time()
             # Rollout
             with torch.inference_mode():
-                # for _ in range(self.num_steps_per_env):
-                #     # Sample actions
-                #     actions = self.alg.act(obs, privileged_obs, amp_obs)
-                #     # Step the environment
-                #     obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
-                #     next_amp_obs = self.env.get_amp_obs_for_expert_trans()
-                #     # Move to device
-                #     obs, rewards, dones, next_amp_obs = (
-                #         obs.to(self.device),
-                #         rewards.to(self.device),
-                #         dones.to(self.device),
-                #         next_amp_obs.to(self.device),
-                #     )
-                #     # perform normalization
-                #     obs = self.obs_normalizer(obs)
-                #     if self.privileged_obs_type is not None:
-                #         privileged_obs = self.privileged_obs_normalizer(
-                #             infos["observations"][self.privileged_obs_type].to(self.device)
-                #         )
-                #     else:
-                #         privileged_obs = obs
-                #
-                #     # Account for terminal state transitions
-                #     next_amp_obs_with_term = torch.clone(next_amp_obs)
-                #     reset_env_ids = self.env.reset_env_ids
-                #     terminal_amp_states = self.env.get_amp_obs_for_expert_trans()[reset_env_ids]
-                #     next_amp_obs_with_term[reset_env_ids] = terminal_amp_states
-                #
-                #     rewards = self.alg.discriminator.predict_amp_reward(
-                #         amp_obs, next_amp_obs_with_term, rewards, normalizer=self.alg.amp_normalizer
-                #     )[0]
-                #     amp_obs = torch.clone(next_amp_obs)
-                #     self.alg.process_env_step(rewards, dones, infos, next_amp_obs_with_term)
                 for _ in range(self.num_steps_per_env):
                     # Sample actions
                     actions = self.alg.act(obs, privileged_obs, amp_obs)

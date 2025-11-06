@@ -440,50 +440,6 @@ class AMPPPO:
                     policy_next_state = self.amp_normalizer.normalize_torch(policy_next_state, self.device)
                     expert_state = self.amp_normalizer.normalize_torch(expert_state, self.device)
                     expert_next_state = self.amp_normalizer.normalize_torch(expert_next_state, self.device)
-            # --- 增强版 AMP 调试代码 ---
-            # 随机采样一个 mini-batch 进行打印，避免刷屏
-            if torch.rand(1) < 0.01:
-                print("\n--- AMP DEBUG (Full State Sample) ---")
-
-                # --- 1. 策略 (Policy) 状态 ---
-                # 我们只看 batch 中的第一个样本 (sample 0)
-                p_state = policy_state[0]
-                print("POLICY State [0]:")
-
-                # 根据 motion_loader.py 的定义
-                # 关节位置 (29 dim)
-                print(f"  Joint Pos [0:29]: {p_state[0:29]}")
-                # 关节速度 (29 dim)
-                print(f"  Joint Vel [29:58]: {p_state[29:58]}")
-                # 末端执行器 (12 dim)
-                print(f"  End Eff [58:70]: {p_state[58:70]}")
-
-                # 进一步细分末端 (根据 G1_AMP_cfg.py)
-                print(f"    L-Wrist [58:61]: {p_state[58:61]}")
-                print(f"    R-Wrist [61:64]: {p_state[61:64]}")
-                print(f"    L-Ankle [64:67]: {p_state[64:67]}")
-                print(f"    R-Ankle [67:70]: {p_state[67:70]}")
-
-                # --- 2. 专家 (Expert) 状态 ---
-                # 我们只看 batch 中的第一个样本 (sample 0)
-                e_state = expert_state[0]
-                print("EXPERT State [0]:")
-
-                # 关节位置 (29 dim)
-                print(f"  Joint Pos [0:29]: {e_state[0:29]}")
-                # 关节速度 (29 dim)
-                print(f"  Joint Vel [29:58]: {e_state[29:58]}")
-                # 末端执行器 (12 dim)
-                print(f"  End Eff [58:70]: {e_state[58:70]}")
-
-                # 进一步细分末端 (根据 G1_AMP_cfg.py)
-                print(f"    L-Wrist [58:61]: {e_state[58:61]}")
-                print(f"    R-Wrist [61:64]: {e_state[61:64]}")
-                print(f"    L-Ankle [64:67]: {e_state[64:67]}")
-                print(f"    R-Ankle [67:70]: {e_state[67:70]}")
-
-                print("---------------------------------------\n")
-            # --- 调试代码结束 ---
             policy_d = self.discriminator(torch.cat([policy_state, policy_next_state], dim=-1))
             expert_d = self.discriminator(torch.cat([expert_state, expert_next_state], dim=-1))
             expert_loss = torch.nn.MSELoss()(expert_d, torch.ones(expert_d.size(), device=self.device))
