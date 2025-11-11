@@ -114,7 +114,17 @@ class AmpOnPolicyRunner:
             num_preload_transitions=train_cfg["amp_num_preload_transitions"],
             motion_files=train_cfg["amp_motion_files"],
         )
-        amp_normalizer = Normalizer(amp_data.observation_dim)
+
+        # ===== 🔧 修复：检查是否禁用 AMP 归一化器 =====
+        amp_normalize_input = train_cfg.get("amp_normalize_input", True)  # 默认为 True（向后兼容）
+        if amp_normalize_input:
+            amp_normalizer = Normalizer(amp_data.observation_dim)
+            print("[AMP Runner] ✅ AMP 归一化器已启用")
+        else:
+            amp_normalizer = None
+            print("[AMP Runner] ⚠️  AMP 归一化器已禁用 (amp_normalize_input=False)")
+        # ===== 修复结束 =====
+
         discriminator = Discriminator(
             amp_data.observation_dim * 2,
             train_cfg["amp_reward_coef"],

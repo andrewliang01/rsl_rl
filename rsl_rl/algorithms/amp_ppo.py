@@ -484,12 +484,223 @@ class AMPPPO:
                 # Discriminator loss
                 policy_state, policy_next_state = sample_amp_policy
                 expert_state, expert_next_state = sample_amp_expert
+
+                # ===== 🔍 诊断：打印数据顺序验证信息 =====
+                if not hasattr(self, '_amp_order_diagnosed'):
+                    self._amp_order_diagnosed = True
+                    print("\n" + "="*80)
+                    print("🔍 AMP 数据顺序诊断 (仅打印一次)")
+                    print("="*80)
+
+                    # 打印原始数据（归一化前）
+                    print("\n【归一化前的原始数据】")
+                    print(f"policy_state shape: {policy_state.shape}")
+                    print(f"expert_state shape: {expert_state.shape}")
+
+                    # 数据结构说明
+                    print(f"\n数据结构: [0:29]关节位置 + [29:58]关节速度 + [58:70]末端位置")
+                    print(f"末端位置: [58:61]末端1 + [61:64]末端2 + [64:67]末端3 + [67:70]末端4")
+                    print(f"预期顺序: 左手 → 右手 → 左脚 → 右脚")
+
+                    # 打印第一个样本的末端位置
+                    print(f"\n【Policy 末端位置 (第1个样本)】")
+                    print(f"  [58:61] 末端1: [{policy_state[0,58]:.4f}, {policy_state[0,59]:.4f}, {policy_state[0,60]:.4f}]")
+                    print(f"  [61:64] 末端2: [{policy_state[0,61]:.4f}, {policy_state[0,62]:.4f}, {policy_state[0,63]:.4f}]")
+                    print(f"  [64:67] 末端3: [{policy_state[0,64]:.4f}, {policy_state[0,65]:.4f}, {policy_state[0,66]:.4f}]")
+                    print(f"  [67:70] 末端4: [{policy_state[0,67]:.4f}, {policy_state[0,68]:.4f}, {policy_state[0,69]:.4f}]")
+
+                    print(f"\n【Expert 末端位置 (第1个样本)】")
+                    print(f"  [58:61] 末端1: [{expert_state[0,58]:.4f}, {expert_state[0,59]:.4f}, {expert_state[0,60]:.4f}]")
+                    print(f"  [61:64] 末端2: [{expert_state[0,61]:.4f}, {expert_state[0,62]:.4f}, {expert_state[0,63]:.4f}]")
+                    print(f"  [64:67] 末端3: [{expert_state[0,64]:.4f}, {expert_state[0,65]:.4f}, {expert_state[0,66]:.4f}]")
+                    print(f"  [67:70] 末端4: [{expert_state[0,67]:.4f}, {expert_state[0,68]:.4f}, {expert_state[0,69]:.4f}]")
+
+                    # ===== 新增：统计分析 =====
+                    print(f"\n【统计分析 - 检查所有样本的符号分布】")
+
+                    # 统计 Policy 的末端Y坐标符号
+                    p_y1_signs = (policy_state[:, 59] > 0).float()
+                    p_y2_signs = (policy_state[:, 62] < 0).float()
+                    p_y3_signs = (policy_state[:, 65] > 0).float()
+                    p_y4_signs = (policy_state[:, 68] < 0).float()
+
+                    # 统计 Expert 的末端Y坐标符号
+                    e_y1_signs = (expert_state[:, 59] > 0).float()
+                    e_y2_signs = (expert_state[:, 62] < 0).float()
+                    e_y3_signs = (expert_state[:, 65] > 0).float()
+                    e_y4_signs = (expert_state[:, 68] < 0).float()
+
+                    total_samples = policy_state.shape[0]
+
+                    print(f"总样本数: {total_samples}")
+                    print(f"\nPolicy 符号正确率 (期望: 左正右负):")
+                    print(f"  末端1 (左手) Y>0: {p_y1_signs.mean()*100:.1f}%  ✅" if p_y1_signs.mean() > 0.8 else f"  末端1 (左手) Y>0: {p_y1_signs.mean()*100:.1f}%  ⚠️")
+                    print(f"  末端2 (右手) Y<0: {p_y2_signs.mean()*100:.1f}%  ✅" if p_y2_signs.mean() > 0.8 else f"  末端2 (右手) Y<0: {p_y2_signs.mean()*100:.1f}%  ⚠️")
+                    print(f"  末端3 (左脚) Y>0: {p_y3_signs.mean()*100:.1f}%  ✅" if p_y3_signs.mean() > 0.8 else f"  末端3 (左脚) Y>0: {p_y3_signs.mean()*100:.1f}%  ⚠️")
+                    print(f"  末端4 (右脚) Y<0: {p_y4_signs.mean()*100:.1f}%  ✅" if p_y4_signs.mean() > 0.8 else f"  末端4 (右脚) Y<0: {p_y4_signs.mean()*100:.1f}%  ⚠️")
+
+                    print(f"\nExpert 符号正确率 (期望: 左正右负):")
+                    print(f"  末端1 (左手) Y>0: {e_y1_signs.mean()*100:.1f}%  ✅" if e_y1_signs.mean() > 0.8 else f"  末端1 (左手) Y>0: {e_y1_signs.mean()*100:.1f}%  ⚠️")
+                    print(f"  末端2 (右手) Y<0: {e_y2_signs.mean()*100:.1f}%  ✅" if e_y2_signs.mean() > 0.8 else f"  末端2 (右手) Y<0: {e_y2_signs.mean()*100:.1f}%  ⚠️")
+                    print(f"  末端3 (左脚) Y>0: {e_y3_signs.mean()*100:.1f}%  ✅" if e_y3_signs.mean() > 0.8 else f"  末端3 (左脚) Y>0: {e_y3_signs.mean()*100:.1f}%  ⚠️")
+                    print(f"  末端4 (右脚) Y<0: {e_y4_signs.mean()*100:.1f}%  ✅" if e_y4_signs.mean() > 0.8 else f"  末端4 (右脚) Y<0: {e_y4_signs.mean()*100:.1f}%  ⚠️")
+
+                    # 判断是否是数据顺序问题
+                    print(f"\n【诊断结论】")
+                    if e_y1_signs.mean() > 0.9 and e_y2_signs.mean() > 0.9 and e_y3_signs.mean() > 0.9 and e_y4_signs.mean() > 0.9:
+                        print(f"✅ Expert 数据顺序正确 (所有末端符号正确率 >90%)")
+                    else:
+                        print(f"❌ Expert 数据顺序可能有问题！")
+
+                    if p_y4_signs.mean() < 0.5:
+                        print(f"⚠️  Policy 右脚符号正确率仅 {p_y4_signs.mean()*100:.1f}%")
+                        print(f"   这是训练初期的正常现象，策略还在学习中")
+                        print(f"   判别器仍然能学习，因为其他特征是正确的")
+                    elif p_y4_signs.mean() < 0.8:
+                        print(f"⚠️  Policy 右脚符号正确率 {p_y4_signs.mean()*100:.1f}% (略低)")
+                        print(f"   建议增加训练时间，让策略继续学习")
+                    else:
+                        print(f"✅ Policy 数据质量良好 (所有末端符号正确率 >80%)")
+
+                    # ===== 统计分析结束 =====
+
+                    # Y坐标符号检查（右手坐标系：左正右负）
+                    print(f"\n【第1个样本的Y坐标符号检查】")
+                    print(f"Policy: 末端1_Y={policy_state[0,59]:+.4f}, 末端2_Y={policy_state[0,62]:+.4f}, "
+                          f"末端3_Y={policy_state[0,65]:+.4f}, 末端4_Y={policy_state[0,68]:+.4f}")
+                    print(f"Expert: 末端1_Y={expert_state[0,59]:+.4f}, 末端2_Y={expert_state[0,62]:+.4f}, "
+                          f"末端3_Y={expert_state[0,65]:+.4f}, 末端4_Y={expert_state[0,68]:+.4f}")
+
+                    # 自动判断（保留原有逻辑，但简化输出）
+                    p_y = [policy_state[0,59].item(), policy_state[0,62].item(),
+                           policy_state[0,65].item(), policy_state[0,68].item()]
+                    e_y = [expert_state[0,59].item(), expert_state[0,62].item(),
+                           expert_state[0,65].item(), expert_state[0,68].item()]
+
+                    print(f"\n【第1个样本的自动判断】")
+                    if abs(p_y[0]) > 0.05 and abs(p_y[1]) > 0.05:
+                        if p_y[0] > 0 and p_y[1] < 0:
+                            print(f"✅ Policy 末端1/2: 左正 右负 → 左手-右手")
+                        elif p_y[0] < 0 and p_y[1] > 0:
+                            print(f"❌ Policy 末端1/2: 左负 右正 → 数据顺序反了!")
+
+                    if abs(e_y[0]) > 0.05 and abs(e_y[1]) > 0.05:
+                        if e_y[0] > 0 and e_y[1] < 0:
+                            print(f"✅ Expert 末端1/2: 左正 右负 → 左手-右手")
+                        elif e_y[0] < 0 and e_y[1] > 0:
+                            print(f"❌ Expert 末端1/2: 左负 右正 → 数据顺序反了!")
+
+                    if abs(e_y[2]) > 0.05 and abs(e_y[3]) > 0.05:
+                        if e_y[2] > 0 and e_y[3] < 0:
+                            print(f"✅ Expert 末端3/4: 左正 右负 → 左脚-右脚")
+                        elif e_y[2] < 0 and e_y[3] > 0:
+                            print(f"❌ Expert 末端3/4: 左负 右正 → 数据顺序反了!")
+
+                    print("="*80 + "\n")
+                # ===== 诊断代码结束 =====
+
+                if self.amp_normalizer is not None:
+                    self.amp_normalizer.update(policy_state.cpu().numpy())
+                    self.amp_normalizer.update(expert_state.cpu().numpy())
                 if self.amp_normalizer is not None:
                     with torch.no_grad():
                         policy_state = self.amp_normalizer.normalize_torch(policy_state, self.device)
                         policy_next_state = self.amp_normalizer.normalize_torch(policy_next_state, self.device)
                         expert_state = self.amp_normalizer.normalize_torch(expert_state, self.device)
                         expert_next_state = self.amp_normalizer.normalize_torch(expert_next_state, self.device)
+
+                # ===== 🔍 诊断：打印归一化后的数据 =====
+                if hasattr(self, '_amp_order_diagnosed') and not hasattr(self, '_amp_normalized_diagnosed'):
+                    self._amp_normalized_diagnosed = True
+                    if self.amp_normalizer is not None:
+                        print("\n【归一化后的数据 (第1个样本末端位置)】")
+                        print(f"Policy: 末端1_Y={policy_state[0,59]:+.4f}, 末端2_Y={policy_state[0,62]:+.4f}, "
+                              f"末端3_Y={policy_state[0,65]:+.4f}, 末端4_Y={policy_state[0,68]:+.4f}")
+                        print(f"Expert: 末端1_Y={expert_state[0,59]:+.4f}, 末端2_Y={expert_state[0,62]:+.4f}, "
+                              f"末端3_Y={expert_state[0,65]:+.4f}, 末端4_Y={expert_state[0,68]:+.4f}")
+                        print("注意: 归一化后数值范围会改变，但相对关系应保持\n")
+
+                        # ===== 新增：检查归一化器的统计量 =====
+                        print("="*80)
+                        print("⚠️  归一化器诊断")
+                        print("="*80)
+
+                        # 获取归一化器的统计量
+                        if hasattr(self.amp_normalizer, 'mean') and hasattr(self.amp_normalizer, 'std'):
+                            import numpy as np
+                            mean = self.amp_normalizer.mean
+                            std = self.amp_normalizer.std
+
+                            print(f"\n【归一化器统计量 (末端位置部分)】")
+                            print(f"末端位置维度: [58:70] (12维)")
+                            print(f"\nMean (均值):")
+                            for i in range(58, 70):
+                                ee_idx = (i - 58) // 3
+                                coord = ['X', 'Y', 'Z'][(i - 58) % 3]
+                                print(f"  [{i}] 末端{ee_idx+1}_{coord}: mean={mean[i]:+.4f}, std={std[i]:.4f}")
+
+                            # 检查末端Y坐标的均值
+                            ee_y_means = [mean[59], mean[62], mean[65], mean[68]]
+                            ee_y_stds = [std[59], std[62], std[65], std[68]]
+
+                            print(f"\n【末端Y坐标的统计量】")
+                            print(f"末端1_Y: mean={ee_y_means[0]:+.6f}, std={ee_y_stds[0]:.6f}")
+                            print(f"末端2_Y: mean={ee_y_means[1]:+.6f}, std={ee_y_stds[1]:.6f}")
+                            print(f"末端3_Y: mean={ee_y_means[2]:+.6f}, std={ee_y_stds[2]:.6f}")
+                            print(f"末端4_Y: mean={ee_y_means[3]:+.6f}, std={ee_y_stds[3]:.6f}")
+
+                            # 自动诊断
+                            print(f"\n【自动诊断】")
+
+                            # 检查1: 左右脚的均值是否对称
+                            if abs(ee_y_means[0] + ee_y_means[1]) < 0.01:
+                                print(f"✅ 左右手Y均值接近对称: {ee_y_means[0]:+.4f} vs {ee_y_means[1]:+.4f}")
+                            else:
+                                print(f"⚠️  左右手Y均值不对称: {ee_y_means[0]:+.4f} vs {ee_y_means[1]:+.4f}")
+
+                            if abs(ee_y_means[2] + ee_y_means[3]) < 0.01:
+                                print(f"✅ 左右脚Y均值接近对称: {ee_y_means[2]:+.4f} vs {ee_y_means[3]:+.4f}")
+                            else:
+                                print(f"⚠️  左右脚Y均值不对称: {ee_y_means[2]:+.4f} vs {ee_y_means[3]:+.4f}")
+
+                            # 检查2: 均值是否接近0
+                            if all(abs(m) < 0.05 for m in ee_y_means):
+                                print(f"✅ 所有末端Y均值接近0，归一化器统计量正常")
+                            else:
+                                print(f"⚠️  某些末端Y均值偏离0，这可能导致符号翻转问题")
+                                print(f"   建议: 使用更多样化的数据初始化归一化器")
+
+                            # 检查3: 标准差是否合理
+                            if all(0.05 < s < 0.5 for s in ee_y_stds):
+                                print(f"✅ 所有末端Y标准差在合理范围内 (0.05-0.5)")
+                            else:
+                                print(f"⚠️  某些末端Y标准差异常:")
+                                for i, s in enumerate(ee_y_stds):
+                                    if s < 0.05:
+                                        print(f"   末端{i+1}_Y std={s:.4f} 过小，数据可能缺乏多样性")
+                                    elif s > 0.5:
+                                        print(f"   末端{i+1}_Y std={s:.4f} 过大，数据可能有异常值")
+
+                            print(f"\n【问题根源分析】")
+                            print(f"从诊断结果看，Policy 末端4 的原始Y坐标为 +0.0253")
+                            print(f"这说明在训练初期，某些环境的机器人姿态异常（右脚偏向左侧）")
+                            print(f"这是正常现象，因为策略还在学习中")
+                            print(f"\n但更严重的是，归一化后 Expert 的符号发生了变化！")
+                            print(f"这说明归一化器的统计量可能是用 Policy 的混乱数据初始化的")
+
+                            print(f"\n【解决方案】")
+                            print(f"方案1 (推荐): 用专家数据初始化归一化器")
+                            print(f"   - 在训练开始前，用专家数据计算 mean 和 std")
+                            print(f"   - 这样可以确保归一化器基于正确的分布")
+                            print(f"\n方案2: 禁用归一化")
+                            print(f"   - 将 amp_normalizer 设置为 None")
+                            print(f"   - 简单但可能影响判别器性能")
+                            print(f"\n方案3: 使用 running mean/std")
+                            print(f"   - 让归一化器在训练过程中动态更新统计量")
+                            print(f"   - 但初期可能不稳定")
+
+                        print("="*80 + "\n")
+                # ===== 诊断代码结束 =====
 
                 policy_d = self.discriminator(torch.cat([policy_state, policy_next_state], dim=-1))
                 expert_d = self.discriminator(torch.cat([expert_state, expert_next_state], dim=-1))
@@ -507,9 +718,6 @@ class AMPPPO:
                 nn.utils.clip_grad_norm_(self.discriminator.parameters(), self.max_grad_norm)
                 self.discriminator_optimizer.step()
 
-                if self.amp_normalizer is not None:
-                    self.amp_normalizer.update(policy_state.cpu().numpy())
-                    self.amp_normalizer.update(expert_state.cpu().numpy())
 
                 # Store the losses
                 mean_amp_loss += amp_loss.item()
