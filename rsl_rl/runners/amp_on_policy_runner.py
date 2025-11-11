@@ -131,6 +131,8 @@ class AmpOnPolicyRunner:
             discriminator,
             amp_data,
             amp_normalizer,
+            amp_loss_scale=train_cfg["amp_loss_scale"],
+            amp_grad_pen_scale=train_cfg["amp_grad_pen_scale"],
             device=self.device,
             min_std=min_std,
             **self.alg_cfg,
@@ -220,6 +222,12 @@ class AmpOnPolicyRunner:
         cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
 
+        # amp_reward&&task_reward buffer -- ADDED
+        amprewbuffer = deque(maxlen=100)
+        taskrewbuffer = deque(maxlen=100)
+        cur_amp_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+        cur_task_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+
         # create buffers for logging extrinsic and intrinsic rewards
         if self.alg.rnd:
             erewbuffer = deque(maxlen=100)
@@ -270,9 +278,9 @@ class AmpOnPolicyRunner:
                     # The complex logic for terminal states is no longer needed.
                     next_amp_obs_with_term = next_amp_obs
 
-                    rewards = self.alg.discriminator.predict_amp_reward(
+                    rewards,_, amp_rewards, task_rewards = self.alg.discriminator.predict_amp_reward(
                         amp_obs, next_amp_obs_with_term, rewards, normalizer=self.alg.amp_normalizer
-                    )[0]
+                    )
                     amp_obs = torch.clone(next_amp_obs)
                     self.alg.process_env_step(rewards, dones, infos, next_amp_obs_with_term)
 
@@ -292,6 +300,8 @@ class AmpOnPolicyRunner:
                             cur_reward_sum += rewards + intrinsic_rewards
                         else:
                             cur_reward_sum += rewards
+                            cur_amp_reward_sum += amp_rewards
+                            cur_task_reward_sum += task_rewards
                         # Update episode length
                         cur_episode_length += 1
                         # Clear data for completed episodes
@@ -307,6 +317,11 @@ class AmpOnPolicyRunner:
                             irewbuffer.extend(cur_ireward_sum[new_ids][:, 0].cpu().numpy().tolist())
                             cur_ereward_sum[new_ids] = 0
                             cur_ireward_sum[new_ids] = 0
+                            # --- ADDED ---
+                        amprewbuffer.extend(cur_amp_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                        taskrewbuffer.extend(cur_task_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                        cur_amp_reward_sum[new_ids] = 0
+                        cur_task_reward_sum[new_ids] = 0
 
                 stop = time.time()
                 collection_time = stop - start
@@ -401,8 +416,19 @@ class AmpOnPolicyRunner:
                 self.writer.add_scalar("Rnd/weight", self.alg.rnd.weight, locs["it"])
             # everything else
             self.writer.add_scalar("Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"])
+            # 仅当 amprewbuffer 中有数据时才记录 (即 RND 未激活时)
+            if len(locs["amprewbuffer"]) > 0:
+                self.writer.add_scalar("Train/mean_amp_reward", statistics.mean(locs["amprewbuffer"]), locs["it"])
+            if len(locs["taskrewbuffer"]) > 0:
+                self.writer.add_scalar("Train/mean_task_reward", statistics.mean(locs["taskrewbuffer"]), locs["it"])
             self.writer.add_scalar("Train/mean_episode_length", statistics.mean(locs["lenbuffer"]), locs["it"])
             if self.logger_type != "wandb":  # wandb does not support non-integer x-axis logging
+                if len(locs["amprewbuffer"]) > 0:
+                    self.writer.add_scalar("Train/mean_amp_reward/time", statistics.mean(locs["amprewbuffer"]),
+                                           self.tot_time)
+                if len(locs["taskrewbuffer"]) > 0:
+                    self.writer.add_scalar("Train/mean_task_reward/time", statistics.mean(locs["taskrewbuffer"]),
+                                           self.tot_time)
                 self.writer.add_scalar("Train/mean_reward/time", statistics.mean(locs["rewbuffer"]), self.tot_time)
                 self.writer.add_scalar(
                     "Train/mean_episode_length/time", statistics.mean(locs["lenbuffer"]), self.tot_time
@@ -427,6 +453,10 @@ class AmpOnPolicyRunner:
                     f"""{'Mean extrinsic reward:':>{pad}} {statistics.mean(locs['erewbuffer']):.2f}\n"""
                     f"""{'Mean intrinsic reward:':>{pad}} {statistics.mean(locs['irewbuffer']):.2f}\n"""
                 )
+            if len(locs["amprewbuffer"]) > 0:
+                log_string += f"""{'Mean AMP reward:':>{pad}} {statistics.mean(locs['amprewbuffer']):.2f}\n"""
+            if len(locs["taskrewbuffer"]) > 0:
+                log_string += f"""{'Mean Task reward:':>{pad}} {statistics.mean(locs['taskrewbuffer']):.2f}\n"""
             log_string += f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
             # -- episode info
             log_string += f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n"""

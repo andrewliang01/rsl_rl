@@ -184,12 +184,9 @@ class AMPLoader:
         for traj_idx in set(traj_idxs):
             trajectory = self.trajectories_full[traj_idx]
             traj_mask = traj_idxs == traj_idx
-            all_frame_amp_starts[traj_mask] = trajectory[idx_low[traj_mask]][
-                :, AMPLoader.JOINT_POSE_START_IDX : AMPLoader.END_POS_END_IDX
-            ]
-            all_frame_amp_ends[traj_mask] = trajectory[idx_high[traj_mask]][
-                :, AMPLoader.JOINT_POSE_START_IDX : AMPLoader.END_POS_END_IDX
-            ]
+            # 🔧 修复：先切片特征维度，再用索引选择对应的帧
+            all_frame_amp_starts[traj_mask] = trajectory[idx_low[traj_mask], AMPLoader.JOINT_POSE_START_IDX : AMPLoader.END_POS_END_IDX]
+            all_frame_amp_ends[traj_mask] = trajectory[idx_high[traj_mask], AMPLoader.JOINT_POSE_START_IDX : AMPLoader.END_POS_END_IDX]
         blend = torch.tensor(p * n - idx_low, device=self.device, dtype=torch.float32).unsqueeze(-1)
 
         amp_blend = self.slerp(all_frame_amp_starts, all_frame_amp_ends, blend)

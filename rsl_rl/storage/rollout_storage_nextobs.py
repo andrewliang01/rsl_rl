@@ -22,6 +22,7 @@ class RolloutStorageNextObs(RolloutStorage):
             self.dones = None
             self.values = None
             self.actions_log_prob = None
+            self.actions_log_prob = None
             self.action_mean = None
             self.action_sigma = None
             self.hidden_states = None

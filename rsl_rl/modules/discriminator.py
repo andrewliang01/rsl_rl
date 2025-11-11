@@ -123,9 +123,9 @@ class Discriminator(nn.Module):
             d = self.amp_linear(self.trunk(torch.cat([state, next_state], dim=-1)))
             reward = self.amp_reward_coef * torch.clamp(1 - (1 / 4) * torch.square(d - 1), min=0)
             if self.task_reward_lerp > 0:
-                reward = self._lerp_reward(reward, task_reward.unsqueeze(-1))
+                reward, disc_r, task_r= self._lerp_reward(reward, task_reward.unsqueeze(-1))
             self.train()
-        return reward.squeeze(), d
+        return reward.squeeze(), d, disc_r.squeeze(), task_r.squeeze()
 
     def _lerp_reward(self, disc_r, task_r):
         """
@@ -139,4 +139,6 @@ class Discriminator(nn.Module):
             torch.Tensor: Interpolated reward.
         """
         r = (1.0 - self.task_reward_lerp) * disc_r + self.task_reward_lerp * task_r
-        return r
+        disc_r = (1.0 - self.task_reward_lerp) * disc_r
+        task_r = self.task_reward_lerp * task_r
+        return r, disc_r, task_r

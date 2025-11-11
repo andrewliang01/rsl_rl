@@ -45,6 +45,10 @@ class AMPPPO:
         amp_normalizer,
         amp_replay_buffer_size=100000,
         min_std=None,
+        amp_loss_scale=1.0,
+        amp_grad_pen_scale=10.0,
+        amp_discriminator_learning_rate=None,  # 判别器独立学习率
+        amp_discriminator_update_freq=1,  # 判别器更新频率
         # --------- AMP components END---------
         num_learning_epochs=1,
         num_mini_batches=1,
@@ -111,7 +115,8 @@ class AMPPPO:
             self.symmetry = None
 
         # --------- AMP 判别器 ---------
-        self.amploss_coef = 1.0
+        self.amploss_coef = amp_loss_scale  #1.0
+        self.amp_grad_pen_scale = amp_grad_pen_scale  #10.0
         self.min_std = min_std
         self.discriminator = discriminator
         self.discriminator.to(self.device)
@@ -120,17 +125,32 @@ class AMPPPO:
         self.amp_data = amp_data
         self.amp_normalizer = amp_normalizer
 
+        # 判别器更新频率控制
+        self.amp_discriminator_update_freq = amp_discriminator_update_freq
+        self.amp_update_counter = 0  # 用于跟踪更新次数
+
         # PPO components
         self.policy = policy
         self.policy.to(self.device)
         # Create optimizer
-        # --------- 优化器准备参数列表 ---------
-        params = [
-            {"params": self.policy.parameters(), "name": "policy"},
-            {"params": self.discriminator.trunk.parameters(), "weight_decay": 10e-4, "name": "amp_trunk"},
-            {"params": self.discriminator.amp_linear.parameters(), "weight_decay": 10e-2, "name": "amp_head"},
+        # --------- 分离优化器：策略使用独立的优化器 ---------
+        self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+
+        # --------- 判别器使用独立的优化器和学习率 ---------
+        # 如果没有指定判别器学习率，则使用策略学习率
+        discriminator_lr = amp_discriminator_learning_rate if amp_discriminator_learning_rate is not None else learning_rate
+        discriminator_params = [
+            {"params": self.discriminator.trunk.parameters(), "weight_decay": 10e-4},
+            {"params": self.discriminator.amp_linear.parameters(), "weight_decay": 10e-2},
         ]
-        self.optimizer = optim.Adam(params, lr=learning_rate)
+        self.discriminator_optimizer = optim.Adam(discriminator_params, lr=discriminator_lr)
+        self.discriminator_learning_rate = discriminator_lr
+
+        # 打印学习率信息
+        print(f"[AMP PPO] Policy learning rate: {learning_rate}")
+        print(f"[AMP PPO] Discriminator learning rate: {discriminator_lr}")
+        print(f"[AMP PPO] Discriminator update frequency: 1/{amp_discriminator_update_freq}")
+
         # Create rollout storage
         self.storage: RolloutStorage = None  # type: ignore
         self.transition = RolloutStorage.Transition()
@@ -385,7 +405,8 @@ class AMPPPO:
             else:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
-            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+            # --------- 策略损失（PPO）：不包含判别器损失 ---------
+            ppo_loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
             # Symmetry loss
             if self.symmetry:
@@ -418,7 +439,7 @@ class AMPPPO:
                 )
                 # add the loss to the total loss
                 if self.symmetry["use_mirror_loss"]:
-                    loss += self.symmetry["mirror_loss_coeff"] * symmetry_loss
+                    ppo_loss += self.symmetry["mirror_loss_coeff"] * symmetry_loss
                 else:
                     symmetry_loss = symmetry_loss.detach()
 
@@ -430,57 +451,99 @@ class AMPPPO:
                 # compute the loss as the mean squared error
                 mseloss = torch.nn.MSELoss()
                 rnd_loss = mseloss(predicted_embedding, target_embedding)
+            else:
+                rnd_loss = None
 
-            # Discriminator loss.
-            policy_state, policy_next_state = sample_amp_policy
-            expert_state, expert_next_state = sample_amp_expert
-            if self.amp_normalizer is not None:
-                with torch.no_grad():
-                    policy_state = self.amp_normalizer.normalize_torch(policy_state, self.device)
-                    policy_next_state = self.amp_normalizer.normalize_torch(policy_next_state, self.device)
-                    expert_state = self.amp_normalizer.normalize_torch(expert_state, self.device)
-                    expert_next_state = self.amp_normalizer.normalize_torch(expert_next_state, self.device)
-            policy_d = self.discriminator(torch.cat([policy_state, policy_next_state], dim=-1))
-            expert_d = self.discriminator(torch.cat([expert_state, expert_next_state], dim=-1))
-            expert_loss = torch.nn.MSELoss()(expert_d, torch.ones(expert_d.size(), device=self.device))
-            policy_loss = torch.nn.MSELoss()(policy_d, -1 * torch.ones(policy_d.size(), device=self.device))
-            amp_loss = 0.5 * (expert_loss + policy_loss)
-            grad_pen_loss = self.discriminator.compute_grad_pen(*sample_amp_expert, lambda_=10)
-            loss += self.amploss_coef * amp_loss + self.amploss_coef * grad_pen_loss
-
-            # Compute the gradients
-            # -- For PPO
+            # ========== 第一步：更新策略网络（Actor-Critic） ==========
             self.optimizer.zero_grad()
-            loss.backward()
+            ppo_loss.backward()
+
             # -- For RND
-            if self.rnd:
-                self.rnd_optimizer.zero_grad()  # type: ignore
+            if self.rnd and rnd_loss is not None:
+                self.rnd_optimizer.zero_grad()
                 rnd_loss.backward()
 
             # Collect gradients from all GPUs
             if self.is_multi_gpu:
                 self.reduce_parameters()
 
-            # Apply the gradients
-            # -- For PPO
+            # Apply the gradients for policy
             nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
             self.optimizer.step()
+
             # -- For RND
             if self.rnd_optimizer:
                 self.rnd_optimizer.step()
 
-            if self.amp_normalizer is not None:
-                self.amp_normalizer.update(policy_state.cpu().numpy())
-                self.amp_normalizer.update(expert_state.cpu().numpy())
+            # ========== 第二步：独立更新判别器（根据更新频率） ==========
+            # 判别器更新频率控制：只在特定的迭代中更新判别器
+            self.amp_update_counter += 1
+            should_update_discriminator = (self.amp_update_counter % self.amp_discriminator_update_freq == 0)
 
-            # Store the losses
+            if should_update_discriminator:
+                # Discriminator loss
+                policy_state, policy_next_state = sample_amp_policy
+                expert_state, expert_next_state = sample_amp_expert
+                if self.amp_normalizer is not None:
+                    with torch.no_grad():
+                        policy_state = self.amp_normalizer.normalize_torch(policy_state, self.device)
+                        policy_next_state = self.amp_normalizer.normalize_torch(policy_next_state, self.device)
+                        expert_state = self.amp_normalizer.normalize_torch(expert_state, self.device)
+                        expert_next_state = self.amp_normalizer.normalize_torch(expert_next_state, self.device)
+
+                policy_d = self.discriminator(torch.cat([policy_state, policy_next_state], dim=-1))
+                expert_d = self.discriminator(torch.cat([expert_state, expert_next_state], dim=-1))
+                expert_loss = torch.nn.MSELoss()(expert_d, torch.ones(expert_d.size(), device=self.device))
+                policy_loss = torch.nn.MSELoss()(policy_d, -1 * torch.ones(policy_d.size(), device=self.device))
+                amp_loss = 0.5 * (expert_loss + policy_loss)
+                grad_pen_loss = self.discriminator.compute_grad_pen(*sample_amp_expert, lambda_=self.amp_grad_pen_scale)
+
+                # 判别器的总损失
+                discriminator_loss = self.amploss_coef * amp_loss + self.amploss_coef * grad_pen_loss
+
+                # 更新判别器
+                self.discriminator_optimizer.zero_grad()
+                discriminator_loss.backward()
+                nn.utils.clip_grad_norm_(self.discriminator.parameters(), self.max_grad_norm)
+                self.discriminator_optimizer.step()
+
+                if self.amp_normalizer is not None:
+                    self.amp_normalizer.update(policy_state.cpu().numpy())
+                    self.amp_normalizer.update(expert_state.cpu().numpy())
+
+                # Store the losses
+                mean_amp_loss += amp_loss.item()
+                mean_grad_pen_loss += grad_pen_loss.item()
+                mean_policy_pred += policy_d.mean().item()
+                mean_expert_pred += expert_d.mean().item()
+            else:
+                # 如果不更新判别器，仍然需要计算判别器输出用于记录（可选）
+                with torch.no_grad():
+                    policy_state, policy_next_state = sample_amp_policy
+                    expert_state, expert_next_state = sample_amp_expert
+                    if self.amp_normalizer is not None:
+                        policy_state = self.amp_normalizer.normalize_torch(policy_state, self.device)
+                        policy_next_state = self.amp_normalizer.normalize_torch(policy_next_state, self.device)
+                        expert_state = self.amp_normalizer.normalize_torch(expert_state, self.device)
+                        expert_next_state = self.amp_normalizer.normalize_torch(expert_next_state, self.device)
+
+                    policy_d = self.discriminator(torch.cat([policy_state, policy_next_state], dim=-1))
+                    expert_d = self.discriminator(torch.cat([expert_state, expert_next_state], dim=-1))
+                    expert_loss = torch.nn.MSELoss()(expert_d, torch.ones(expert_d.size(), device=self.device))
+                    policy_loss = torch.nn.MSELoss()(policy_d, -1 * torch.ones(policy_d.size(), device=self.device))
+                    amp_loss = 0.5 * (expert_loss + policy_loss)
+                    grad_pen_loss = torch.tensor(0.0, device=self.device)  # 不计算梯度惩罚
+
+                    # Store the losses for logging
+                    mean_amp_loss += amp_loss.item()
+                    mean_grad_pen_loss += grad_pen_loss.item()
+                    mean_policy_pred += policy_d.mean().item()
+                    mean_expert_pred += expert_d.mean().item()
+
+            # Store other losses
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy_batch.mean().item()
-            mean_amp_loss += amp_loss.item()
-            mean_grad_pen_loss += grad_pen_loss.item()
-            mean_policy_pred += policy_d.mean().item()
-            mean_expert_pred += expert_d.mean().item()
             # -- RND loss
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()
