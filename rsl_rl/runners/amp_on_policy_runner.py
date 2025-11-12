@@ -143,6 +143,7 @@ class AmpOnPolicyRunner:
             amp_normalizer,
             amp_loss_scale=train_cfg["amp_loss_scale"],
             amp_grad_pen_scale=train_cfg["amp_grad_pen_scale"],
+            amp_discriminator_learning_rate=train_cfg["amp_discriminator_learning_rate"],
             device=self.device,
             min_std=min_std,
             **self.alg_cfg,
