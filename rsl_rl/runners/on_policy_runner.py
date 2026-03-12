@@ -33,6 +33,7 @@ from rsl_rl.modules import (
     ActorCriticMode13A3,
     ActorCriticMode13A4,
     ActorCriticMode13A5,
+    ActorCriticAweNet,
     # ActorCritic_DeltaSine,
     AMPDiscriminator,
     resolve_rnd_config,
@@ -58,6 +59,7 @@ ActorCriticType = (
     | ActorCriticMode13A3
     | ActorCriticMode13A4
     | ActorCriticMode13A5
+    | ActorCriticAweNet
 )
 
 

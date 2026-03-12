@@ -33,6 +33,9 @@ from .actor_critic_mode13A3 import ActorCriticMode13A3
 from .actor_critic_mode13A4 import ActorCriticMode13A4
 from .actor_critic_mode13A5 import ActorCriticMode13A5
 
+# AweNet: 基于跨模态注意力机制的网络
+from .actor_critic_AweNet import ActorCriticAweNet
+
 __all__ = [
     "ActorCritic",
     "ActorCriticRecurrent",
@@ -62,4 +65,7 @@ __all__ = [
     "ActorCriticMode13A3",
     "ActorCriticMode13A4",
     "ActorCriticMode13A5",
+    
+    # AweNet: 基于跨模态注意力机制的网络
+    "ActorCriticAweNet",
 ]
