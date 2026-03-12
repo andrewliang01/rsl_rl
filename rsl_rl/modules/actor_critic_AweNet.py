@@ -340,7 +340,17 @@ class ActorCriticAweNet(nn.Module):
         print(f"[AweNet] Actor MLP: {self.actor}")
 
         # ============ Critic网络 ============
-        # Critic使用简化版：直接用CNN提取地形特征 + 本体特权观测
+        # Critic复用Actor的前半部分架构
+        # 1. 本体特权观测编码器
+        self.proprio_encoder_critic = MLP(
+            num_critic_obs,
+            proprio_embed_dim,
+            proprio_encoder_hidden_dims,
+            activation,
+        )
+        print(f"[AweNet] Critic Proprio Encoder: {num_critic_obs} -> {proprio_embed_dim}")
+        
+        # 2. 地形编码器（共享结构，独立参数）
         self.terrain_encoder_critic = TerrainEncoder(
             in_channels=elevation_history_length,
             cnn_hidden_dims=critic_terrain_cnn_hidden_dims,
@@ -350,9 +360,18 @@ class ActorCriticAweNet(nn.Module):
             vision_spatial_size=vision_spatial_size,
         )
         
-        critic_input_dim = num_critic_obs + feature_dim
+        # 3. 注意力地图编码器（共享结构，独立参数）
+        self.attention_encoder_critic = AttentionMapEncoder(
+            proprio_dim=proprio_embed_dim,
+            feature_dim=feature_dim,
+            num_heads=attention_num_heads,
+            dropout=attention_dropout,
+        )
+        
+        # 4. Critic价值解码器
+        critic_input_dim = proprio_embed_dim + feature_dim
         self.critic = MLP(critic_input_dim, 1, critic_hidden_dims, activation)
-        print(f"[AweNet] Critic: {critic_input_dim} (proprio: {num_critic_obs} + terrain_feature: {feature_dim}) -> 1")
+        print(f"[AweNet] Critic Value Decoder: {critic_input_dim} (proprio_embed: {proprio_embed_dim} + map_embed: {feature_dim}) -> 1")
         print(f"[AweNet] Critic MLP: {self.critic}")
         
         # Critic观测归一化
@@ -441,13 +460,14 @@ class ActorCriticAweNet(nn.Module):
         """归一化多帧高程图历史
         
         Args:
-            height_map: [B, T, H, W] 高程图历史
+            height_map: [B, T, H, W] 高程图历史（相对于机器人的高度）
         
         Returns:
             归一化后的高程图
         """
-        height_map_mean = height_map.mean(dim=(-2, -1), keepdim=True)  # [B, T, 1, 1]
-        height_map = torch.clip((height_map - height_map_mean) / 0.6, -3.0, 3.0)
+        # 不减均值，保留相对高度信息（楼梯台阶高度等）
+        # 直接用固定scale归一化，让±0.3m映射到±1.0
+        height_map = torch.clip(height_map / 0.3, -3.0, 3.0)
         return height_map
 
     def _check_height_map_shape(self, height_map: torch.Tensor, obs_key: str) -> None:
@@ -534,10 +554,11 @@ class ActorCriticAweNet(nn.Module):
     def evaluate(self, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
         """评估状态价值
         
-        Critic Pipeline:
-        1. 本体特权观测 -> 归一化
-        2. 高程图 -> Terrain Encoder -> Global Features
-        3. [Proprio + Global Features] -> Critic MLP -> Value
+        Critic Pipeline (复用Actor架构):
+        1. 本体特权观测 -> MLP Encoder -> Proprioception Embedding
+        2. 高程图 -> Terrain Encoder -> Pointwise Features + Global Features
+        3. Cross-Attention -> Map Embedding
+        4. [Proprio Embedding + Map Embedding] -> Value Decoder -> Value
         """
         # 提取观测
         height_map = obs["height_scan_critic"]  # [B, T, H, W]
@@ -548,11 +569,21 @@ class ActorCriticAweNet(nn.Module):
         height_map = self._normalize_elevation_map(height_map)
         proprio_obs = self.critic_obs_normalizer(proprio_obs)
         
-        # 地形特征提取（只需要全局特征）
-        _, global_features = self.terrain_encoder_critic(height_map)  # [B, feature_dim]
+        # 模块一：本体特权观测编码
+        proprio_embedding = self.proprio_encoder_critic(proprio_obs)  # [B, proprio_embed_dim]
         
-        # 融合特征
-        fused_features = torch.cat([proprio_obs, global_features], dim=-1)
+        # 模块二：地形特征提取
+        pointwise_features, global_features = self.terrain_encoder_critic(height_map)
+        # pointwise_features: [B, Seq_Len, feature_dim]
+        # global_features: [B, feature_dim]
+        
+        # 模块三：注意力地图编码
+        map_embedding = self.attention_encoder_critic(
+            proprio_embedding, pointwise_features, global_features
+        )  # [B, feature_dim]
+        
+        # 模块四：价值解码
+        fused_features = torch.cat([proprio_embedding, map_embedding], dim=-1)
         
         # Critic输出
         value = self.critic(fused_features)
