@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import inspect
 import statistics
 import time
 import torch
@@ -101,6 +102,22 @@ class OnPolicyRunner:
         self.tot_time = 0
         self.current_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__]
+        # Support both env.step(actions) and env.step(actions, extra_info) wrappers.
+        self._env_step_accepts_extra_info = self._detect_env_step_extra_info_support()
+
+    def _detect_env_step_extra_info_support(self) -> bool:
+        """Return whether env.step supports an extra_info positional argument."""
+        step_signature = inspect.signature(self.env.step)
+        params = list(step_signature.parameters.values())
+        # Bound methods exclude `self`, so 2 positional params means (actions, extra_info).
+        positional_params = [
+            p
+            for p in params
+            if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        ]
+        if any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params):
+            return True
+        return len(positional_params) >= 2
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
         # Initialize writer
@@ -157,7 +174,11 @@ class OnPolicyRunner:
                     # Sample actions
                     actions, extra_info = self.alg.act(obs, rewards)
                     # Step the environment
-                    obs, rewards, dones, extras = self.env.step(actions.to(self.env.device), extra_info)
+                    actions = actions.to(self.env.device)
+                    if self._env_step_accepts_extra_info:
+                        obs, rewards, dones, extras = self.env.step(actions, extra_info)
+                    else:
+                        obs, rewards, dones, extras = self.env.step(actions)
                     # Move to device
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
                     # 保存下一次观测值
