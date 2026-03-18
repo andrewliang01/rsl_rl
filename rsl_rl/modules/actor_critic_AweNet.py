@@ -613,3 +613,175 @@ class ActorCriticAweNet(nn.Module):
         
         optimizer = optim.Adam(self.parameters(), lr=learning_rate)
         return {"optimizer": optimizer}
+
+    def export_to_onnx(self, path: str, filename: str = "AweNet_policy.onnx", normalizer: torch.nn.Module | None = None, verbose: bool = False) -> None:
+        """将AweNet策略导出为ONNX格式
+        
+        Args:
+            path: 保存目录的路径
+            filename: 导出的ONNX文件名，默认为"AweNet_policy.onnx"
+            normalizer: 归一化模块，如果为None则使用Identity
+            verbose: 是否打印模型摘要，默认为False
+        """
+        import copy
+        import os
+        
+        if not os.path.exists(path):
+            os.makedirs(path, exist_ok=True)
+            
+        # 创建AweNet专用的导出器
+        exporter = _AweNetOnnxPolicyExporter(self, normalizer, verbose)
+        exporter.export(path, filename)
+
+
+class _AweNetOnnxPolicyExporter(torch.nn.Module):
+    """AweNet策略的ONNX导出器
+    
+    AweNet的推理流程:
+    1. 从合并输入中分离：本体观测 + 高程图历史
+    2. 本体编码：proprio_obs -> proprio_encoder -> proprio_embedding
+    3. 地形编码：height_map -> terrain_encoder -> pointwise_features + global_features
+    4. 注意力编码：proprio_embedding + features -> attention_encoder -> map_embedding
+    5. Actor推理：[proprio_embedding + map_embedding] -> actor -> actions
+    """
+
+    def __init__(self, policy: ActorCriticAweNet, normalizer=None, verbose=False):
+        super().__init__()
+        self.verbose = verbose
+        
+        # 复制策略所需的模块
+        # 本体编码器
+        if hasattr(policy, "proprio_encoder_actor"):
+            self.proprio_encoder_actor = copy.deepcopy(policy.proprio_encoder_actor)
+        
+        # 地形编码器
+        if hasattr(policy, "terrain_encoder_actor"):
+            self.terrain_encoder_actor = copy.deepcopy(policy.terrain_encoder_actor)
+        
+        # 注意力编码器
+        if hasattr(policy, "attention_encoder_actor"):
+            self.attention_encoder_actor = copy.deepcopy(policy.attention_encoder_actor)
+        
+        # Actor网络
+        if hasattr(policy, "actor"):
+            self.actor = copy.deepcopy(policy.actor)
+        
+        # 保存维度信息
+        self.vision_spatial_size = policy.vision_spatial_size
+        self.elevation_history_length = policy.elevation_history_length
+        self.state_dependent_std = policy.state_dependent_std
+        
+        # 计算本体观测维度（需要从policy中获取）
+        # 由于在__init__中没有存储，我们需要从encoder推断
+        self.proprio_dim = policy.proprio_encoder_actor[0].in_features
+        
+        # 计算高程图维度
+        height, width = self.vision_spatial_size
+        self.elevation_dim = self.elevation_history_length * height * width
+        
+        # 复制归一化器
+        if normalizer:
+            self.normalizer = copy.deepcopy(normalizer)
+        else:
+            self.normalizer = torch.nn.Identity()
+
+    def forward(self, obs_input):
+        """前向传播（单输入版本）
+        
+        Args:
+            obs_input: 合并的观测数据，形状为 [batch_size, total_obs_dim]
+                       组成：[本体观测 | 高程图]
+                       - 本体观测：proprio_dim 维
+                       - 高程图：elevation_dim 维
+        
+        Returns:
+            actions_mean: 动作均值，形状为 [batch_size, num_actions]
+        """
+        batch_size = obs_input.shape[0]
+        
+        # 切片分离各部分数据
+        offset = 0
+        # 1. 本体观测
+        proprio_obs = obs_input[:, offset:offset + self.proprio_dim]
+        offset += self.proprio_dim
+        
+        # 2. 高程图数据
+        elevation_data_flat = obs_input[:, offset:]
+        
+        # 将高程图数据reshape为 [B, T, H, W]
+        height, width = self.vision_spatial_size
+        elevation_data = elevation_data_flat.reshape(
+            batch_size, self.elevation_history_length, height, width
+        )
+        
+        # 应用归一化器到本体观测
+        proprio_obs_normalized = self.normalizer(proprio_obs)
+        
+        # 归一化高程图
+        elevation_data = torch.clip(elevation_data / 0.3, -3.0, 3.0)
+        
+        # 模块一：本体感知编码
+        proprio_embedding = self.proprio_encoder_actor(proprio_obs_normalized)  # [B, proprio_embed_dim]
+        
+        # 模块二：地形特征提取
+        pointwise_features, global_features = self.terrain_encoder_actor(elevation_data)
+        # pointwise_features: [B, Seq_Len, feature_dim]
+        # global_features: [B, feature_dim]
+        
+        # 模块三：注意力地图编码
+        map_embedding = self.attention_encoder_actor(
+            proprio_embedding, pointwise_features, global_features
+        )  # [B, feature_dim]
+        
+        # 模块四：动作解码
+        fused_features = torch.cat([proprio_embedding, map_embedding], dim=-1)
+        
+        # 输出动作（推理时只使用均值）
+        if self.state_dependent_std:
+            actions_mean = self.actor(fused_features)[..., 0, :]
+        else:
+            actions_mean = self.actor(fused_features)
+        
+        return actions_mean
+
+    def export(self, path, filename):
+        self.to("cpu")
+        self.eval()
+        opset_version = 18
+        
+        # 计算总输入维度
+        total_obs_dim = self.proprio_dim + self.elevation_dim
+        
+        # 创建单个合并的输入示例
+        obs_input = torch.zeros(1, total_obs_dim)
+        
+        print(f"\n{'='*80}")
+        print(f"ONNX导出配置 (AweNet - 单输入模式):")
+        print(f"{'='*80}")
+        print(f"  本体观测维度:     {self.proprio_dim}")
+        print(f"  高程图维度:       {self.elevation_dim} ({self.elevation_history_length}×{self.vision_spatial_size[0]}×{self.vision_spatial_size[1]})")
+        print(f"  总输入维度:       {total_obs_dim}")
+        print(f"  ")
+        print(f"  输入切片方式:")
+        print(f"    [:, 0:{self.proprio_dim}] = 本体观测")
+        print(f"    [:, {self.proprio_dim}:] = 高程图")
+        print(f"  ")
+        print(f"  处理流程:")
+        print(f"    1. 本体观测归一化")
+        print(f"    2. 本体感知编码 -> proprio_embedding")
+        print(f"    3. 地形特征提取 (CNN) -> pointwise_features + global_features")
+        print(f"    4. 注意力地图编码 -> map_embedding")
+        print(f"    5. Actor: [proprio_embedding + map_embedding] -> actions")
+        print(f"{'='*80}\n")
+        
+        torch.onnx.export(
+            self,
+            obs_input,
+            os.path.join(path, filename),
+            export_params=True,
+            opset_version=opset_version,
+            verbose=self.verbose,
+            input_names=["obs"],
+            output_names=["actions"],
+            dynamic_axes={},
+        )
