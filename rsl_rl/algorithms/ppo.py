@@ -159,6 +159,11 @@ class PPO:
         if self.rnd:
             self.rnd.update_normalization(obs)
 
+        # Handle multi-critic rewards in single-critic mode
+        # If rewards is [N, num_critics], use only the first column (task reward)
+        if rewards.dim() > 1 and rewards.shape[-1] > 1:
+            rewards = rewards[:, 0]
+
         # Record the rewards and dones
         # Note: We clone here because later on we bootstrap the rewards based on timeouts
         self.transition.rewards = rewards.clone()
@@ -197,11 +202,23 @@ class PPO:
             # 1 if we are not in a terminal state, 0 otherwise
             next_is_not_terminal = 1.0 - st.dones[step].float()
             # TD error: r_t + gamma * V(s_{t+1}) - V(s_t)
-            delta = st.rewards[step] + next_is_not_terminal * self.gamma * next_values - st.values[step]
+            # Handle multi-critic storage: rewards/values may be [T, N, num_critics]
+            # For single critic PPO, select the first column
+            rewards_step = st.rewards[step]
+            values_step = st.values[step]
+            next_values_step = next_values
+            if rewards_step.dim() > 1 and rewards_step.shape[-1] > 1:
+                rewards_step = rewards_step[:, 0:1]  # Keep dimension for broadcasting
+            if values_step.dim() > 1 and values_step.shape[-1] > 1:
+                values_step = values_step[:, 0:1]
+            if next_values_step.dim() > 1 and next_values_step.shape[-1] > 1:
+                next_values_step = next_values_step[:, 0:1]
+
+            delta = rewards_step + next_is_not_terminal * self.gamma * next_values_step - values_step
             # Advantage: A(s_t, a_t) = delta_t + gamma * lambda * A(s_{t+1}, a_{t+1})
             advantage = delta + next_is_not_terminal * self.gamma * self.lam * advantage
             # Return: R_t = A(s_t, a_t) + V(s_t)
-            st.returns[step] = advantage + st.values[step]
+            st.returns[step] = advantage + values_step
         # Compute the advantages
         st.advantages = st.returns - st.values
         # Normalize the advantages if per minibatch normalization is not used
@@ -488,6 +505,12 @@ class PPO:
 
         # Resolve symmetry config if used
         cfg["algorithm"] = resolve_symmetry_config(cfg["algorithm"], env)
+
+        # These fields are used by MultiPPO only. Keep them in the shared config
+        # class, but do not pass them to the standard PPO constructor.
+        cfg["algorithm"].pop("num_critics", None)
+        cfg["algorithm"].pop("reward_group_names", None)
+        cfg["algorithm"].pop("reward_group_weights", None)
 
         # Initialize the policy
         actor: MLPModel = actor_class(obs, cfg["obs_groups"], "actor", env.num_actions, **cfg["actor"]).to(device)

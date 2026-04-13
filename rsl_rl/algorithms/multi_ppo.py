@@ -64,6 +64,7 @@ class MultiPPO(PPO):
         critic: MLPModel | nn.ModuleList,
         storage: RolloutStorage,
         num_critics: int = 1,
+        reward_group_names: Optional[List[str]] = None,
         reward_group_weights: Optional[List[float]] = None,
         **kwargs,
     ):
@@ -74,12 +75,25 @@ class MultiPPO(PPO):
             critic: Single critic (MLPModel) or list of critics (ModuleList) for multi-critic.
             storage: Rollout storage for transitions.
             num_critics: Number of critics (reward groups). 1 for standard PPO.
+            reward_group_names: Names of reward groups in reward tensor order.
+                Used for validation and logging only.
             reward_group_weights: Weights for aggregating advantages from each critic.
                 Length must match num_critics. If None, uses equal weights.
             **kwargs: Additional arguments passed to PPO base class.
         """
         # Store multi-critic parameters
         self.num_critics = num_critics
+
+        if reward_group_names is None:
+            reward_group_names = [f"critic_{i}" for i in range(num_critics)]
+        if len(reward_group_names) != num_critics:
+            raise ValueError(
+                f"Length of reward_group_names ({len(reward_group_names)}) "
+                f"must match num_critics ({num_critics})"
+            )
+        if len(set(reward_group_names)) != len(reward_group_names):
+            raise ValueError(f"reward_group_names must be unique, got {reward_group_names}")
+        self.reward_group_names = list(reward_group_names)
 
         # Initialize reward group weights
         if reward_group_weights is None:
@@ -487,8 +501,8 @@ class MultiPPO(PPO):
         }
 
         # Add per-critic value losses
-        for i in range(self.num_critics):
-            loss_dict[f"value_critic_{i}"] = per_critic_value_losses[i] / num_updates
+        for i, name in enumerate(self.reward_group_names):
+            loss_dict[f"value_{name}"] = per_critic_value_losses[i] / num_updates
 
         if self.rnd:
             mean_rnd_loss /= num_updates
@@ -576,7 +590,10 @@ class MultiPPO(PPO):
         """
         # Extract multi-critic parameters
         alg_cfg = cfg.get("algorithm", {}).copy()
+        alg_cfg.pop("class_name", None)
+        share_cnn_encoders = alg_cfg.pop("share_cnn_encoders", False)
         num_critics = alg_cfg.pop("num_critics", 1)
+        reward_group_names = alg_cfg.pop("reward_group_names", None)
         reward_group_weights = alg_cfg.pop("reward_group_weights", None)
 
         # Resolve class callables
@@ -608,7 +625,7 @@ class MultiPPO(PPO):
             critic = critics
         else:
             # Single critic mode
-            if cfg["algorithm"].pop("share_cnn_encoders", None):
+            if share_cnn_encoders:
                 cfg["critic"]["cnns"] = actor.cnns
             critic = critic_class(obs, cfg["obs_groups"], "critic", 1, **cfg["critic"]).to(device)
             print(f"Critic Model: {critic}")
@@ -624,6 +641,7 @@ class MultiPPO(PPO):
             critic,
             storage,
             num_critics=num_critics,
+            reward_group_names=reward_group_names,
             reward_group_weights=reward_group_weights,
             device=device,
             **alg_cfg,

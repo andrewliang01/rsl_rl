@@ -130,13 +130,25 @@ class RolloutStorage:
         obs: TensorDict,
         actions_shape: tuple[int, ...] | list[int],
         device: str = "cpu",
+        num_critics: int = 1,
     ) -> None:
-        """Allocate rollout buffers for a specific training mode and batch shape."""
+        """Allocate rollout buffers for a specific training mode and batch shape.
+
+        Args:
+            training_type: Type of training ("rl" or "distillation").
+            num_envs: Number of parallel environments.
+            num_transitions_per_env: Number of transitions to store per environment.
+            obs: Observation tensor dict to infer observation shapes.
+            actions_shape: Shape of the action tensor.
+            device: Device to allocate tensors on.
+            num_critics: Number of critics (for multi-critic RL). Defaults to 1.
+        """
         self.training_type = training_type
         self.device = device
         self.num_transitions_per_env = num_transitions_per_env
         self.num_envs = num_envs
         self.actions_shape = actions_shape
+        self.num_critics = num_critics  # Store for multi-critic support
 
         # Core
         self.observations = TensorDict(
@@ -144,7 +156,8 @@ class RolloutStorage:
             batch_size=[num_transitions_per_env, num_envs],
             device=self.device,
         )
-        self.rewards = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+        # Support multi-critic: rewards are [T, N, num_critics] instead of [T, N, 1]
+        self.rewards = torch.zeros(num_transitions_per_env, num_envs, num_critics, device=self.device)
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
 
@@ -154,11 +167,16 @@ class RolloutStorage:
 
         # For reinforcement learning
         if training_type == "rl":
-            self.values = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+            # Support multi-critic: values are [T, N, num_critics]
+            self.values = torch.zeros(num_transitions_per_env, num_envs, num_critics, device=self.device)
             self.actions_log_prob = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.distribution_params: tuple[torch.Tensor, ...] | None = None  # Lazily initialized on first transition
-            self.returns = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
-            self.advantages = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+            self.returns = torch.zeros(num_transitions_per_env, num_envs, num_critics, device=self.device)
+            # For multi-critic, we store advantages per critic and also weighted advantages
+            self.advantages = torch.zeros(num_transitions_per_env, num_envs, num_critics, device=self.device)
+            # Weighted advantages for policy update (only used in multi-critic mode)
+            if num_critics > 1:
+                self.weighted_advantages = torch.zeros(num_transitions_per_env, num_envs, device=self.device)
 
         # For recurrent networks
         self.saved_hidden_state_a = None
@@ -176,7 +194,20 @@ class RolloutStorage:
         # Core
         self.observations[self.step].copy_(transition.observations)
         self.actions[self.step].copy_(transition.actions)  # type: ignore
-        self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
+        # Handle multi-critic rewards: [N] or [N, 1] -> [N, num_critics]
+        if transition.rewards.dim() == 1:
+            # Single-dimensional rewards, expand to [N, num_critics]
+            self.rewards[self.step].copy_(transition.rewards.unsqueeze(-1).expand(-1, self.num_critics))
+        elif transition.rewards.shape[-1] == self.num_critics:
+            # Already correct shape [N, num_critics]
+            self.rewards[self.step].copy_(transition.rewards.view(self.num_envs, self.num_critics))
+        elif transition.rewards.shape[-1] == 1 and self.num_critics == 1:
+            # Single critic mode with [N, 1] rewards
+            self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
+        else:
+            raise ValueError(
+                f"Invalid rewards shape {transition.rewards.shape} for num_critics={self.num_critics}"
+            )
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
 
         # For distillation
@@ -185,7 +216,17 @@ class RolloutStorage:
 
         # For reinforcement learning
         if self.training_type == "rl":
-            self.values[self.step].copy_(transition.values)  # type: ignore
+            # Handle multi-critic values: [N, num_critics]
+            if transition.values.dim() == 1:
+                # Single-dimensional values, expand
+                self.values[self.step].copy_(transition.values.unsqueeze(-1).expand(-1, self.num_critics))
+            elif transition.values.shape[-1] == self.num_critics:
+                # Correct shape
+                self.values[self.step].copy_(transition.values.view(self.num_envs, self.num_critics))
+            else:
+                raise ValueError(
+                    f"Invalid values shape {transition.values.shape} for num_critics={self.num_critics}"
+                )
             self.actions_log_prob[self.step].copy_(transition.actions_log_prob.view(-1, 1))
             if self.distribution_params is None:  # Initialize the distribution parameters
                 self.distribution_params = tuple(
@@ -219,8 +260,15 @@ class RolloutStorage:
             )
 
     # For reinforcement learning with feedforward networks
-    def mini_batch_generator(self, num_mini_batches: int, num_epochs: int = 8) -> Generator[Batch, None, None]:
-        """Yield shuffled flat mini-batches for feedforward RL updates."""
+    def mini_batch_generator(self, num_mini_batches: int, num_epochs: int = 8, use_weighted_advantages: bool = False) -> Generator[Batch, None, None]:
+        """Yield shuffled flat mini-batches for feedforward RL updates.
+
+        Args:
+            num_mini_batches: Number of mini-batches per epoch.
+            num_epochs: Number of epochs to iterate over the data.
+            use_weighted_advantages: If True and in multi-critic mode, use weighted advantages.
+                The weighted advantages should be pre-computed and stored in self.weighted_advantages.
+        """
         if self.training_type != "rl":
             raise ValueError("This function is only available for reinforcement learning training.")
         batch_size = self.num_envs * self.num_transitions_per_env
@@ -230,10 +278,21 @@ class RolloutStorage:
         # Flatten the data
         observations = self.observations.flatten(0, 1)
         actions = self.actions.flatten(0, 1)
-        values = self.values.flatten(0, 1)
-        returns = self.returns.flatten(0, 1)
+        values = self.values.flatten(0, 1)  # [batch_size, num_critics]
+        returns = self.returns.flatten(0, 1)  # [batch_size, num_critics]
         old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
-        advantages = self.advantages.flatten(0, 1)
+
+        # Handle advantages
+        if use_weighted_advantages and self.num_critics > 1:
+            # Use pre-computed weighted advantages for policy update
+            advantages = self.weighted_advantages.flatten()  # [batch_size]
+        else:
+            # Use per-critic advantages (will be selected per critic during update)
+            advantages = self.advantages.flatten(0, 1)  # [batch_size, num_critics]
+            # If single critic, squeeze the last dimension for backward compatibility
+            if self.num_critics == 1:
+                advantages = advantages.squeeze(-1)  # [batch_size]
+
         old_distribution_params = tuple(p.flatten(0, 1) for p in self.distribution_params)  # type: ignore
 
         for epoch in range(num_epochs):
