@@ -80,6 +80,7 @@ class PropMLPElevationFusionModel(nn.Module):
         self.elevation_set = elevation_set
 
         self.vision_feature_dim = vision_feature_dim
+        self.vision_spatial_size = tuple(vision_spatial_size)
         self.prop_feature_dim = prop_feature_dim
         self.elevation_history_length = elevation_history_length
 
@@ -200,9 +201,9 @@ class PropMLPElevationFusionModel(nn.Module):
         """Return a version of the model compatible with Torch JIT export."""
         return _TorchPropMLPElevationFusionModel(self)
 
-    def as_onnx(self, verbose: bool) -> nn.Module:
+    def as_onnx(self, verbose: bool, input_mode: str = "split") -> nn.Module:
         """Return a version of the model compatible with ONNX export."""
-        return _OnnxPropMLPElevationFusionModel(self, verbose)
+        return _OnnxPropMLPElevationFusionModel(self, verbose, input_mode)
 
     def update_normalization(self, obs: TensorDict) -> None:
         """Update proprio observation-normalization statistics from a batch of observations."""
@@ -257,10 +258,15 @@ class _TorchPropMLPElevationFusionModel(nn.Module):
     def forward(self, proprio_obs: torch.Tensor, elevation_obs: torch.Tensor) -> torch.Tensor:
         proprio_obs = self.obs_normalizer(proprio_obs)
         proprio_features = self.prop_mlp(proprio_obs)
+        elevation_obs = self._normalize_elevation_map(elevation_obs)
         elevation_features = self.elevation_encoder(elevation_obs)
         fused_features = torch.cat((proprio_features, elevation_features), dim=-1)
         out = self.mlp(fused_features)
         return self.deterministic_output(out)
+
+    def _normalize_elevation_map(self, elevation_map: torch.Tensor) -> torch.Tensor:
+        elevation_mean = elevation_map.mean(dim=(-2, -1), keepdim=True)
+        return torch.clamp((elevation_map - elevation_mean) / 0.6, -3.0, 3.0)
 
     @torch.jit.export
     def reset(self) -> None:
@@ -272,9 +278,12 @@ class _OnnxPropMLPElevationFusionModel(nn.Module):
 
     is_recurrent: bool = False
 
-    def __init__(self, model: PropMLPElevationFusionModel, verbose: bool) -> None:
+    def __init__(self, model: PropMLPElevationFusionModel, verbose: bool, input_mode: str = "split") -> None:
         super().__init__()
+        if input_mode not in ("split", "single"):
+            raise ValueError(f"Unsupported ONNX input mode: {input_mode}")
         self.verbose = verbose
+        self.input_mode = input_mode
         self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
         self.prop_mlp = copy.deepcopy(model.prop_mlp)
         self.elevation_encoder = copy.deepcopy(model.elevation_encoder)
@@ -285,23 +294,45 @@ class _OnnxPropMLPElevationFusionModel(nn.Module):
             self.deterministic_output = nn.Identity()
         self.proprio_input_size = model.obs_dim
         self.elevation_history_length = model.elevation_history_length
+        self.vision_spatial_size = model.vision_spatial_size
 
-    def forward(self, proprio_obs: torch.Tensor, elevation_obs: torch.Tensor) -> torch.Tensor:
+    def forward(self, proprio_obs: torch.Tensor, elevation_obs: torch.Tensor | None = None) -> torch.Tensor:
+        if self.input_mode == "single":
+            obs = proprio_obs
+            elevation_size = self.elevation_history_length * self.vision_spatial_size[0] * self.vision_spatial_size[1]
+            proprio_obs = obs[:, :self.proprio_input_size]
+            elevation_obs = obs[:, self.proprio_input_size:self.proprio_input_size + elevation_size]
+            elevation_obs = elevation_obs.reshape(
+                -1, self.elevation_history_length, self.vision_spatial_size[0], self.vision_spatial_size[1]
+            )
+        elif elevation_obs is None:
+            raise ValueError("elevation_obs is required when ONNX input_mode='split'")
+
         proprio_obs = self.obs_normalizer(proprio_obs)
         proprio_features = self.prop_mlp(proprio_obs)
+        elevation_obs = self._normalize_elevation_map(elevation_obs)
         elevation_features = self.elevation_encoder(elevation_obs)
         fused_features = torch.cat((proprio_features, elevation_features), dim=-1)
         out = self.mlp(fused_features)
         return self.deterministic_output(out)
 
+    def _normalize_elevation_map(self, elevation_map: torch.Tensor) -> torch.Tensor:
+        elevation_mean = elevation_map.mean(dim=(-2, -1), keepdim=True)
+        return torch.clamp((elevation_map - elevation_mean) / 0.6, -3.0, 3.0)
+
     def get_dummy_inputs(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.input_mode == "single":
+            elevation_size = self.elevation_history_length * self.vision_spatial_size[0] * self.vision_spatial_size[1]
+            return (torch.zeros(1, self.proprio_input_size + elevation_size),)
         return (
             torch.zeros(1, self.proprio_input_size),
-            torch.zeros(1, self.elevation_history_length, 25, 17),
+            torch.zeros(1, self.elevation_history_length, *self.vision_spatial_size),
         )
 
     @property
     def input_names(self) -> list[str]:
+        if self.input_mode == "single":
+            return ["obs"]
         return ["proprio_obs", "elevation_obs"]
 
     @property

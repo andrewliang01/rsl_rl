@@ -184,9 +184,18 @@ class OnPolicyRunner:
         traced_model = torch.jit.script(jit_model)
         traced_model.save(save_path)
 
-    def export_policy_to_onnx(self, path: str, filename: str = "policy.onnx", verbose: bool = False) -> None:
+    def export_policy_to_onnx(
+        self,
+        path: str,
+        filename: str = "policy.onnx",
+        verbose: bool = False,
+        input_mode: str = "split",
+    ) -> None:
         """Export the model into an ONNX file."""
-        onnx_model = self.alg.get_policy().as_onnx(verbose=verbose)
+        try:
+            onnx_model = self.alg.get_policy().as_onnx(verbose=verbose, input_mode=input_mode)
+        except TypeError:
+            onnx_model = self.alg.get_policy().as_onnx(verbose=verbose)
         onnx_model.to("cpu")
         onnx_model.eval()
 

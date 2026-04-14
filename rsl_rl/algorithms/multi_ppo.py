@@ -95,6 +95,8 @@ class MultiPPO(PPO):
             raise ValueError(f"reward_group_names must be unique, got {reward_group_names}")
         self.reward_group_names = list(reward_group_names)
 
+        self._optimizer_name = kwargs.get("optimizer", "adam")
+
         # Initialize reward group weights
         if reward_group_weights is None:
             reward_group_weights = [1.0] * num_critics
@@ -261,15 +263,15 @@ class MultiPPO(PPO):
 
         if self.is_multi_critic:
             # Multi-critic GAE computation
-            advantage = torch.zeros(self.num_envs, self.num_critics, device=self.device)
+            advantage = torch.zeros(st.num_envs, self.num_critics, device=self.device)
 
             for step in reversed(range(st.num_transitions_per_env)):
                 if step == st.num_transitions_per_env - 1:
                     next_values = last_values
-                    next_is_not_terminal = 1.0 - st.dones[step].float().unsqueeze(-1)
+                    next_is_not_terminal = 1.0 - st.dones[step].float()
                 else:
                     next_values = st.values[step + 1]
-                    next_is_not_terminal = 1.0 - st.dones[step].float().unsqueeze(-1)
+                    next_is_not_terminal = 1.0 - st.dones[step].float()
 
                 # TD error for each critic: r_t + gamma * V(s_{t+1}) - V(s_t)
                 delta = st.rewards[step] + next_is_not_terminal * self.gamma * next_values - st.values[step]
@@ -596,9 +598,24 @@ class MultiPPO(PPO):
         reward_group_names = alg_cfg.pop("reward_group_names", None)
         reward_group_weights = alg_cfg.pop("reward_group_weights", None)
 
-        # Resolve class callables
-        actor_class = resolve_callable(cfg["actor"].pop("class_name"))
-        critic_class = resolve_callable(cfg["critic"].pop("class_name"))
+        # Resolve actor callable. Some downstream configclasses may omit class_name
+        # for plain MLP configs, so keep MLPModel as the default.
+        actor_cfg = cfg["actor"].copy()
+        actor_class = resolve_callable(actor_cfg.pop("class_name", "MLPModel"))
+
+        def resolve_critic_cfg(group_name: str | None = None) -> tuple[type[MLPModel], dict]:
+            critic_key = f"critic_{group_name}" if group_name else "critic"
+            if critic_key in cfg:
+                critic_cfg = cfg[critic_key].copy()
+            elif "critic" in cfg:
+                critic_cfg = cfg["critic"].copy()
+            else:
+                raise KeyError(
+                    f"Missing critic config. Expected '{critic_key}'"
+                    + (" or 'critic'." if critic_key != "critic" else ".")
+                )
+            critic_class = resolve_callable(critic_cfg.pop("class_name", "MLPModel"))
+            return critic_class, critic_cfg
 
         # Resolve observation groups
         default_sets = ["actor", "critic"]
@@ -611,7 +628,7 @@ class MultiPPO(PPO):
         alg_cfg = resolve_symmetry_config(alg_cfg, env)
 
         # Initialize the actor
-        actor = actor_class(obs, cfg["obs_groups"], "actor", env.num_actions, **cfg["actor"]).to(device)
+        actor = actor_class(obs, cfg["obs_groups"], "actor", env.num_actions, **actor_cfg).to(device)
         print(f"Actor Model: {actor}")
 
         # Initialize critic(s)
@@ -619,15 +636,18 @@ class MultiPPO(PPO):
             # Multi-critic mode
             critics = nn.ModuleList()
             for i in range(num_critics):
-                critic = critic_class(obs, cfg["obs_groups"], "critic", 1, **cfg["critic"]).to(device)
+                group_name = reward_group_names[i] if reward_group_names is not None else str(i)
+                critic_class, critic_cfg = resolve_critic_cfg(group_name)
+                critic = critic_class(obs, cfg["obs_groups"], "critic", 1, **critic_cfg).to(device)
                 critics.append(critic)
-            print(f"Created {num_critics} critics for multi-critic training")
+            print(f"Created {num_critics} critics for multi-critic training: {reward_group_names}")
             critic = critics
         else:
             # Single critic mode
+            critic_class, critic_cfg = resolve_critic_cfg()
             if share_cnn_encoders:
-                cfg["critic"]["cnns"] = actor.cnns
-            critic = critic_class(obs, cfg["obs_groups"], "critic", 1, **cfg["critic"]).to(device)
+                critic_cfg["cnns"] = actor.cnns
+            critic = critic_class(obs, cfg["obs_groups"], "critic", 1, **critic_cfg).to(device)
             print(f"Critic Model: {critic}")
 
         # Initialize storage with num_critics
