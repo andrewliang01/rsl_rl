@@ -9,10 +9,12 @@ from .cnn_model import CNNModel
 from .mlp_model import MLPModel
 from .rnn_model import RNNModel
 from .prop_mlp_elevation_fusion_model import PropMLPElevationFusionModel
+from .shared_prop_mlp_elevation_multi_head_critic import SharedPropMLPElevationMultiHeadCritic
  
 __all__ = [
     "CNNModel",
     "MLPModel",
     "RNNModel",
     "PropMLPElevationFusionModel",
+    "SharedPropMLPElevationMultiHeadCritic",
 ]

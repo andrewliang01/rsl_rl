@@ -299,11 +299,12 @@ class _OnnxPropMLPElevationFusionModel(nn.Module):
     def forward(self, proprio_obs: torch.Tensor, elevation_obs: torch.Tensor | None = None) -> torch.Tensor:
         if self.input_mode == "single":
             obs = proprio_obs
+            batch_size = obs.shape[0]
             elevation_size = self.elevation_history_length * self.vision_spatial_size[0] * self.vision_spatial_size[1]
             proprio_obs = obs[:, :self.proprio_input_size]
             elevation_obs = obs[:, self.proprio_input_size:self.proprio_input_size + elevation_size]
             elevation_obs = elevation_obs.reshape(
-                -1, self.elevation_history_length, self.vision_spatial_size[0], self.vision_spatial_size[1]
+                batch_size, self.elevation_history_length, self.vision_spatial_size[0], self.vision_spatial_size[1]
             )
         elif elevation_obs is None:
             raise ValueError("elevation_obs is required when ONNX input_mode='split'")
@@ -338,3 +339,13 @@ class _OnnxPropMLPElevationFusionModel(nn.Module):
     @property
     def output_names(self) -> list[str]:
         return ["actions"]
+
+    @property
+    def dynamic_axes(self) -> dict[str, dict[int, str]]:
+        if self.input_mode == "single":
+            return {"obs": {0: "batch_size"}, "actions": {0: "batch_size"}}
+        return {
+            "proprio_obs": {0: "batch_size"},
+            "elevation_obs": {0: "batch_size"},
+            "actions": {0: "batch_size"},
+        }

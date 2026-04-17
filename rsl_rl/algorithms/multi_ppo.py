@@ -66,6 +66,7 @@ class MultiPPO(PPO):
         num_critics: int = 1,
         reward_group_names: Optional[List[str]] = None,
         reward_group_weights: Optional[List[float]] = None,
+        shared_critic: bool = False,
         **kwargs,
     ):
         """Initialize Multi-Critic PPO.
@@ -111,8 +112,14 @@ class MultiPPO(PPO):
 
         # Handle critic(s)
         self.is_multi_critic = num_critics > 1
+        self.shared_critic = shared_critic
 
-        if self.is_multi_critic:
+        if self.is_multi_critic and self.shared_critic:
+            if isinstance(critic, nn.ModuleList):
+                raise ValueError("shared_critic=True expects a single critic module, not ModuleList.")
+            self.critics = nn.ModuleList([critic])
+            self._first_critic = critic
+        elif self.is_multi_critic:
             # Multi-critic mode: critic should be a ModuleList
             if not isinstance(critic, nn.ModuleList):
                 raise ValueError(
@@ -166,12 +173,15 @@ class MultiPPO(PPO):
 
         # Compute values from all critics
         if self.is_multi_critic:
-            values = []
-            for critic in self.critics:
-                value = critic(obs).detach()
-                values.append(value)
-            # Concatenate to [num_envs, num_critics]
-            self.transition.values = torch.cat(values, dim=-1)
+            if self.shared_critic:
+                self.transition.values = self._first_critic(obs).detach()
+            else:
+                values = []
+                for critic in self.critics:
+                    value = critic(obs).detach()
+                    values.append(value)
+                # Concatenate to [num_envs, num_critics]
+                self.transition.values = torch.cat(values, dim=-1)
         else:
             # Single critic mode
             self.transition.values = self._first_critic(obs).detach()
@@ -192,8 +202,9 @@ class MultiPPO(PPO):
         # Update the normalizers
         self.actor.update_normalization(obs)
         self._first_critic.update_normalization(obs)
-        for critic in self.critics:
-            critic.update_normalization(obs)
+        if not self.shared_critic:
+            for critic in self.critics:
+                critic.update_normalization(obs)
         if self.rnd:
             self.rnd.update_normalization(obs)
 
@@ -241,8 +252,10 @@ class MultiPPO(PPO):
         self.storage.add_transition(self.transition)
         self.transition.clear()
         self.actor.reset(dones)
-        for critic in self.critics:
-            critic.reset(dones)
+        self._first_critic.reset(dones)
+        if not self.shared_critic:
+            for critic in self.critics:
+                critic.reset(dones)
 
     def compute_returns(self, obs: TensorDict) -> None:
         """Compute return and advantage targets from stored transitions.
@@ -254,10 +267,13 @@ class MultiPPO(PPO):
 
         # Compute value for the last step
         if self.is_multi_critic:
-            last_values = []
-            for critic in self.critics:
-                last_values.append(critic(obs).detach())
-            last_values = torch.cat(last_values, dim=-1)  # [num_envs, num_critics]
+            if self.shared_critic:
+                last_values = self._first_critic(obs).detach()
+            else:
+                last_values = []
+                for critic in self.critics:
+                    last_values.append(critic(obs).detach())
+                last_values = torch.cat(last_values, dim=-1)  # [num_envs, num_critics]
         else:
             last_values = self._first_critic(obs).detach()
 
@@ -370,12 +386,17 @@ class MultiPPO(PPO):
             distribution_params = tuple(p[:original_batch_size] for p in self.actor.output_distribution_params)
             entropy = self.actor.output_entropy[:original_batch_size]
 
-            # Critic forward (all critics)
-            values_list = []
-            for critic in self.critics:
-                values = critic(batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[1])
-                values_list.append(values)
-            values = torch.cat(values_list, dim=-1)  # [batch, num_critics]
+            # Critic forward
+            if self.shared_critic:
+                values = self._first_critic(
+                    batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[1]
+                )
+            else:
+                values_list = []
+                for critic in self.critics:
+                    values = critic(batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[1])
+                    values_list.append(values)
+                values = torch.cat(values_list, dim=-1)  # [batch, num_critics]
 
             # KL divergence and learning rate adaptation
             if self.desired_kl is not None and self.schedule == "adaptive":
@@ -537,9 +558,12 @@ class MultiPPO(PPO):
         }
 
         if self.is_multi_critic:
-            # Save all critics
-            for i, critic in enumerate(self.critics):
-                saved_dict[f"critic_{i}_state_dict"] = critic.state_dict()
+            if self.shared_critic:
+                saved_dict["critic_state_dict"] = self._first_critic.state_dict()
+            else:
+                # Save all critics
+                for i, critic in enumerate(self.critics):
+                    saved_dict[f"critic_{i}_state_dict"] = critic.state_dict()
         else:
             saved_dict["critic_state_dict"] = self._first_critic.state_dict()
 
@@ -564,7 +588,9 @@ class MultiPPO(PPO):
             self.actor.load_state_dict(loaded_dict["actor_state_dict"], strict=strict)
 
         if load_cfg.get("critic"):
-            if self.is_multi_critic:
+            if self.is_multi_critic and self.shared_critic:
+                self._first_critic.load_state_dict(loaded_dict["critic_state_dict"], strict=strict)
+            elif self.is_multi_critic:
                 # Load all critics
                 for i in range(self.num_critics):
                     key = f"critic_{i}_state_dict"
@@ -597,6 +623,7 @@ class MultiPPO(PPO):
         num_critics = alg_cfg.pop("num_critics", 1)
         reward_group_names = alg_cfg.pop("reward_group_names", None)
         reward_group_weights = alg_cfg.pop("reward_group_weights", None)
+        shared_critic = alg_cfg.pop("shared_critic", False)
 
         # Resolve actor callable. Some downstream configclasses may omit class_name
         # for plain MLP configs, so keep MLPModel as the default.
@@ -632,7 +659,12 @@ class MultiPPO(PPO):
         print(f"Actor Model: {actor}")
 
         # Initialize critic(s)
-        if num_critics > 1:
+        if num_critics > 1 and shared_critic:
+            critic_class, critic_cfg = resolve_critic_cfg()
+            critic_cfg.setdefault("num_heads", num_critics)
+            critic = critic_class(obs, cfg["obs_groups"], "critic", num_critics, **critic_cfg).to(device)
+            print(f"Created shared multi-head critic for groups: {reward_group_names}")
+        elif num_critics > 1:
             # Multi-critic mode
             critics = nn.ModuleList()
             for i in range(num_critics):
@@ -663,6 +695,7 @@ class MultiPPO(PPO):
             num_critics=num_critics,
             reward_group_names=reward_group_names,
             reward_group_weights=reward_group_weights,
+            shared_critic=shared_critic,
             device=device,
             **alg_cfg,
             multi_gpu_cfg=cfg.get("multi_gpu"),
