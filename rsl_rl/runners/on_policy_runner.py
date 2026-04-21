@@ -95,10 +95,13 @@ class OnPolicyRunner:
                     # Extract intrinsic rewards if RND is used (only for logging)
                     intrinsic_rewards = self.alg.intrinsic_rewards if self.cfg["algorithm"]["rnd_cfg"] else None
                     # Book keeping
-                    # Handle multi-critic rewards: sum across critics for logging
+                    # Handle multi-critic rewards: use the same group weights as advantage aggregation for logging.
                     if rewards.dim() > 1 and rewards.shape[-1] > 1:
-                        # Multi-critic: sum rewards across all groups for logging
-                        rewards_for_log = rewards.sum(dim=-1)
+                        if hasattr(self.alg, "reward_group_weights"):
+                            weights = self.alg.reward_group_weights.to(device=rewards.device, dtype=rewards.dtype)
+                            rewards_for_log = torch.sum(rewards * weights.view(1, -1), dim=-1)
+                        else:
+                            rewards_for_log = rewards.sum(dim=-1)
                     else:
                         rewards_for_log = rewards.squeeze(-1) if rewards.dim() > 1 else rewards
                     self.logger.process_env_step(rewards_for_log, dones, extras, intrinsic_rewards)
