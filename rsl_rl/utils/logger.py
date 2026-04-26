@@ -56,6 +56,16 @@ class Logger:
             self.cur_ereward_sum = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
             self.cur_ireward_sum = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
 
+        # Create AMP buffers
+        self.amp_cfg = self.cfg["algorithm"].get("amp_cfg")
+        if self.amp_cfg:
+            self.task_rewbuffer = deque(maxlen=100)
+            self.style_rewbuffer = deque(maxlen=100)
+            self.final_rewbuffer = deque(maxlen=100)
+            self.cur_task_reward_sum = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+            self.cur_style_reward_sum = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+            self.cur_final_reward_sum = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+
         # Decide whether to disable logging
         # Note: We only log from the process with rank 0 (main process)
         self.disable_logs = is_distributed and gpu_global_rank != 0
@@ -100,6 +110,7 @@ class Logger:
         dones: torch.Tensor,
         extras: dict,
         intrinsic_rewards: torch.Tensor | None = None,
+        amp_rewards: dict[str, torch.Tensor | None] | None = None,
     ) -> None:
         """Add metrics from the environment step to the buffers."""
         if self.writer is not None:
@@ -117,6 +128,15 @@ class Logger:
                 self.cur_reward_sum += rewards
             self.cur_episode_length += 1
 
+            # Update AMP rewards if available
+            if amp_rewards is not None and self.amp_cfg:
+                if amp_rewards.get('task') is not None:
+                    self.cur_task_reward_sum += amp_rewards['task']
+                if amp_rewards.get('style') is not None:
+                    self.cur_style_reward_sum += amp_rewards['style']
+                if amp_rewards.get('final') is not None:
+                    self.cur_final_reward_sum += amp_rewards['final']
+
             # Clear data for completed episodes
             new_ids = (dones > 0).nonzero(as_tuple=False)
             self.rewbuffer.extend(self.cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
@@ -128,6 +148,13 @@ class Logger:
                 self.irewbuffer.extend(self.cur_ireward_sum[new_ids][:, 0].cpu().numpy().tolist())
                 self.cur_ereward_sum[new_ids] = 0
                 self.cur_ireward_sum[new_ids] = 0
+            if amp_rewards is not None and self.amp_cfg:
+                self.task_rewbuffer.extend(self.cur_task_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                self.style_rewbuffer.extend(self.cur_style_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                self.final_rewbuffer.extend(self.cur_final_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                self.cur_task_reward_sum[new_ids] = 0
+                self.cur_style_reward_sum[new_ids] = 0
+                self.cur_final_reward_sum[new_ids] = 0
 
     def log(
         self,
@@ -198,6 +225,11 @@ class Logger:
                     self.writer.add_scalar("Rnd/mean_extrinsic_reward", statistics.mean(self.erewbuffer), it)
                     self.writer.add_scalar("Rnd/mean_intrinsic_reward", statistics.mean(self.irewbuffer), it)
                     self.writer.add_scalar("Rnd/weight", rnd_weight, it)  # type: ignore
+                # Log AMP rewards
+                if self.amp_cfg:
+                    self.writer.add_scalar("AMP/mean_task_reward", statistics.mean(self.task_rewbuffer), it)
+                    self.writer.add_scalar("AMP/mean_style_reward", statistics.mean(self.style_rewbuffer), it)
+                    self.writer.add_scalar("AMP/mean_final_reward", statistics.mean(self.final_rewbuffer), it)
                 self.writer.add_scalar("Train/mean_reward", statistics.mean(self.rewbuffer), it)
                 self.writer.add_scalar("Train/mean_episode_length", statistics.mean(self.lenbuffer), it)
                 if self.logger_type != "wandb":
@@ -233,6 +265,10 @@ class Logger:
                 if self.cfg["algorithm"]["rnd_cfg"]:
                     log_string += f"""{"Mean extrinsic reward:":>{pad}} {statistics.mean(self.erewbuffer):.2f}\n"""
                     log_string += f"""{"Mean intrinsic reward:":>{pad}} {statistics.mean(self.irewbuffer):.2f}\n"""
+                if self.amp_cfg:
+                    log_string += f"""{"Mean AMP task reward:":>{pad}} {statistics.mean(self.task_rewbuffer):.2f}\n"""
+                    log_string += f"""{"Mean AMP style reward:":>{pad}} {statistics.mean(self.style_rewbuffer):.2f}\n"""
+                    log_string += f"""{"Mean AMP final reward:":>{pad}} {statistics.mean(self.final_rewbuffer):.2f}\n"""
                 log_string += f"""{"Mean reward:":>{pad}} {statistics.mean(self.rewbuffer):.2f}\n"""
                 log_string += f"""{"Mean episode length:":>{pad}} {statistics.mean(self.lenbuffer):.2f}\n"""
 

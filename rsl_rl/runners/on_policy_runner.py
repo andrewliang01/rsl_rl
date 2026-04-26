@@ -104,7 +104,17 @@ class OnPolicyRunner:
                             rewards_for_log = rewards.sum(dim=-1)
                     else:
                         rewards_for_log = rewards.squeeze(-1) if rewards.dim() > 1 else rewards
-                    self.logger.process_env_step(rewards_for_log, dones, extras, intrinsic_rewards)
+
+                    # Handle AMP rewards for logging
+                    amp_rewards = None
+                    if hasattr(self.alg, 'amp_discriminator') and self.alg.amp_discriminator is not None:
+                        amp_rewards = {
+                            'task': getattr(self.alg, 'task_rewards', None),
+                            'style': getattr(self.alg, 'style_rewards', None),
+                            'final': getattr(self.alg, 'final_rewards', None),
+                        }
+
+                    self.logger.process_env_step(rewards_for_log, dones, extras, intrinsic_rewards, amp_rewards)
 
                 stop = time.time()
                 collect_time = stop - start

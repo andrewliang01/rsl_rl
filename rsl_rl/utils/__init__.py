@@ -5,6 +5,7 @@
 
 """Helper functions."""
 
+from .motion_loader import AMPLoader
 from .utils import (
     check_nan,
     get_param,
@@ -17,6 +18,7 @@ from .utils import (
 )
 
 __all__ = [
+    "AMPLoader",
     "check_nan",
     "get_param",
     "resolve_callable",
