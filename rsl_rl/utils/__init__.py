@@ -6,6 +6,8 @@
 """Helper functions."""
 
 from .motion_loader import AMPLoader
+from .motion_loader_for_display import AMPLoaderDisplay
+
 from .utils import (
     check_nan,
     get_param,
