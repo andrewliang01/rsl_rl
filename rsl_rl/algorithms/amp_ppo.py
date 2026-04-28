@@ -1,114 +1,59 @@
-# Copyright (c) 2021-2026, ETH Zurich and NVIDIA CORPORATION
-# All rights reserved.
-#
-# SPDX-License-Identifier: BSD-3-Clause
-
-"""PPO with Adversarial Motion Prior (AMP) support."""
-
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from itertools import chain
 from tensordict import TensorDict
 
 from rsl_rl.algorithms.ppo import PPO
 from rsl_rl.env import VecEnv
+from rsl_rl.extensions import resolve_rnd_config, resolve_symmetry_config
 from rsl_rl.models import AMPDiscriminator, MLPModel
 from rsl_rl.storage import ReplayBuffer, RolloutStorage
 from rsl_rl.utils import AMPLoader, resolve_callable, resolve_obs_groups
 
 
 class AMPPPO(PPO):
-    """PPO algorithm with Adversarial Motion Prior (AMP).
-
-    Extends standard PPO with a discriminator that provides style rewards
-    based on expert motion data.
-    """
+    """PPO with AMP support that is compatible with the local rsl_rl 5.x APIs."""
 
     def __init__(
         self,
         actor: MLPModel,
         critic: MLPModel,
         storage: RolloutStorage,
-        num_learning_epochs: int = 5,
-        num_mini_batches: int = 4,
-        clip_param: float = 0.2,
-        gamma: float = 0.99,
-        lam: float = 0.95,
-        value_loss_coef: float = 1.0,
-        entropy_coef: float = 0.01,
-        learning_rate: float = 0.001,
-        max_grad_norm: float = 1.0,
-        optimizer: str = "adam",
-        use_clipped_value_loss: bool = True,
-        schedule: str = "adaptive",
-        desired_kl: float = 0.01,
-        normalize_advantage_per_mini_batch: bool = False,
-        device: str = "cpu",
-        rnd_cfg: dict | None = None,
-        symmetry_cfg: dict | None = None,
-        multi_gpu_cfg: dict | None = None,
-        # AMP specific parameters
         amp_cfg: dict | None = None,
+        **kwargs,
     ) -> None:
-        """Initialize AMPPPO with PPO and AMP components."""
-        # Initialize base PPO
-        super().__init__(
-            actor=actor,
-            critic=critic,
-            storage=storage,
-            num_learning_epochs=num_learning_epochs,
-            num_mini_batches=num_mini_batches,
-            clip_param=clip_param,
-            gamma=gamma,
-            lam=lam,
-            value_loss_coef=value_loss_coef,
-            entropy_coef=entropy_coef,
-            learning_rate=learning_rate,
-            max_grad_norm=max_grad_norm,
-            optimizer=optimizer,
-            use_clipped_value_loss=use_clipped_value_loss,
-            schedule=schedule,
-            desired_kl=desired_kl,
-            normalize_advantage_per_mini_batch=normalize_advantage_per_mini_batch,
-            device=device,
-            rnd_cfg=rnd_cfg,
-            symmetry_cfg=symmetry_cfg,
-            multi_gpu_cfg=multi_gpu_cfg,
-        )
+        super().__init__(actor=actor, critic=critic, storage=storage, **kwargs)
 
-        # AMP components
         self.amp_cfg = amp_cfg
+        self.amp_discriminator: AMPDiscriminator | None = None
+        self.amp_expert_data: AMPLoader | None = None
+        self.amp_storage: ReplayBuffer | None = None
+        self.amp_optimizer: optim.Optimizer | None = None
+        self.disc_update_decimation = 1
+        self.disc_update_counter = 0
+
+        self.task_rewards: torch.Tensor | None = None
+        self.style_rewards: torch.Tensor | None = None
+        self.final_rewards: torch.Tensor | None = None
+
         if amp_cfg is not None:
             self._init_amp(amp_cfg)
-        else:
-            self.amp_discriminator = None
-            self.amp_expert_data = None
-            self.amp_storage = None
-            self.amp_optimizer = None
-
-        # Reward tracking for logging
-        self.task_rewards = None
-        self.style_rewards = None
-        self.final_rewards = None
 
     def _init_amp(self, amp_cfg: dict) -> None:
-        """Initialize AMP components."""
-        # Initialize expert data loader
+        motion_files = amp_cfg.get("motion_files", [])
         self.amp_expert_data = AMPLoader(
             device=self.device,
             time_between_frames=amp_cfg.get("time_between_frames", 0.02),
-            motion_files=amp_cfg["motion_files"],
+            motion_files=motion_files,
             preload_transitions=amp_cfg.get("preload_transitions", True),
             num_preload_transitions=amp_cfg.get("num_preload_transitions", 100000),
         )
 
-        # Initialize discriminator
         amp_obs_dim = self.amp_expert_data.amp_obs_dim
         self.amp_discriminator = AMPDiscriminator(
-            input_dim=amp_obs_dim * 2,  # state + next_state
+            input_dim=amp_obs_dim * 2,
             hidden_dims=amp_cfg.get("discriminator_hidden_dims", [256, 128]),
             activation=amp_cfg.get("discriminator_activation", "elu"),
             amp_reward_coef=amp_cfg.get("reward_coef", 1.0),
@@ -116,108 +61,217 @@ class AMPPPO(PPO):
             task_reward_lerp=amp_cfg.get("task_reward_lerp", 0.0),
         ).to(self.device)
 
-        # Initialize policy data storage for discriminator
         self.amp_storage = ReplayBuffer(
             obs_dim=amp_obs_dim,
             buffer_size=amp_cfg.get("amp_buffer_size", 100000),
             device=self.device,
         )
-
-        # Initialize discriminator optimizer
         self.amp_optimizer = optim.Adam(
             self.amp_discriminator.parameters(),
             lr=amp_cfg.get("discriminator_learning_rate", 1e-4),
         )
-
-        # Discriminator update settings
         self.disc_update_decimation = amp_cfg.get("discriminator_update_decimation", 1)
-        self.disc_update_counter = 0
-
-        print(f"[AMPPPO] AMP initialized with obs_dim={amp_obs_dim}")
-        print(f"[AMPPPO] Discriminator: {self.amp_discriminator}")
-        print(f"[AMPPPO] Expert motions: {self.amp_expert_data.num_motions}")
 
     def process_env_step(
         self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
     ) -> None:
-        """Process environment step with AMP reward computation."""
-        # Store original task reward before modification
-        self.task_rewards = rewards.clone()
+        amp_task_rewards = rewards
+        if amp_task_rewards.dim() > 1 and amp_task_rewards.shape[-1] == 1:
+            amp_task_rewards = amp_task_rewards.squeeze(-1)
 
-        # Compute AMP rewards if enabled
-        if self.amp_discriminator is not None:
-            # Get AMP observations from extras or obs
-            if "amp_obs" in extras:
-                amp_obs = extras["amp_obs"]
-                amp_next_obs = extras["amp_next_obs"]
-            elif "amp" in obs:
-                amp_obs = obs["amp"]
-                amp_next_obs = extras.get("amp_next_obs", amp_obs)  # Fallback
-            else:
-                # AMP not available in this step
-                amp_obs = None
-                amp_next_obs = None
+        self.task_rewards = amp_task_rewards.clone()
+        self.style_rewards = None
+        self.final_rewards = None
 
-            if amp_obs is not None and amp_next_obs is not None:
-                # Compute AMP rewards
-                self.final_rewards, self.style_rewards, _, _, _ = self.amp_discriminator.predict_amp_reward(
-                    amp_obs, amp_next_obs, self.task_rewards
-                )
+        if self.amp_discriminator is not None and self.amp_storage is not None:
+            current_amp_obs = None
+            next_amp_obs = None
+            has_terminal_safe_next_obs = "amp_next_obs" in extras
 
-                # Store policy transitions for discriminator training
-                if dones.any():
-                    not_done_mask = ~dones
-                    if not_done_mask.any():
-                        self.amp_storage.add_transitions(amp_obs[not_done_mask], amp_next_obs[not_done_mask])
-                else:
-                    self.amp_storage.add_transitions(amp_obs, amp_next_obs)
+            if self.transition.observations is not None and "amp" in self.transition.observations.keys():
+                current_amp_obs = self.transition.observations["amp"]
+            if has_terminal_safe_next_obs:
+                next_amp_obs = extras["amp_next_obs"]
+            elif "amp" in obs.keys():
+                next_amp_obs = obs["amp"]
 
-                # Use AMP-combined reward
+            if current_amp_obs is not None and next_amp_obs is not None:
+                done_mask = dones.to(dtype=torch.bool).view(-1)
+                reward_mask = torch.ones_like(done_mask)
+                # If the environment only exposes post-reset observations, terminal transitions would use
+                # reset states as AMP next observations. Fall back to pure task reward on those transitions.
+                if not has_terminal_safe_next_obs:
+                    reward_mask = ~done_mask
+
+                self.final_rewards = self.task_rewards.clone()
+                self.style_rewards = torch.zeros_like(self.task_rewards)
+
+                if reward_mask.any():
+                    valid_final_rewards, valid_style_rewards, _, _, _ = self.amp_discriminator.predict_amp_reward(
+                        current_amp_obs[reward_mask],
+                        next_amp_obs[reward_mask],
+                        self.task_rewards[reward_mask],
+                    )
+                    self.final_rewards[reward_mask] = valid_final_rewards
+                    self.style_rewards[reward_mask] = valid_style_rewards
+
                 rewards = self.final_rewards
-        else:
-            self.style_rewards = None
-            self.final_rewards = None
 
-        # Call parent process_env_step with potentially modified rewards
+                valid_mask = ~done_mask
+                if valid_mask.any():
+                    self.amp_storage.insert(current_amp_obs[valid_mask], next_amp_obs[valid_mask])
+                elif has_terminal_safe_next_obs:
+                    # Keep behavior explicit: AMP replay buffer never stores reset transitions.
+                    pass
+                else:
+                    # No valid AMP transitions this step.
+                    pass
+
         super().process_env_step(obs, rewards, dones, extras)
 
     def update(self) -> dict[str, float]:
-        """Run optimization with AMP discriminator updates."""
+        mean_value_loss = 0
+        mean_surrogate_loss = 0
+        mean_entropy = 0
+        mean_rnd_loss = 0 if self.rnd else None
+        mean_symmetry_loss = 0 if self.symmetry else None
         mean_amp_loss = 0.0
         mean_grad_pen_loss = 0.0
         mean_policy_pred = 0.0
         mean_expert_pred = 0.0
         disc_actual_updates = 0
 
-        # Get mini batch generators
         if self.actor.is_recurrent or self.critic.is_recurrent:
-            ppo_generator = self.storage.recurrent_mini_batch_generator(
-                self.num_mini_batches, self.num_learning_epochs
-            )
+            generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         else:
-            ppo_generator = self.storage.mini_batch_generator(
-                self.num_mini_batches, self.num_learning_epochs
-            )
+            generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
 
-        # Create AMP generators if enabled
-        if self.amp_discriminator is not None:
+        if self.amp_discriminator is not None and self.amp_storage is not None and self.amp_expert_data is not None and self.amp_storage.num_samples > 0:
             total_batches = self.num_learning_epochs * self.num_mini_batches
             batch_size = self.storage.num_transitions_per_env * self.storage.num_envs // self.num_mini_batches
-
-            amp_policy_generator = self.amp_storage.mini_batch_generator(total_batches, batch_size)
+            amp_policy_generator = self.amp_storage.feed_forward_generator(total_batches, batch_size)
             amp_expert_generator = self.amp_expert_data.feed_forward_generator(total_batches, batch_size)
-
-            combined_generator = zip(ppo_generator, amp_policy_generator, amp_expert_generator)
+            combined_generator = zip(generator, amp_policy_generator, amp_expert_generator)
         else:
-            combined_generator = ((batch, None, None) for batch in ppo_generator)
+            combined_generator = ((batch, None, None) for batch in generator)
 
-        # Training loop
-        for ppo_batch, amp_policy_data, amp_expert_data in combined_generator:
-            # Standard PPO update (forward pass)
-            self._update_ppo_batch(ppo_batch)
+        for batch, amp_policy_data, amp_expert_data in combined_generator:
+            original_batch_size = batch.observations.batch_size[0]
 
-            # AMP discriminator update
-            if self.amp_discriminator is not None and amp_policy_data is not None and amp_expert_data is not None:
+            if self.normalize_advantage_per_mini_batch:
+                with torch.no_grad():
+                    batch.advantages = (batch.advantages - batch.advantages.mean()) / (batch.advantages.std() + 1e-8)  # type: ignore
+
+            if self.symmetry and self.symmetry["use_data_augmentation"]:
+                data_augmentation_func = self.symmetry["data_augmentation_func"]
+                batch.observations, batch.actions = data_augmentation_func(
+                    env=self.symmetry["_env"],
+                    obs=batch.observations,
+                    actions=batch.actions,
+                )
+                num_aug = int(batch.observations.batch_size[0] / original_batch_size)
+                batch.old_actions_log_prob = batch.old_actions_log_prob.repeat(num_aug, 1)
+                batch.values = batch.values.repeat(num_aug, 1)
+                batch.advantages = batch.advantages.repeat(num_aug, 1)
+                batch.returns = batch.returns.repeat(num_aug, 1)
+
+            self.actor(
+                batch.observations,
+                masks=batch.masks,
+                hidden_state=batch.hidden_states[0],
+                stochastic_output=True,
+            )
+            actions_log_prob = self.actor.get_output_log_prob(batch.actions)  # type: ignore
+            values = self.critic(batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[1])
+            distribution_params = tuple(p[:original_batch_size] for p in self.actor.output_distribution_params)
+            entropy = self.actor.output_entropy[:original_batch_size]
+
+            if self.desired_kl is not None and self.schedule == "adaptive":
+                with torch.inference_mode():
+                    kl = self.actor.get_kl_divergence(batch.old_distribution_params, distribution_params)  # type: ignore
+                    kl_mean = torch.mean(kl)
+
+                    if self.is_multi_gpu:
+                        torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
+                        kl_mean /= self.gpu_world_size
+
+                    if self.gpu_global_rank == 0:
+                        if kl_mean > self.desired_kl * 2.0:
+                            self.learning_rate = max(1e-5, self.learning_rate / 1.5)
+                        elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
+                            self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+
+                    if self.is_multi_gpu:
+                        lr_tensor = torch.tensor(self.learning_rate, device=self.device)
+                        torch.distributed.broadcast(lr_tensor, src=0)
+                        self.learning_rate = lr_tensor.item()
+
+                    for param_group in self.optimizer.param_groups:
+                        param_group["lr"] = self.learning_rate
+
+            ratio = torch.exp(actions_log_prob - torch.squeeze(batch.old_actions_log_prob))  # type: ignore
+            surrogate = -torch.squeeze(batch.advantages) * ratio  # type: ignore
+            surrogate_clipped = -torch.squeeze(batch.advantages) * torch.clamp(  # type: ignore
+                ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
+            )
+            surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+
+            if self.use_clipped_value_loss:
+                value_clipped = batch.values + (values - batch.values).clamp(-self.clip_param, self.clip_param)
+                value_losses = (values - batch.returns).pow(2)
+                value_losses_clipped = (value_clipped - batch.returns).pow(2)
+                value_loss = torch.max(value_losses, value_losses_clipped).mean()
+            else:
+                value_loss = (batch.returns - values).pow(2).mean()
+
+            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
+
+            if self.symmetry:
+                if not self.symmetry["use_data_augmentation"]:
+                    data_augmentation_func = self.symmetry["data_augmentation_func"]
+                    batch.observations, _ = data_augmentation_func(
+                        obs=batch.observations, actions=None, env=self.symmetry["_env"]
+                    )
+
+                mean_actions = self.actor(batch.observations.detach().clone())
+                action_mean_orig = mean_actions[:original_batch_size]
+                _, actions_mean_symm = data_augmentation_func(
+                    obs=None, actions=action_mean_orig, env=self.symmetry["_env"]
+                )
+
+                mse_loss = torch.nn.MSELoss()
+                symmetry_loss = mse_loss(
+                    mean_actions[original_batch_size:], actions_mean_symm.detach()[original_batch_size:]
+                )
+                if self.symmetry["use_mirror_loss"]:
+                    loss += self.symmetry["mirror_loss_coeff"] * symmetry_loss
+                else:
+                    symmetry_loss = symmetry_loss.detach()
+
+            if self.rnd:
+                with torch.no_grad():
+                    rnd_state = self.rnd.get_rnd_state(batch.observations[:original_batch_size])  # type: ignore
+                    rnd_state = self.rnd.state_normalizer(rnd_state)
+                predicted_embedding = self.rnd.predictor(rnd_state)
+                target_embedding = self.rnd.target(rnd_state).detach()
+                rnd_loss = torch.nn.MSELoss()(predicted_embedding, target_embedding)
+
+            self.optimizer.zero_grad()
+            loss.backward()
+            if self.rnd:
+                self.rnd_optimizer.zero_grad()
+                rnd_loss.backward()
+
+            if self.is_multi_gpu:
+                self.reduce_parameters()
+
+            nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+            nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+            self.optimizer.step()
+            if self.rnd_optimizer:
+                self.rnd_optimizer.step()
+
+            if amp_policy_data is not None and amp_expert_data is not None:
                 if self.disc_update_counter % self.disc_update_decimation == 0:
                     amp_loss, grad_pen_loss, policy_pred, expert_pred = self._update_discriminator(
                         amp_policy_data, amp_expert_data
@@ -227,15 +281,37 @@ class AMPPPO(PPO):
                     mean_policy_pred += policy_pred
                     mean_expert_pred += expert_pred
                     disc_actual_updates += 1
-
                 self.disc_update_counter += 1
 
-        # Compute average losses
-        num_updates = self.num_learning_epochs * self.num_mini_batches
-        loss_dict = self._compute_loss_dict(num_updates)
+            mean_value_loss += value_loss.item()
+            mean_surrogate_loss += surrogate_loss.item()
+            mean_entropy += entropy.mean().item()
+            if mean_rnd_loss is not None:
+                mean_rnd_loss += rnd_loss.item()
+            if mean_symmetry_loss is not None:
+                mean_symmetry_loss += symmetry_loss.item()
 
-        # Add AMP losses if applicable
-        if self.amp_discriminator is not None and disc_actual_updates > 0:
+        num_updates = self.num_learning_epochs * self.num_mini_batches
+        mean_value_loss /= num_updates
+        mean_surrogate_loss /= num_updates
+        mean_entropy /= num_updates
+        if mean_rnd_loss is not None:
+            mean_rnd_loss /= num_updates
+        if mean_symmetry_loss is not None:
+            mean_symmetry_loss /= num_updates
+
+        self.storage.clear()
+
+        loss_dict = {
+            "value": mean_value_loss,
+            "surrogate": mean_surrogate_loss,
+            "entropy": mean_entropy,
+        }
+        if self.rnd:
+            loss_dict["rnd"] = mean_rnd_loss
+        if self.symmetry:
+            loss_dict["symmetry"] = mean_symmetry_loss
+        if disc_actual_updates > 0:
             loss_dict["amp"] = mean_amp_loss / disc_actual_updates
             loss_dict["amp_grad_pen"] = mean_grad_pen_loss / disc_actual_updates
             loss_dict["amp_policy_pred"] = mean_policy_pred / disc_actual_updates
@@ -243,27 +319,15 @@ class AMPPPO(PPO):
 
         return loss_dict
 
-    def _update_ppo_batch(self, batch) -> None:
-        """Update PPO with a single batch."""
-        # This is a placeholder - actual implementation would be in the main loop
-        pass
-
     def _update_discriminator(
         self, policy_data: tuple[torch.Tensor, torch.Tensor], expert_data: tuple[torch.Tensor, torch.Tensor]
     ) -> tuple[float, float, float, float]:
-        """Update AMP discriminator.
+        if self.amp_discriminator is None or self.amp_optimizer is None:
+            raise RuntimeError("AMP discriminator is not initialized.")
 
-        Args:
-            policy_data: Tuple of (state, next_state) from policy rollouts.
-            expert_data: Tuple of (state, next_state) from expert data.
-
-        Returns:
-            Tuple of losses (amp_loss, grad_pen_loss, policy_pred, expert_pred).
-        """
         policy_state, policy_next_state = policy_data
         expert_state, expert_next_state = expert_data
 
-        # Update normalizer if enabled
         if self.amp_discriminator.normalize:
             self.amp_discriminator.update_normalization(policy_state)
             self.amp_discriminator.update_normalization(expert_state)
@@ -273,27 +337,20 @@ class AMPPPO(PPO):
                 expert_state = self.amp_discriminator.obs_normalizer(expert_state)
                 expert_next_state = self.amp_discriminator.obs_normalizer(expert_next_state)
 
-        # Compute discriminator outputs
         policy_input = torch.cat([policy_state, policy_next_state], dim=-1)
         expert_input = torch.cat([expert_state, expert_next_state], dim=-1)
 
         policy_d = self.amp_discriminator(policy_input)
         expert_d = self.amp_discriminator(expert_input)
 
-        # Compute losses (policy should output -1, expert should output +1)
         expert_loss = nn.MSELoss()(expert_d, torch.ones_like(expert_d))
         policy_loss = nn.MSELoss()(policy_d, -torch.ones_like(policy_d))
         amp_loss = 0.5 * (expert_loss + policy_loss)
-
-        # Gradient penalty on expert data
         grad_pen_loss = self.amp_discriminator.compute_grad_pen(expert_state, expert_next_state, lambda_=10.0)
+        total_loss = amp_loss + grad_pen_loss
 
-        # Total discriminator loss
-        discriminator_loss = amp_loss + grad_pen_loss
-
-        # Update discriminator
         self.amp_optimizer.zero_grad()
-        discriminator_loss.backward()
+        total_loss.backward()
         nn.utils.clip_grad_norm_(self.amp_discriminator.parameters(), self.max_grad_norm)
         self.amp_optimizer.step()
 
@@ -304,64 +361,51 @@ class AMPPPO(PPO):
             expert_d.mean().item(),
         )
 
-    def _compute_loss_dict(self, num_updates: int) -> dict[str, float]:
-        """Compute loss dictionary from PPO updates."""
-        # This would be populated during the training loop
-        # For now return empty dict, actual values computed in main loop
-        return {}
-
     def train_mode(self) -> None:
-        """Set train mode for all models including discriminator."""
         super().train_mode()
         if self.amp_discriminator is not None:
             self.amp_discriminator.train()
 
     def eval_mode(self) -> None:
-        """Set eval mode for all models including discriminator."""
         super().eval_mode()
         if self.amp_discriminator is not None:
             self.amp_discriminator.eval()
 
     def save(self) -> dict:
-        """Save all models including AMP discriminator."""
         saved_dict = super().save()
-        if self.amp_discriminator is not None:
+        if self.amp_discriminator is not None and self.amp_optimizer is not None:
             saved_dict["amp_discriminator_state_dict"] = self.amp_discriminator.state_dict()
             saved_dict["amp_optimizer_state_dict"] = self.amp_optimizer.state_dict()
         return saved_dict
 
-    def load(self, loaded_dict: dict, load_cfg: dict | None = None, strict: bool = True) -> bool:
-        """Load all models including AMP discriminator."""
+    def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
         result = super().load(loaded_dict, load_cfg, strict)
         if self.amp_discriminator is not None and "amp_discriminator_state_dict" in loaded_dict:
             self.amp_discriminator.load_state_dict(loaded_dict["amp_discriminator_state_dict"], strict=strict)
+        if self.amp_optimizer is not None and "amp_optimizer_state_dict" in loaded_dict:
             self.amp_optimizer.load_state_dict(loaded_dict["amp_optimizer_state_dict"])
         return result
 
     @staticmethod
-    def construct_algorithm(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> AMPPPO:
-        """Construct the AMPPPO algorithm."""
-        # Resolve classes
+    def construct_algorithm(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> "AMPPPO":
         alg_class: type[AMPPPO] = resolve_callable(cfg["algorithm"].pop("class_name"))
-        actor_class = resolve_callable(cfg["actor"].pop("class_name"))
-        critic_class = resolve_callable(cfg["critic"].pop("class_name"))
+        actor_class: type[MLPModel] = resolve_callable(cfg["actor"].pop("class_name"))
+        critic_class: type[MLPModel] = resolve_callable(cfg["critic"].pop("class_name"))
 
-        # Resolve observation groups
-        default_sets = ["actor", "critic"]
+        default_sets = ["actor", "critic", "amp"]
         if "rnd_cfg" in cfg["algorithm"] and cfg["algorithm"]["rnd_cfg"] is not None:
             default_sets.append("rnd_state")
-        if "amp_cfg" in cfg["algorithm"] and cfg["algorithm"]["amp_cfg"] is not None:
-            default_sets.append("amp")
         cfg["obs_groups"] = resolve_obs_groups(obs, cfg["obs_groups"], default_sets)
+        cfg["algorithm"] = resolve_rnd_config(cfg["algorithm"], obs, cfg["obs_groups"], env)
+        cfg["algorithm"] = resolve_symmetry_config(cfg["algorithm"], env)
+        cfg["algorithm"].pop("num_critics", None)
+        cfg["algorithm"].pop("reward_group_names", None)
+        cfg["algorithm"].pop("reward_group_weights", None)
 
-        # Initialize actor and critic
         actor = actor_class(obs, cfg["obs_groups"], "actor", env.num_actions, **cfg["actor"]).to(device)
+        if cfg["algorithm"].pop("share_cnn_encoders", None):
+            cfg["critic"]["cnns"] = actor.cnns  # type: ignore[attr-defined]
         critic = critic_class(obs, cfg["obs_groups"], "critic", 1, **cfg["critic"]).to(device)
 
-        # Initialize storage
         storage = RolloutStorage("rl", env.num_envs, cfg["num_steps_per_env"], obs, [env.num_actions], device)
-
-        # Initialize algorithm
-        alg = alg_class(actor, critic, storage, device=device, **cfg["algorithm"], multi_gpu_cfg=cfg["multi_gpu"])
-
-        return alg
+        return alg_class(actor, critic, storage, device=device, **cfg["algorithm"], multi_gpu_cfg=cfg["multi_gpu"])
