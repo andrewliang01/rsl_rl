@@ -11,7 +11,7 @@ from rsl_rl.models import AMPDiscriminator, MLPModel
 from rsl_rl.storage import ReplayBuffer, RolloutStorage
 from rsl_rl.utils import AMPLoader, resolve_callable, resolve_obs_groups
 from .multi_ppo import MultiPPO
-from .ppo_factory import AMP_STYLE_REWARD_GROUP_NAME, construct_ppo_algorithm
+from .ppo_factory import construct_ppo_algorithm
 
 
 class AMPPPO(MultiPPO):
@@ -38,6 +38,14 @@ class AMPPPO(MultiPPO):
         self.task_rewards: torch.Tensor | None = None
         self.style_rewards: torch.Tensor | None = None
         self.final_rewards: torch.Tensor | None = None
+        self.amp_task_reward_lerp = amp_cfg.get("task_reward_lerp", 0.0) if amp_cfg is not None else 0.0
+        self._amp_style_rewards_rollout: torch.Tensor | None = None
+        if self.is_multi_critic:
+            self._amp_style_rewards_rollout = torch.zeros(
+                self.storage.num_transitions_per_env,
+                self.storage.num_envs,
+                device=self.device,
+            )
 
         if amp_cfg is not None:
             self._init_amp(amp_cfg)
@@ -80,22 +88,12 @@ class AMPPPO(MultiPPO):
             return rewards.squeeze(-1)
         return rewards.sum(dim=-1)
 
-    def _uses_amp_style_channel(self) -> bool:
-        return self.is_multi_critic and len(self.reward_group_names) > 0 and self.reward_group_names[-1] == AMP_STYLE_REWARD_GROUP_NAME
-
-    def _compose_amp_multi_rewards(self, rewards: torch.Tensor) -> torch.Tensor:
-        if self.style_rewards is None:
-            raise RuntimeError("AMP style rewards are not initialized.")
-        if rewards.dim() == 1:
-            rewards = rewards.unsqueeze(-1)
-        return torch.cat([rewards, self.style_rewards.unsqueeze(-1)], dim=-1)
-
     def process_env_step(
         self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
     ) -> None:
         self.task_rewards = self._extract_amp_task_rewards(rewards).clone()
         self.final_rewards = self.task_rewards.clone()
-        self.style_rewards = torch.zeros_like(self.task_rewards) if self._uses_amp_style_channel() else None
+        self.style_rewards = torch.zeros_like(self.task_rewards)
 
         if self.amp_discriminator is not None and self.amp_storage is not None:
             current_amp_obs = None
@@ -124,8 +122,7 @@ class AMPPPO(MultiPPO):
                         self.task_rewards[reward_mask],
                     )
                     self.final_rewards[reward_mask] = valid_final_rewards
-                    if self.style_rewards is not None:
-                        self.style_rewards[reward_mask] = valid_style_rewards
+                    self.style_rewards[reward_mask] = valid_style_rewards
 
                 valid_mask = ~done_mask
                 if valid_mask.any():
@@ -137,12 +134,46 @@ class AMPPPO(MultiPPO):
                     # No valid AMP transitions this step.
                     pass
 
-        if self._uses_amp_style_channel():
-            rewards = self._compose_amp_multi_rewards(rewards)
+        if self.is_multi_critic and self._amp_style_rewards_rollout is not None and self.style_rewards is not None:
+            self._amp_style_rewards_rollout[self.storage.step].copy_(self.style_rewards)
         elif self.final_rewards is not None:
             rewards = self.final_rewards
 
         super().process_env_step(obs, rewards, dones, extras)
+
+    def compute_returns(self, obs: TensorDict) -> None:
+        super().compute_returns(obs)
+
+        if not self.is_multi_critic or self._amp_style_rewards_rollout is None:
+            return
+
+        st = self.storage
+        weighted_env_advantages = st.weighted_advantages.clone()
+        style_advantages = torch.zeros(
+            st.num_transitions_per_env,
+            st.num_envs,
+            device=self.device,
+        )
+        style_advantage = torch.zeros(st.num_envs, device=self.device)
+        for step in reversed(range(st.num_transitions_per_env)):
+            next_is_not_terminal = 1.0 - st.dones[step].float().squeeze(-1)
+            style_advantage = (
+                self._amp_style_rewards_rollout[step]
+                + next_is_not_terminal * self.gamma * self.lam * style_advantage
+            )
+            style_advantages[step] = style_advantage
+
+        if not self.normalize_advantage_per_mini_batch:
+            style_advantages = (style_advantages - style_advantages.mean()) / (style_advantages.std() + 1e-8)
+
+        st.weighted_advantages = (
+            self.amp_task_reward_lerp * weighted_env_advantages
+            + (1.0 - self.amp_task_reward_lerp) * style_advantages
+        )
+        if not self.normalize_advantage_per_mini_batch:
+            st.weighted_advantages = (
+                st.weighted_advantages - st.weighted_advantages.mean()
+            ) / (st.weighted_advantages.std() + 1e-8)
 
     def update(self) -> dict[str, float]:
         mean_value_loss = 0.0
