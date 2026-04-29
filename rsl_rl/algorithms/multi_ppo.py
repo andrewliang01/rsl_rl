@@ -33,6 +33,7 @@ from rsl_rl.models import MLPModel
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import resolve_callable, resolve_obs_groups, resolve_optimizer
 from rsl_rl.extensions import resolve_rnd_config, resolve_symmetry_config
+from .ppo_factory import construct_ppo_algorithm
 
 
 class MultiPPO(PPO):
@@ -610,95 +611,5 @@ class MultiPPO(PPO):
 
     @staticmethod
     def construct_algorithm(obs: TensorDict, env: VecEnv, cfg: dict, device: str):
-        """Construct the Multi-Critic PPO algorithm.
-
-        This factory method creates the appropriate algorithm based on configuration:
-        - If num_critics=1 or not specified: creates single critic (backward compatible)
-        - If num_critics>1: creates multiple critics
-        """
-        # Extract multi-critic parameters
-        alg_cfg = cfg.get("algorithm", {}).copy()
-        alg_cfg.pop("class_name", None)
-        share_cnn_encoders = alg_cfg.pop("share_cnn_encoders", False)
-        num_critics = alg_cfg.pop("num_critics", 1)
-        reward_group_names = alg_cfg.pop("reward_group_names", None)
-        reward_group_weights = alg_cfg.pop("reward_group_weights", None)
-        shared_critic = alg_cfg.pop("shared_critic", False)
-
-        # Resolve actor callable. Some downstream configclasses may omit class_name
-        # for plain MLP configs, so keep MLPModel as the default.
-        actor_cfg = cfg["actor"].copy()
-        actor_class = resolve_callable(actor_cfg.pop("class_name", "MLPModel"))
-
-        def resolve_critic_cfg(group_name: str | None = None) -> tuple[type[MLPModel], dict]:
-            critic_key = f"critic_{group_name}" if group_name else "critic"
-            if critic_key in cfg:
-                critic_cfg = cfg[critic_key].copy()
-            elif "critic" in cfg:
-                critic_cfg = cfg["critic"].copy()
-            else:
-                raise KeyError(
-                    f"Missing critic config. Expected '{critic_key}'"
-                    + (" or 'critic'." if critic_key != "critic" else ".")
-                )
-            critic_class = resolve_callable(critic_cfg.pop("class_name", "MLPModel"))
-            return critic_class, critic_cfg
-
-        # Resolve observation groups
-        default_sets = ["actor", "critic"]
-        if "rnd_cfg" in alg_cfg and alg_cfg["rnd_cfg"] is not None:
-            default_sets.append("rnd_state")
-        cfg["obs_groups"] = resolve_obs_groups(obs, cfg.get("obs_groups"), default_sets)
-
-        # Resolve RND and symmetry configs
-        alg_cfg = resolve_rnd_config(alg_cfg, obs, cfg["obs_groups"], env)
-        alg_cfg = resolve_symmetry_config(alg_cfg, env)
-
-        # Initialize the actor
-        actor = actor_class(obs, cfg["obs_groups"], "actor", env.num_actions, **actor_cfg).to(device)
-        print(f"Actor Model: {actor}")
-
-        # Initialize critic(s)
-        if num_critics > 1 and shared_critic:
-            critic_class, critic_cfg = resolve_critic_cfg()
-            critic_cfg.setdefault("num_heads", num_critics)
-            critic = critic_class(obs, cfg["obs_groups"], "critic", num_critics, **critic_cfg).to(device)
-            print(f"Created shared multi-head critic for groups: {reward_group_names}")
-        elif num_critics > 1:
-            # Multi-critic mode
-            critics = nn.ModuleList()
-            for i in range(num_critics):
-                group_name = reward_group_names[i] if reward_group_names is not None else str(i)
-                critic_class, critic_cfg = resolve_critic_cfg(group_name)
-                critic = critic_class(obs, cfg["obs_groups"], "critic", 1, **critic_cfg).to(device)
-                critics.append(critic)
-            print(f"Created {num_critics} critics for multi-critic training: {reward_group_names}")
-            critic = critics
-        else:
-            # Single critic mode
-            critic_class, critic_cfg = resolve_critic_cfg()
-            if share_cnn_encoders:
-                critic_cfg["cnns"] = actor.cnns
-            critic = critic_class(obs, cfg["obs_groups"], "critic", 1, **critic_cfg).to(device)
-            print(f"Critic Model: {critic}")
-
-        # Initialize storage with num_critics
-        storage = RolloutStorage(
-            "rl", env.num_envs, cfg["num_steps_per_env"], obs, [env.num_actions], device, num_critics=num_critics
-        )
-
-        # Initialize algorithm
-        alg = MultiPPO(
-            actor,
-            critic,
-            storage,
-            num_critics=num_critics,
-            reward_group_names=reward_group_names,
-            reward_group_weights=reward_group_weights,
-            shared_critic=shared_critic,
-            device=device,
-            **alg_cfg,
-            multi_gpu_cfg=cfg.get("multi_gpu"),
-        )
-
-        return alg
+        """Construct the multi-critic PPO variant from the shared PPO config."""
+        return construct_ppo_algorithm(obs, env, cfg, device, variant="auto")

@@ -5,15 +5,16 @@ import torch.nn as nn
 import torch.optim as optim
 from tensordict import TensorDict
 
-from rsl_rl.algorithms.ppo import PPO
 from rsl_rl.env import VecEnv
 from rsl_rl.extensions import resolve_rnd_config, resolve_symmetry_config
 from rsl_rl.models import AMPDiscriminator, MLPModel
 from rsl_rl.storage import ReplayBuffer, RolloutStorage
 from rsl_rl.utils import AMPLoader, resolve_callable, resolve_obs_groups
+from .multi_ppo import MultiPPO
+from .ppo_factory import AMP_STYLE_REWARD_GROUP_NAME, construct_ppo_algorithm
 
 
-class AMPPPO(PPO):
+class AMPPPO(MultiPPO):
     """PPO with AMP support that is compatible with the local rsl_rl 5.x APIs."""
 
     def __init__(
@@ -72,16 +73,29 @@ class AMPPPO(PPO):
         )
         self.disc_update_decimation = amp_cfg.get("discriminator_update_decimation", 1)
 
+    def _extract_amp_task_rewards(self, rewards: torch.Tensor) -> torch.Tensor:
+        if rewards.dim() == 1:
+            return rewards
+        if rewards.shape[-1] == 1:
+            return rewards.squeeze(-1)
+        return rewards.sum(dim=-1)
+
+    def _uses_amp_style_channel(self) -> bool:
+        return self.is_multi_critic and len(self.reward_group_names) > 0 and self.reward_group_names[-1] == AMP_STYLE_REWARD_GROUP_NAME
+
+    def _compose_amp_multi_rewards(self, rewards: torch.Tensor) -> torch.Tensor:
+        if self.style_rewards is None:
+            raise RuntimeError("AMP style rewards are not initialized.")
+        if rewards.dim() == 1:
+            rewards = rewards.unsqueeze(-1)
+        return torch.cat([rewards, self.style_rewards.unsqueeze(-1)], dim=-1)
+
     def process_env_step(
         self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
     ) -> None:
-        amp_task_rewards = rewards
-        if amp_task_rewards.dim() > 1 and amp_task_rewards.shape[-1] == 1:
-            amp_task_rewards = amp_task_rewards.squeeze(-1)
-
-        self.task_rewards = amp_task_rewards.clone()
-        self.style_rewards = None
-        self.final_rewards = None
+        self.task_rewards = self._extract_amp_task_rewards(rewards).clone()
+        self.final_rewards = self.task_rewards.clone()
+        self.style_rewards = torch.zeros_like(self.task_rewards) if self._uses_amp_style_channel() else None
 
         if self.amp_discriminator is not None and self.amp_storage is not None:
             current_amp_obs = None
@@ -103,9 +117,6 @@ class AMPPPO(PPO):
                 if not has_terminal_safe_next_obs:
                     reward_mask = ~done_mask
 
-                self.final_rewards = self.task_rewards.clone()
-                self.style_rewards = torch.zeros_like(self.task_rewards)
-
                 if reward_mask.any():
                     valid_final_rewards, valid_style_rewards, _, _, _ = self.amp_discriminator.predict_amp_reward(
                         current_amp_obs[reward_mask],
@@ -113,9 +124,8 @@ class AMPPPO(PPO):
                         self.task_rewards[reward_mask],
                     )
                     self.final_rewards[reward_mask] = valid_final_rewards
-                    self.style_rewards[reward_mask] = valid_style_rewards
-
-                rewards = self.final_rewards
+                    if self.style_rewards is not None:
+                        self.style_rewards[reward_mask] = valid_style_rewards
 
                 valid_mask = ~done_mask
                 if valid_mask.any():
@@ -127,26 +137,41 @@ class AMPPPO(PPO):
                     # No valid AMP transitions this step.
                     pass
 
+        if self._uses_amp_style_channel():
+            rewards = self._compose_amp_multi_rewards(rewards)
+        elif self.final_rewards is not None:
+            rewards = self.final_rewards
+
         super().process_env_step(obs, rewards, dones, extras)
 
     def update(self) -> dict[str, float]:
-        mean_value_loss = 0
-        mean_surrogate_loss = 0
-        mean_entropy = 0
-        mean_rnd_loss = 0 if self.rnd else None
-        mean_symmetry_loss = 0 if self.symmetry else None
+        mean_value_loss = 0.0
+        mean_surrogate_loss = 0.0
+        mean_entropy = 0.0
+        mean_rnd_loss = 0.0 if self.rnd else None
+        mean_symmetry_loss = 0.0 if self.symmetry else None
         mean_amp_loss = 0.0
         mean_grad_pen_loss = 0.0
         mean_policy_pred = 0.0
         mean_expert_pred = 0.0
         disc_actual_updates = 0
+        per_critic_value_losses = [0.0] * self.num_critics if self.is_multi_critic else None
 
-        if self.actor.is_recurrent or self.critic.is_recurrent:
+        if self.actor.is_recurrent or self._first_critic.is_recurrent:
             generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+        elif self.is_multi_critic:
+            generator = self.storage.mini_batch_generator(
+                self.num_mini_batches, self.num_learning_epochs, use_weighted_advantages=True
+            )
         else:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
 
-        if self.amp_discriminator is not None and self.amp_storage is not None and self.amp_expert_data is not None and self.amp_storage.num_samples > 0:
+        if (
+            self.amp_discriminator is not None
+            and self.amp_storage is not None
+            and self.amp_expert_data is not None
+            and self.amp_storage.num_samples > 0
+        ):
             total_batches = self.num_learning_epochs * self.num_mini_batches
             batch_size = self.storage.num_transitions_per_env * self.storage.num_envs // self.num_mini_batches
             amp_policy_generator = self.amp_storage.feed_forward_generator(total_batches, batch_size)
@@ -158,9 +183,17 @@ class AMPPPO(PPO):
         for batch, amp_policy_data, amp_expert_data in combined_generator:
             original_batch_size = batch.observations.batch_size[0]
 
-            if self.normalize_advantage_per_mini_batch:
-                with torch.no_grad():
-                    batch.advantages = (batch.advantages - batch.advantages.mean()) / (batch.advantages.std() + 1e-8)  # type: ignore
+            if self.is_multi_critic:
+                batch_weighted_advantages = batch.advantages
+                if self.normalize_advantage_per_mini_batch:
+                    with torch.no_grad():
+                        batch_weighted_advantages = (
+                            batch_weighted_advantages - batch_weighted_advantages.mean()
+                        ) / (batch_weighted_advantages.std() + 1e-8)
+            else:
+                if self.normalize_advantage_per_mini_batch:
+                    with torch.no_grad():
+                        batch.advantages = (batch.advantages - batch.advantages.mean()) / (batch.advantages.std() + 1e-8)  # type: ignore
 
             if self.symmetry and self.symmetry["use_data_augmentation"]:
                 data_augmentation_func = self.symmetry["data_augmentation_func"]
@@ -172,8 +205,11 @@ class AMPPPO(PPO):
                 num_aug = int(batch.observations.batch_size[0] / original_batch_size)
                 batch.old_actions_log_prob = batch.old_actions_log_prob.repeat(num_aug, 1)
                 batch.values = batch.values.repeat(num_aug, 1)
-                batch.advantages = batch.advantages.repeat(num_aug, 1)
                 batch.returns = batch.returns.repeat(num_aug, 1)
+                if self.is_multi_critic:
+                    batch_weighted_advantages = batch_weighted_advantages.repeat(num_aug)
+                else:
+                    batch.advantages = batch.advantages.repeat(num_aug, 1)
 
             self.actor(
                 batch.observations,
@@ -182,9 +218,24 @@ class AMPPPO(PPO):
                 stochastic_output=True,
             )
             actions_log_prob = self.actor.get_output_log_prob(batch.actions)  # type: ignore
-            values = self.critic(batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[1])
             distribution_params = tuple(p[:original_batch_size] for p in self.actor.output_distribution_params)
             entropy = self.actor.output_entropy[:original_batch_size]
+
+            if self.is_multi_critic:
+                if self.shared_critic:
+                    values = self._first_critic(
+                        batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[1]
+                    )
+                else:
+                    values_list = []
+                    for critic in self.critics:
+                        critic_values = critic(
+                            batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[1]
+                        )
+                        values_list.append(critic_values)
+                    values = torch.cat(values_list, dim=-1)
+            else:
+                values = self._first_critic(batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[1])
 
             if self.desired_kl is not None and self.schedule == "adaptive":
                 with torch.inference_mode():
@@ -210,10 +261,16 @@ class AMPPPO(PPO):
                         param_group["lr"] = self.learning_rate
 
             ratio = torch.exp(actions_log_prob - torch.squeeze(batch.old_actions_log_prob))  # type: ignore
-            surrogate = -torch.squeeze(batch.advantages) * ratio  # type: ignore
-            surrogate_clipped = -torch.squeeze(batch.advantages) * torch.clamp(  # type: ignore
-                ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
-            )
+            if self.is_multi_critic:
+                surrogate = -batch_weighted_advantages * ratio
+                surrogate_clipped = -batch_weighted_advantages * torch.clamp(
+                    ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
+                )
+            else:
+                surrogate = -torch.squeeze(batch.advantages) * ratio  # type: ignore
+                surrogate_clipped = -torch.squeeze(batch.advantages) * torch.clamp(  # type: ignore
+                    ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
+                )
             surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
 
             if self.use_clipped_value_loss:
@@ -223,6 +280,12 @@ class AMPPPO(PPO):
                 value_loss = torch.max(value_losses, value_losses_clipped).mean()
             else:
                 value_loss = (batch.returns - values).pow(2).mean()
+
+            if self.is_multi_critic and per_critic_value_losses is not None:
+                with torch.no_grad():
+                    for i in range(self.num_critics):
+                        critic_loss = (values[:, i] - batch.returns[:, i]).pow(2).mean()
+                        per_critic_value_losses[i] += critic_loss.item()
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
 
@@ -266,7 +329,8 @@ class AMPPPO(PPO):
                 self.reduce_parameters()
 
             nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-            nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+            for critic in self.critics:
+                nn.utils.clip_grad_norm_(critic.parameters(), self.max_grad_norm)
             self.optimizer.step()
             if self.rnd_optimizer:
                 self.rnd_optimizer.step()
@@ -295,10 +359,6 @@ class AMPPPO(PPO):
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
-        if mean_rnd_loss is not None:
-            mean_rnd_loss /= num_updates
-        if mean_symmetry_loss is not None:
-            mean_symmetry_loss /= num_updates
 
         self.storage.clear()
 
@@ -307,9 +367,14 @@ class AMPPPO(PPO):
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
         }
-        if self.rnd:
+        if self.is_multi_critic and per_critic_value_losses is not None:
+            for i, name in enumerate(self.reward_group_names):
+                loss_dict[f"value_{name}"] = per_critic_value_losses[i] / num_updates
+        if self.rnd and mean_rnd_loss is not None:
+            mean_rnd_loss /= num_updates
             loss_dict["rnd"] = mean_rnd_loss
-        if self.symmetry:
+        if self.symmetry and mean_symmetry_loss is not None:
+            mean_symmetry_loss /= num_updates
             loss_dict["symmetry"] = mean_symmetry_loss
         if disc_actual_updates > 0:
             loss_dict["amp"] = mean_amp_loss / disc_actual_updates
@@ -388,24 +453,4 @@ class AMPPPO(PPO):
 
     @staticmethod
     def construct_algorithm(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> "AMPPPO":
-        alg_class: type[AMPPPO] = resolve_callable(cfg["algorithm"].pop("class_name"))
-        actor_class: type[MLPModel] = resolve_callable(cfg["actor"].pop("class_name"))
-        critic_class: type[MLPModel] = resolve_callable(cfg["critic"].pop("class_name"))
-
-        default_sets = ["actor", "critic", "amp"]
-        if "rnd_cfg" in cfg["algorithm"] and cfg["algorithm"]["rnd_cfg"] is not None:
-            default_sets.append("rnd_state")
-        cfg["obs_groups"] = resolve_obs_groups(obs, cfg["obs_groups"], default_sets)
-        cfg["algorithm"] = resolve_rnd_config(cfg["algorithm"], obs, cfg["obs_groups"], env)
-        cfg["algorithm"] = resolve_symmetry_config(cfg["algorithm"], env)
-        cfg["algorithm"].pop("num_critics", None)
-        cfg["algorithm"].pop("reward_group_names", None)
-        cfg["algorithm"].pop("reward_group_weights", None)
-
-        actor = actor_class(obs, cfg["obs_groups"], "actor", env.num_actions, **cfg["actor"]).to(device)
-        if cfg["algorithm"].pop("share_cnn_encoders", None):
-            cfg["critic"]["cnns"] = actor.cnns  # type: ignore[attr-defined]
-        critic = critic_class(obs, cfg["obs_groups"], "critic", 1, **cfg["critic"]).to(device)
-
-        storage = RolloutStorage("rl", env.num_envs, cfg["num_steps_per_env"], obs, [env.num_actions], device)
-        return alg_class(actor, critic, storage, device=device, **cfg["algorithm"], multi_gpu_cfg=cfg["multi_gpu"])
+        return construct_ppo_algorithm(obs, env, cfg, device, variant="auto")
