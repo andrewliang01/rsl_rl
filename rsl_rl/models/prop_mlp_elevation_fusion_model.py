@@ -33,6 +33,11 @@ class PropMLPElevationFusionModel(nn.Module):
     is_recurrent: bool = False
     """Whether the model contains a recurrent module."""
 
+    _CNN_OBSERVATION_MODES = {
+        "elevationmap": 0,
+        "depthcamera": 1,
+    }
+
     def __init__(
         self,
         obs: TensorDict,
@@ -44,6 +49,9 @@ class PropMLPElevationFusionModel(nn.Module):
         obs_normalization: bool = False,
         distribution_cfg: dict | None = None,
         elevation_set: str = "height_scan_actor",
+        cnn_observation_type: str = "elevationmap",
+        depth_camera_near: float = 0.05,
+        depth_camera_far: float = 6.0,
         vision_spatial_size: tuple[int, int] = (25, 17),
         vision_feature_dim: int = 64,
         elevation_history_length: int = 5,
@@ -64,7 +72,11 @@ class PropMLPElevationFusionModel(nn.Module):
             activation: Activation function used by the MLP modules.
             obs_normalization: Whether to normalize proprio observations before the proprio MLP.
             distribution_cfg: Optional output distribution configuration.
-            elevation_set: Elevation observation-group name used by this model instance.
+            elevation_set: CNN observation-group name used by this model instance.
+            cnn_observation_type: Normalization path for the CNN observation. Supported values are
+                ``"elevationmap"`` and ``"depthcamera"``.
+            depth_camera_near: Near depth used by the depth-camera normalization branch.
+            depth_camera_far: Far depth used by the depth-camera normalization branch.
             vision_spatial_size: Spatial size ``(H, W)`` of the elevation map.
             vision_feature_dim: Output dimension of the elevation encoder.
             elevation_history_length: Number of elevation-history frames, used as CNN input channels.
@@ -78,6 +90,19 @@ class PropMLPElevationFusionModel(nn.Module):
 
         self.obs_set = obs_set
         self.elevation_set = elevation_set
+        self.cnn_observation_type = cnn_observation_type.lower()
+        if self.cnn_observation_type not in self._CNN_OBSERVATION_MODES:
+            raise ValueError(
+                f"Unsupported cnn_observation_type '{cnn_observation_type}'. "
+                f"Expected one of {tuple(self._CNN_OBSERVATION_MODES.keys())}."
+            )
+        if depth_camera_far <= depth_camera_near:
+            raise ValueError(
+                f"depth_camera_far must be greater than depth_camera_near, got {depth_camera_far} <= {depth_camera_near}."
+            )
+        self._cnn_observation_mode = self._CNN_OBSERVATION_MODES[self.cnn_observation_type]
+        self.depth_camera_near = float(depth_camera_near)
+        self.depth_camera_far = float(depth_camera_far)
 
         self.vision_feature_dim = vision_feature_dim
         self.vision_spatial_size = tuple(vision_spatial_size)
@@ -150,7 +175,7 @@ class PropMLPElevationFusionModel(nn.Module):
         proprio_features = self.prop_mlp(proprio_obs)
 
         elevation_obs = obs[self.elevation_set]
-        elevation_obs = self._normalize_elevation_map(elevation_obs)
+        elevation_obs = self._normalize_cnn_observation(elevation_obs)
         elevation_features = self.elevation_encoder(elevation_obs)
 
         return torch.cat((proprio_features, elevation_features), dim=-1)
@@ -235,10 +260,23 @@ class PropMLPElevationFusionModel(nn.Module):
             )
         return active_obs_groups, obs_dim
 
-    def _normalize_elevation_map(self, elevation_map: torch.Tensor) -> torch.Tensor:
-        """Normalize multi-frame elevation maps frame-wisely."""
-        elevation_mean = elevation_map.mean(dim=(-2, -1), keepdim=True)
-        return torch.clamp((elevation_map - elevation_mean) / 0.6, -3.0, 3.0)
+    def _normalize_cnn_observation(self, cnn_observation: torch.Tensor) -> torch.Tensor:
+        """Normalize the CNN observation according to its modality."""
+        if self._cnn_observation_mode == 0:
+            elevation_mean = cnn_observation.mean(dim=(-2, -1), keepdim=True)
+            return torch.clamp((cnn_observation - elevation_mean) / 0.6, -3.0, 3.0)
+
+        cnn_observation = torch.nan_to_num(
+            cnn_observation,
+            nan=self.depth_camera_far,
+            posinf=self.depth_camera_far,
+            neginf=self.depth_camera_near,
+        )
+        cnn_observation = torch.clamp(cnn_observation, self.depth_camera_near, self.depth_camera_far)
+        cnn_observation = (cnn_observation - self.depth_camera_near) / (
+            self.depth_camera_far - self.depth_camera_near
+        )
+        return cnn_observation * 2.0 - 1.0
 
 
 class _TorchPropMLPElevationFusionModel(nn.Module):
@@ -250,6 +288,9 @@ class _TorchPropMLPElevationFusionModel(nn.Module):
         self.prop_mlp = copy.deepcopy(model.prop_mlp)
         self.elevation_encoder = copy.deepcopy(model.elevation_encoder)
         self.mlp = copy.deepcopy(model.mlp)
+        self._cnn_observation_mode = model._cnn_observation_mode
+        self.depth_camera_near = model.depth_camera_near
+        self.depth_camera_far = model.depth_camera_far
         if model.distribution is not None:
             self.deterministic_output = model.distribution.as_deterministic_output_module()
         else:
@@ -258,15 +299,28 @@ class _TorchPropMLPElevationFusionModel(nn.Module):
     def forward(self, proprio_obs: torch.Tensor, elevation_obs: torch.Tensor) -> torch.Tensor:
         proprio_obs = self.obs_normalizer(proprio_obs)
         proprio_features = self.prop_mlp(proprio_obs)
-        elevation_obs = self._normalize_elevation_map(elevation_obs)
+        elevation_obs = self._normalize_cnn_observation(elevation_obs)
         elevation_features = self.elevation_encoder(elevation_obs)
         fused_features = torch.cat((proprio_features, elevation_features), dim=-1)
         out = self.mlp(fused_features)
         return self.deterministic_output(out)
 
-    def _normalize_elevation_map(self, elevation_map: torch.Tensor) -> torch.Tensor:
-        elevation_mean = elevation_map.mean(dim=(-2, -1), keepdim=True)
-        return torch.clamp((elevation_map - elevation_mean) / 0.6, -3.0, 3.0)
+    def _normalize_cnn_observation(self, cnn_observation: torch.Tensor) -> torch.Tensor:
+        if self._cnn_observation_mode == 0:
+            elevation_mean = cnn_observation.mean(dim=(-2, -1), keepdim=True)
+            return torch.clamp((cnn_observation - elevation_mean) / 0.6, -3.0, 3.0)
+
+        cnn_observation = torch.nan_to_num(
+            cnn_observation,
+            nan=self.depth_camera_far,
+            posinf=self.depth_camera_far,
+            neginf=self.depth_camera_near,
+        )
+        cnn_observation = torch.clamp(cnn_observation, self.depth_camera_near, self.depth_camera_far)
+        cnn_observation = (cnn_observation - self.depth_camera_near) / (
+            self.depth_camera_far - self.depth_camera_near
+        )
+        return cnn_observation * 2.0 - 1.0
 
     @torch.jit.export
     def reset(self) -> None:
@@ -292,6 +346,9 @@ class _OnnxPropMLPElevationFusionModel(nn.Module):
             self.deterministic_output = model.distribution.as_deterministic_output_module()
         else:
             self.deterministic_output = nn.Identity()
+        self._cnn_observation_mode = model._cnn_observation_mode
+        self.depth_camera_near = model.depth_camera_near
+        self.depth_camera_far = model.depth_camera_far
         self.proprio_input_size = model.obs_dim
         self.elevation_history_length = model.elevation_history_length
         self.vision_spatial_size = model.vision_spatial_size
@@ -311,15 +368,28 @@ class _OnnxPropMLPElevationFusionModel(nn.Module):
 
         proprio_obs = self.obs_normalizer(proprio_obs)
         proprio_features = self.prop_mlp(proprio_obs)
-        elevation_obs = self._normalize_elevation_map(elevation_obs)
+        elevation_obs = self._normalize_cnn_observation(elevation_obs)
         elevation_features = self.elevation_encoder(elevation_obs)
         fused_features = torch.cat((proprio_features, elevation_features), dim=-1)
         out = self.mlp(fused_features)
         return self.deterministic_output(out)
 
-    def _normalize_elevation_map(self, elevation_map: torch.Tensor) -> torch.Tensor:
-        elevation_mean = elevation_map.mean(dim=(-2, -1), keepdim=True)
-        return torch.clamp((elevation_map - elevation_mean) / 0.6, -3.0, 3.0)
+    def _normalize_cnn_observation(self, cnn_observation: torch.Tensor) -> torch.Tensor:
+        if self._cnn_observation_mode == 0:
+            elevation_mean = cnn_observation.mean(dim=(-2, -1), keepdim=True)
+            return torch.clamp((cnn_observation - elevation_mean) / 0.6, -3.0, 3.0)
+
+        cnn_observation = torch.nan_to_num(
+            cnn_observation,
+            nan=self.depth_camera_far,
+            posinf=self.depth_camera_far,
+            neginf=self.depth_camera_near,
+        )
+        cnn_observation = torch.clamp(cnn_observation, self.depth_camera_near, self.depth_camera_far)
+        cnn_observation = (cnn_observation - self.depth_camera_near) / (
+            self.depth_camera_far - self.depth_camera_near
+        )
+        return cnn_observation * 2.0 - 1.0
 
     def get_dummy_inputs(self) -> tuple[torch.Tensor, torch.Tensor]:
         if self.input_mode == "single":
