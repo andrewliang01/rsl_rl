@@ -266,11 +266,11 @@ class PropMLPElevationFusionModel(nn.Module):
             elevation_mean = cnn_observation.mean(dim=(-2, -1), keepdim=True)
             return torch.clamp((cnn_observation - elevation_mean) / 0.6, -3.0, 3.0)
 
-        cnn_observation = torch.nan_to_num(
+        invalid_mask = (~torch.isfinite(cnn_observation)) | (cnn_observation <= 0.0)
+        cnn_observation = torch.where(
+            invalid_mask,
+            torch.full_like(cnn_observation, self.depth_camera_far),
             cnn_observation,
-            nan=self.depth_camera_far,
-            posinf=self.depth_camera_far,
-            neginf=self.depth_camera_near,
         )
         cnn_observation = torch.clamp(cnn_observation, self.depth_camera_near, self.depth_camera_far)
         cnn_observation = (cnn_observation - self.depth_camera_near) / (
@@ -310,11 +310,11 @@ class _TorchPropMLPElevationFusionModel(nn.Module):
             elevation_mean = cnn_observation.mean(dim=(-2, -1), keepdim=True)
             return torch.clamp((cnn_observation - elevation_mean) / 0.6, -3.0, 3.0)
 
-        cnn_observation = torch.nan_to_num(
+        invalid_mask = (~torch.isfinite(cnn_observation)) | (cnn_observation <= 0.0)
+        cnn_observation = torch.where(
+            invalid_mask,
+            torch.full_like(cnn_observation, self.depth_camera_far),
             cnn_observation,
-            nan=self.depth_camera_far,
-            posinf=self.depth_camera_far,
-            neginf=self.depth_camera_near,
         )
         cnn_observation = torch.clamp(cnn_observation, self.depth_camera_near, self.depth_camera_far)
         cnn_observation = (cnn_observation - self.depth_camera_near) / (
@@ -379,11 +379,11 @@ class _OnnxPropMLPElevationFusionModel(nn.Module):
             elevation_mean = cnn_observation.mean(dim=(-2, -1), keepdim=True)
             return torch.clamp((cnn_observation - elevation_mean) / 0.6, -3.0, 3.0)
 
-        cnn_observation = torch.nan_to_num(
+        invalid_mask = (~torch.isfinite(cnn_observation)) | (cnn_observation <= 0.0)
+        cnn_observation = torch.where(
+            invalid_mask,
+            torch.full_like(cnn_observation, self.depth_camera_far),
             cnn_observation,
-            nan=self.depth_camera_far,
-            posinf=self.depth_camera_far,
-            neginf=self.depth_camera_near,
         )
         cnn_observation = torch.clamp(cnn_observation, self.depth_camera_near, self.depth_camera_far)
         cnn_observation = (cnn_observation - self.depth_camera_near) / (
