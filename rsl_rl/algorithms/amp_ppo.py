@@ -176,17 +176,19 @@ class AMPPPO(MultiPPO):
             ) / (st.weighted_advantages.std() + 1e-8)
 
     def update(self) -> dict[str, float]:
-        mean_value_loss = 0.0
-        mean_surrogate_loss = 0.0
-        mean_entropy = 0.0
-        mean_rnd_loss = 0.0 if self.rnd else None
-        mean_symmetry_loss = 0.0 if self.symmetry else None
-        mean_amp_loss = 0.0
-        mean_grad_pen_loss = 0.0
-        mean_policy_pred = 0.0
-        mean_expert_pred = 0.0
+        mean_value_loss = torch.zeros((), device=self.device)
+        mean_surrogate_loss = torch.zeros((), device=self.device)
+        mean_entropy = torch.zeros((), device=self.device)
+        mean_rnd_loss = torch.zeros((), device=self.device) if self.rnd else None
+        mean_symmetry_loss = torch.zeros((), device=self.device) if self.symmetry else None
+        mean_amp_loss = torch.zeros((), device=self.device)
+        mean_grad_pen_loss = torch.zeros((), device=self.device)
+        mean_policy_pred = torch.zeros((), device=self.device)
+        mean_expert_pred = torch.zeros((), device=self.device)
         disc_actual_updates = 0
-        per_critic_value_losses = [0.0] * self.num_critics if self.is_multi_critic else None
+        per_critic_value_losses = (
+            [torch.zeros((), device=self.device) for _ in range(self.num_critics)] if self.is_multi_critic else None
+        )
 
         if self.actor.is_recurrent or self._first_critic.is_recurrent:
             generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
@@ -316,7 +318,7 @@ class AMPPPO(MultiPPO):
                 with torch.no_grad():
                     for i in range(self.num_critics):
                         critic_loss = (values[:, i] - batch.returns[:, i]).pow(2).mean()
-                        per_critic_value_losses[i] += critic_loss.item()
+                        per_critic_value_losses[i] += critic_loss.detach()
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
 
@@ -350,10 +352,10 @@ class AMPPPO(MultiPPO):
                 target_embedding = self.rnd.target(rnd_state).detach()
                 rnd_loss = torch.nn.MSELoss()(predicted_embedding, target_embedding)
 
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
             if self.rnd:
-                self.rnd_optimizer.zero_grad()
+                self.rnd_optimizer.zero_grad(set_to_none=True)
                 rnd_loss.backward()
 
             if self.is_multi_gpu:
@@ -378,13 +380,13 @@ class AMPPPO(MultiPPO):
                     disc_actual_updates += 1
                 self.disc_update_counter += 1
 
-            mean_value_loss += value_loss.item()
-            mean_surrogate_loss += surrogate_loss.item()
-            mean_entropy += entropy.mean().item()
+            mean_value_loss += value_loss.detach()
+            mean_surrogate_loss += surrogate_loss.detach()
+            mean_entropy += entropy.detach().mean()
             if mean_rnd_loss is not None:
-                mean_rnd_loss += rnd_loss.item()
+                mean_rnd_loss += rnd_loss.detach()
             if mean_symmetry_loss is not None:
-                mean_symmetry_loss += symmetry_loss.item()
+                mean_symmetry_loss += symmetry_loss.detach()
 
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
@@ -394,30 +396,30 @@ class AMPPPO(MultiPPO):
         self.storage.clear()
 
         loss_dict = {
-            "value": mean_value_loss,
-            "surrogate": mean_surrogate_loss,
-            "entropy": mean_entropy,
+            "value": mean_value_loss.item(),
+            "surrogate": mean_surrogate_loss.item(),
+            "entropy": mean_entropy.item(),
         }
         if self.is_multi_critic and per_critic_value_losses is not None:
             for i, name in enumerate(self.reward_group_names):
-                loss_dict[f"value_{name}"] = per_critic_value_losses[i] / num_updates
+                loss_dict[f"value_{name}"] = (per_critic_value_losses[i] / num_updates).item()
         if self.rnd and mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
-            loss_dict["rnd"] = mean_rnd_loss
+            loss_dict["rnd"] = mean_rnd_loss.item()
         if self.symmetry and mean_symmetry_loss is not None:
             mean_symmetry_loss /= num_updates
-            loss_dict["symmetry"] = mean_symmetry_loss
+            loss_dict["symmetry"] = mean_symmetry_loss.item()
         if disc_actual_updates > 0:
-            loss_dict["amp"] = mean_amp_loss / disc_actual_updates
-            loss_dict["amp_grad_pen"] = mean_grad_pen_loss / disc_actual_updates
-            loss_dict["amp_policy_pred"] = mean_policy_pred / disc_actual_updates
-            loss_dict["amp_expert_pred"] = mean_expert_pred / disc_actual_updates
+            loss_dict["amp"] = (mean_amp_loss / disc_actual_updates).item()
+            loss_dict["amp_grad_pen"] = (mean_grad_pen_loss / disc_actual_updates).item()
+            loss_dict["amp_policy_pred"] = (mean_policy_pred / disc_actual_updates).item()
+            loss_dict["amp_expert_pred"] = (mean_expert_pred / disc_actual_updates).item()
 
         return loss_dict
 
     def _update_discriminator(
         self, policy_data: tuple[torch.Tensor, torch.Tensor], expert_data: tuple[torch.Tensor, torch.Tensor]
-    ) -> tuple[float, float, float, float]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.amp_discriminator is None or self.amp_optimizer is None:
             raise RuntimeError("AMP discriminator is not initialized.")
 
@@ -435,26 +437,25 @@ class AMPPPO(MultiPPO):
 
         policy_input = torch.cat([policy_state, policy_next_state], dim=-1)
         expert_input = torch.cat([expert_state, expert_next_state], dim=-1)
+        discriminator_input = torch.cat((policy_input, expert_input), dim=0)
+        policy_d, expert_d = self.amp_discriminator(discriminator_input).chunk(2, dim=0)
 
-        policy_d = self.amp_discriminator(policy_input)
-        expert_d = self.amp_discriminator(expert_input)
-
-        expert_loss = nn.MSELoss()(expert_d, torch.ones_like(expert_d))
-        policy_loss = nn.MSELoss()(policy_d, -torch.ones_like(policy_d))
+        expert_loss = (expert_d - 1.0).pow(2).mean()
+        policy_loss = (policy_d + 1.0).pow(2).mean()
         amp_loss = 0.5 * (expert_loss + policy_loss)
         grad_pen_loss = self.amp_discriminator.compute_grad_pen(expert_state, expert_next_state, lambda_=10.0)
         total_loss = amp_loss + grad_pen_loss
 
-        self.amp_optimizer.zero_grad()
+        self.amp_optimizer.zero_grad(set_to_none=True)
         total_loss.backward()
         nn.utils.clip_grad_norm_(self.amp_discriminator.parameters(), self.max_grad_norm)
         self.amp_optimizer.step()
 
         return (
-            amp_loss.item(),
-            grad_pen_loss.item(),
-            policy_d.mean().item(),
-            expert_d.mean().item(),
+            amp_loss.detach(),
+            grad_pen_loss.detach(),
+            policy_d.detach().mean(),
+            expert_d.detach().mean(),
         )
 
     def train_mode(self) -> None:

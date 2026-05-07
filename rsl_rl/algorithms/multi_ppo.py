@@ -245,9 +245,7 @@ class MultiPPO(PPO):
                 # Each critic gets its own bootstrap value
                 self.transition.rewards += self.gamma * self.transition.values * timeouts
             else:
-                self.transition.rewards += self.gamma * torch.squeeze(
-                    self.transition.values * timeouts, 1
-                )
+                self.transition.rewards += self.gamma * self.transition.values * timeouts
 
         # Record the transition
         self.storage.add_transition(self.transition)

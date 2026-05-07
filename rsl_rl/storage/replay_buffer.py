@@ -16,7 +16,6 @@
 # with additional modifications by the TienKung-Lab Project,
 # and is distributed under the BSD-3-Clause license.
 
-import numpy as np
 import torch
 
 
@@ -56,5 +55,8 @@ class ReplayBuffer:
 
     def feed_forward_generator(self, num_mini_batch, mini_batch_size):
         for _ in range(num_mini_batch):
-            sample_idxs = np.random.choice(self.num_samples, size=mini_batch_size)
-            yield (self.states[sample_idxs].to(self.device), self.next_states[sample_idxs].to(self.device))
+            sample_idxs = torch.randint(self.num_samples, (mini_batch_size,), device=self.device)
+            yield (
+                self.states.index_select(0, sample_idxs),
+                self.next_states.index_select(0, sample_idxs),
+            )

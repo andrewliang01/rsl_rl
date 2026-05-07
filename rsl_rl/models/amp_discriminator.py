@@ -86,10 +86,10 @@ class AMPDiscriminator(nn.Module):
             Scalar gradient penalty loss.
         """
         expert_data = torch.cat([expert_state, expert_next_state], dim=-1)
-        expert_data.requires_grad = True
+        expert_data.requires_grad_(True)
 
         disc = self.forward(expert_data)
-        ones = torch.ones(disc.size(), device=disc.device)
+        ones = torch.ones_like(disc)
         grad = autograd.grad(
             outputs=disc,
             inputs=expert_data,
