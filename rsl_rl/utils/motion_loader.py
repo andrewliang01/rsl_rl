@@ -206,9 +206,9 @@ class AMPLoader:
         """
         for _ in range(num_mini_batch):
             if self.preload_transitions:
-                idxs = torch.randint(self.preloaded_s.shape[0], (mini_batch_size,), device=self.device)
-                s = self.preloaded_s.index_select(0, idxs)
-                s_next = self.preloaded_s_next.index_select(0, idxs)
+                idxs = np.random.choice(self.preloaded_s.shape[0], size=mini_batch_size)
+                s = self.preloaded_s[idxs, AMPLoader.JOINT_POSE_START_IDX:AMPLoader.END_POS_END_IDX]
+                s_next = self.preloaded_s_next[idxs, AMPLoader.JOINT_POSE_START_IDX:AMPLoader.END_POS_END_IDX]
             else:
                 traj_idxs = self.weighted_traj_idx_sample_batch(mini_batch_size)
                 times = self.traj_time_sample_batch(traj_idxs)

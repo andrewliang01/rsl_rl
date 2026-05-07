@@ -103,6 +103,22 @@ class AMPDiscriminator(nn.Module):
         grad_pen = lambda_ * grad.norm(2, dim=1).pow(2).mean()
         return grad_pen
 
+
+    def compute_grad_pen_from_disc(
+        self, expert_data: torch.Tensor, disc: torch.Tensor, lambda_: float = 10.0
+    ) -> torch.Tensor:
+        """Compute gradient penalty from an existing discriminator forward pass."""
+        ones = torch.ones_like(disc)
+        grad = autograd.grad(
+            outputs=disc,
+            inputs=expert_data,
+            grad_outputs=ones,
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True,
+        )[0]
+        return lambda_ * grad.norm(2, dim=1).pow(2).mean()
+
     def predict_amp_reward(
         self, state: torch.Tensor, next_state: torch.Tensor, task_reward: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, ...]:

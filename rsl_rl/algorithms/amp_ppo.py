@@ -436,14 +436,15 @@ class AMPPPO(MultiPPO):
                 expert_next_state = self.amp_discriminator.obs_normalizer(expert_next_state)
 
         policy_input = torch.cat([policy_state, policy_next_state], dim=-1)
-        expert_input = torch.cat([expert_state, expert_next_state], dim=-1)
-        discriminator_input = torch.cat((policy_input, expert_input), dim=0)
-        policy_d, expert_d = self.amp_discriminator(discriminator_input).chunk(2, dim=0)
+        expert_input = torch.cat([expert_state, expert_next_state], dim=-1).requires_grad_(True)
+
+        policy_d = self.amp_discriminator(policy_input)
+        expert_d = self.amp_discriminator(expert_input)
 
         expert_loss = (expert_d - 1.0).pow(2).mean()
         policy_loss = (policy_d + 1.0).pow(2).mean()
         amp_loss = 0.5 * (expert_loss + policy_loss)
-        grad_pen_loss = self.amp_discriminator.compute_grad_pen(expert_state, expert_next_state, lambda_=10.0)
+        grad_pen_loss = self.amp_discriminator.compute_grad_pen_from_disc(expert_input, expert_d, lambda_=10.0)
         total_loss = amp_loss + grad_pen_loss
 
         self.amp_optimizer.zero_grad(set_to_none=True)
