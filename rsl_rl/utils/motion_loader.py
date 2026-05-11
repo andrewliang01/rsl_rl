@@ -6,6 +6,9 @@
 """Motion loader for Adversarial Motion Prior (AMP)."""
 
 import json
+import os
+from collections.abc import Sequence
+
 import numpy as np
 import torch
 
@@ -38,11 +41,19 @@ class AMPLoader:
     END_POS_START_IDX = JOINT_VEL_END_IDX
     END_POS_END_IDX = END_POS_START_IDX + END_EFFECTOR_POS_SIZE
 
+    JOINT_EE_LOADER_TYPE = "joint_ee_json"
+    BODY_KINEMATICS_LOADER_TYPE = "body_kinematics_npz"
+
     def __init__(
         self,
         device: torch.device,
         time_between_frames: float,
-        motion_files: list[str],
+        motion_files: list[str] | str,
+        loader_type: str = JOINT_EE_LOADER_TYPE,
+        body_names: Sequence[str] = (),
+        anchor_name: str = "",
+        motion_body_names: Sequence[str] = (),
+        all_body_names: Sequence[str] = (),
         preload_transitions: bool = True,
         num_preload_transitions: int = 100000,
     ) -> None:
@@ -50,6 +61,8 @@ class AMPLoader:
         self.time_between_frames = time_between_frames
         self.preload_transitions = preload_transitions
         self.num_preload_transitions = num_preload_transitions
+        self.loader_type = self._normalize_loader_type(loader_type)
+        self._amp_obs_dim = 0
 
         # Load trajectories from motion files
         self.trajectories = []
@@ -61,30 +74,13 @@ class AMPLoader:
         self.trajectory_frame_durations = []
         self.trajectory_num_frames = []
 
-        for i, motion_file in enumerate(motion_files):
-            self.trajectory_names.append(motion_file.split(".")[0])
-            with open(motion_file) as f:
-                motion_json = json.load(f)
-                motion_data = np.array(motion_json["Frames"])
+        if self.loader_type == self.BODY_KINEMATICS_LOADER_TYPE:
+            self._load_body_kinematics_npz(motion_files, body_names, anchor_name, motion_body_names, all_body_names)
+        else:
+            self._load_joint_ee_json(motion_files)
 
-                # Store full trajectory (joint pos, joint vel, end effector pos)
-                self.trajectories.append(
-                    torch.tensor(motion_data[:, :AMPLoader.END_POS_END_IDX], dtype=torch.float32, device=device)
-                )
-                self.trajectories_full.append(
-                    torch.tensor(motion_data[:, :AMPLoader.END_POS_END_IDX], dtype=torch.float32, device=device)
-                )
-                self.trajectory_idxs.append(i)
-                self.trajectory_weights.append(float(motion_json.get("MotionWeight", 1.0)))
-
-                frame_duration = float(motion_json.get("FrameDuration", 0.02))
-                self.trajectory_frame_durations.append(frame_duration)
-
-                traj_len = (motion_data.shape[0] - 1) * frame_duration
-                self.trajectory_lens.append(traj_len)
-                self.trajectory_num_frames.append(float(motion_data.shape[0]))
-
-                print(f"[AMPLoader] Loaded {traj_len:.2f}s motion from {motion_file}")
+        if len(self.trajectories) == 0:
+            raise ValueError(f"[AMPLoader] No motion files loaded for loader_type={self.loader_type}")
 
         # Normalize trajectory weights for sampling
         self.trajectory_weights = np.array(self.trajectory_weights)
@@ -98,6 +94,185 @@ class AMPLoader:
             print(f"[AMPLoader] Preloading {num_preload_transitions} transitions...")
             self._preload_transitions()
             print("[AMPLoader] Preloading complete")
+
+    @staticmethod
+    def _normalize_loader_type(loader_type: str) -> str:
+        aliases = {
+            "legacy": AMPLoader.JOINT_EE_LOADER_TYPE,
+            "joint_ee": AMPLoader.JOINT_EE_LOADER_TYPE,
+            "joint_ee_json": AMPLoader.JOINT_EE_LOADER_TYPE,
+            "json": AMPLoader.JOINT_EE_LOADER_TYPE,
+            "txt": AMPLoader.JOINT_EE_LOADER_TYPE,
+            "mimic": AMPLoader.BODY_KINEMATICS_LOADER_TYPE,
+            "body_npz": AMPLoader.BODY_KINEMATICS_LOADER_TYPE,
+            "body_kinematics": AMPLoader.BODY_KINEMATICS_LOADER_TYPE,
+            "body_kinematics_npz": AMPLoader.BODY_KINEMATICS_LOADER_TYPE,
+            "npz": AMPLoader.BODY_KINEMATICS_LOADER_TYPE,
+        }
+        normalized = aliases.get(str(loader_type), str(loader_type))
+        if normalized not in (AMPLoader.JOINT_EE_LOADER_TYPE, AMPLoader.BODY_KINEMATICS_LOADER_TYPE):
+            raise ValueError(f"[AMPLoader] Unknown loader_type: {loader_type}")
+        return normalized
+
+    @staticmethod
+    def _expand_motion_files(motion_files: list[str] | str, extensions: tuple[str, ...]) -> list[str]:
+        raw_files = [motion_files] if isinstance(motion_files, str) else list(motion_files)
+        expanded: list[str] = []
+        for path in raw_files:
+            if os.path.isdir(path):
+                for root, _dirs, filenames in os.walk(path):
+                    for filename in filenames:
+                        if filename.endswith(extensions):
+                            expanded.append(os.path.join(root, filename))
+            elif path.endswith(extensions):
+                expanded.append(path)
+            else:
+                expanded.append(path)
+        return sorted(expanded)
+
+    def _load_joint_ee_json(self, motion_files: list[str] | str) -> None:
+        self._amp_obs_dim = AMPLoader.END_POS_END_IDX - AMPLoader.JOINT_POSE_START_IDX
+        for i, motion_file in enumerate(self._expand_motion_files(motion_files, (".txt", ".json"))):
+            self.trajectory_names.append(os.path.splitext(motion_file)[0])
+            with open(motion_file) as f:
+                motion_json = json.load(f)
+                motion_data = np.array(motion_json["Frames"], dtype=np.float32)
+
+            if motion_data.shape[1] < AMPLoader.END_POS_END_IDX:
+                raise ValueError(
+                    f"[AMPLoader] {motion_file} has {motion_data.shape[1]} dims, "
+                    f"expected at least {AMPLoader.END_POS_END_IDX}"
+                )
+
+            trajectory = torch.tensor(
+                motion_data[:, AMPLoader.JOINT_POSE_START_IDX:AMPLoader.END_POS_END_IDX],
+                dtype=torch.float32,
+                device=self.device,
+            )
+            self.trajectories.append(trajectory)
+            self.trajectories_full.append(trajectory)
+            self.trajectory_idxs.append(i)
+            self.trajectory_weights.append(float(motion_json.get("MotionWeight", 1.0)))
+
+            frame_duration = float(motion_json.get("FrameDuration", 0.02))
+            self.trajectory_frame_durations.append(frame_duration)
+            traj_len = max(0.0, (motion_data.shape[0] - 1) * frame_duration)
+            self.trajectory_lens.append(traj_len)
+            self.trajectory_num_frames.append(float(motion_data.shape[0]))
+
+            print(f"[AMPLoader] Loaded {traj_len:.2f}s {self.loader_type} motion from {motion_file}")
+
+    def _load_body_kinematics_npz(
+        self,
+        motion_files: list[str] | str,
+        body_names: Sequence[str],
+        anchor_name: str,
+        motion_body_names: Sequence[str],
+        all_body_names: Sequence[str],
+    ) -> None:
+        if not body_names:
+            raise ValueError("[AMPLoader] body_kinematics_npz requires non-empty body_names")
+        if not anchor_name:
+            raise ValueError("[AMPLoader] body_kinematics_npz requires anchor_name")
+
+        import isaaclab.utils.math as math_utils
+
+        requested_names = tuple(body_names) + (anchor_name,)
+        if all_body_names:
+            missing_robot_names = [name for name in requested_names if name not in all_body_names]
+            if missing_robot_names:
+                raise ValueError(f"[AMPLoader] body names not found in robot model: {missing_robot_names}")
+
+        motion_body_names = list(motion_body_names or all_body_names)
+        if not motion_body_names:
+            raise ValueError(
+                "[AMPLoader] body_kinematics_npz requires motion_body_names. "
+                "This list must match the body axis order stored in the npz files."
+            )
+        missing_motion_names = [name for name in requested_names if name not in motion_body_names]
+        if missing_motion_names:
+            raise ValueError(f"[AMPLoader] body names not found in npz motion body list: {missing_motion_names}")
+
+        body_indexes = [motion_body_names.index(name) for name in body_names]
+        anchor_index = motion_body_names.index(anchor_name)
+        num_bodies = len(body_indexes)
+        self._amp_obs_dim = num_bodies * (3 + 6 + 3 + 3)
+
+        for i, motion_file in enumerate(self._expand_motion_files(motion_files, (".npz",))):
+            data = np.load(motion_file)
+            required_keys = (
+                "fps",
+                "body_pos_w",
+                "body_quat_w",
+                "body_lin_vel_w",
+                "body_ang_vel_w",
+            )
+            missing_keys = [key for key in required_keys if key not in data.files]
+            if missing_keys:
+                raise ValueError(f"[AMPLoader] {motion_file} missing npz keys: {missing_keys}")
+
+            body_pos_w = torch.tensor(data["body_pos_w"], dtype=torch.float32, device=self.device)
+            body_quat_w = torch.tensor(data["body_quat_w"], dtype=torch.float32, device=self.device)
+            body_lin_vel_w = torch.tensor(data["body_lin_vel_w"], dtype=torch.float32, device=self.device)
+            body_ang_vel_w = torch.tensor(data["body_ang_vel_w"], dtype=torch.float32, device=self.device)
+
+            required_body_count = max(body_indexes + [anchor_index]) + 1
+            if body_pos_w.shape[1] < required_body_count:
+                raise ValueError(
+                    f"[AMPLoader] {motion_file} has {body_pos_w.shape[1]} bodies, "
+                    f"but motion_body_names indexes require at least {required_body_count}"
+                )
+
+            target_pos_w = body_pos_w[:, body_indexes, :]
+            target_quat_w = body_quat_w[:, body_indexes, :]
+            target_lin_vel_w = body_lin_vel_w[:, body_indexes, :]
+            target_ang_vel_w = body_ang_vel_w[:, body_indexes, :]
+            anchor_pos_w = body_pos_w[:, anchor_index, None, :].expand(-1, num_bodies, -1)
+            anchor_quat_w = body_quat_w[:, anchor_index, None, :].expand(-1, num_bodies, -1)
+
+            body_pos_b, body_quat_b = math_utils.subtract_frame_transforms(
+                anchor_pos_w,
+                anchor_quat_w,
+                target_pos_w,
+                target_quat_w,
+            )
+            body_ori_b = math_utils.matrix_from_quat(body_quat_b)[..., :, :2].reshape(body_pos_w.shape[0], num_bodies, 6)
+            body_lin_vel_b = math_utils.quat_apply_inverse(
+                target_quat_w.reshape(-1, 4),
+                target_lin_vel_w.reshape(-1, 3),
+            ).reshape(body_pos_w.shape[0], num_bodies, 3)
+            body_ang_vel_b = math_utils.quat_apply_inverse(
+                target_quat_w.reshape(-1, 4),
+                target_ang_vel_w.reshape(-1, 3),
+            ).reshape(body_pos_w.shape[0], num_bodies, 3)
+
+            trajectory = torch.cat(
+                [
+                    body_pos_b.reshape(body_pos_w.shape[0], -1),
+                    body_ori_b.reshape(body_pos_w.shape[0], -1),
+                    body_lin_vel_b.reshape(body_pos_w.shape[0], -1),
+                    body_ang_vel_b.reshape(body_pos_w.shape[0], -1),
+                ],
+                dim=-1,
+            )
+
+            self.trajectory_names.append(os.path.splitext(motion_file)[0])
+            self.trajectories.append(trajectory)
+            self.trajectories_full.append(trajectory)
+            self.trajectory_idxs.append(i)
+            self.trajectory_weights.append(1.0)
+
+            fps = float(np.asarray(data["fps"]).reshape(-1)[0])
+            frame_duration = 1.0 / fps
+            self.trajectory_frame_durations.append(frame_duration)
+            traj_len = max(0.0, (trajectory.shape[0] - 1) * frame_duration)
+            self.trajectory_lens.append(traj_len)
+            self.trajectory_num_frames.append(float(trajectory.shape[0]))
+
+            print(
+                f"[AMPLoader] Loaded {traj_len:.2f}s {self.loader_type} motion "
+                f"from {motion_file} with amp_obs_dim={self._amp_obs_dim}"
+            )
 
     def _preload_transitions(self) -> None:
         """Preload transitions into memory for faster sampling."""
@@ -137,8 +312,8 @@ class AMPLoader:
         """Get a single frame at a specific time from a trajectory."""
         p = float(time) / self.trajectory_lens[traj_idx]
         n = self.trajectories[traj_idx].shape[0]
-        idx_low = int(np.floor(p * n))
-        idx_high = int(np.ceil(p * n))
+        idx_low = min(int(np.floor(p * n)), n - 1)
+        idx_high = min(int(np.ceil(p * n)), n - 1)
         frame_start = self.trajectories[traj_idx][idx_low]
         frame_end = self.trajectories[traj_idx][idx_high]
         blend = p * n - idx_low
@@ -148,8 +323,8 @@ class AMPLoader:
         """Get frames at specific times for multiple trajectories."""
         p = times / self.trajectory_lens[traj_idxs]
         n = self.trajectory_num_frames[traj_idxs]
-        idx_low = np.floor(p * n).astype(np.int64)
-        idx_high = np.ceil(p * n).astype(np.int64)
+        idx_low = np.minimum(np.floor(p * n).astype(np.int64), n.astype(np.int64) - 1)
+        idx_high = np.minimum(np.ceil(p * n).astype(np.int64), n.astype(np.int64) - 1)
 
         all_frame_starts = torch.zeros(len(traj_idxs), self.observation_dim, device=self.device)
         all_frame_ends = torch.zeros(len(traj_idxs), self.observation_dim, device=self.device)
@@ -167,33 +342,29 @@ class AMPLoader:
         """Get full AMP frame at a specific time."""
         p = float(time) / self.trajectory_lens[traj_idx]
         n = self.trajectories_full[traj_idx].shape[0]
-        idx_low = int(np.floor(p * n))
-        idx_high = int(np.ceil(p * n))
+        idx_low = min(int(np.floor(p * n)), n - 1)
+        idx_high = min(int(np.ceil(p * n)), n - 1)
         frame_start = self.trajectories_full[traj_idx][idx_low]
         frame_end = self.trajectories_full[traj_idx][idx_high]
         blend = p * n - idx_low
-
-        # Extract AMP observations (joint pos, joint vel, end effector pos)
-        joints0 = frame_start[AMPLoader.JOINT_POSE_START_IDX:AMPLoader.END_POS_END_IDX]
-        joints1 = frame_end[AMPLoader.JOINT_POSE_START_IDX:AMPLoader.END_POS_END_IDX]
-        return self.slerp(joints0, joints1, blend)
+        return self.slerp(frame_start, frame_end, blend)
 
     def get_full_frame_at_time_batch(self, traj_idxs: np.ndarray, times: np.ndarray) -> torch.Tensor:
         """Get full AMP frames at specific times for multiple trajectories."""
         p = times / self.trajectory_lens[traj_idxs]
         n = self.trajectory_num_frames[traj_idxs]
-        idx_low = np.floor(p * n).astype(np.int64)
-        idx_high = np.ceil(p * n).astype(np.int64)
+        idx_low = np.minimum(np.floor(p * n).astype(np.int64), n.astype(np.int64) - 1)
+        idx_high = np.minimum(np.ceil(p * n).astype(np.int64), n.astype(np.int64) - 1)
 
-        amp_obs_dim = AMPLoader.END_POS_END_IDX - AMPLoader.JOINT_POSE_START_IDX
+        amp_obs_dim = self.amp_obs_dim
         all_frame_starts = torch.zeros(len(traj_idxs), amp_obs_dim, device=self.device)
         all_frame_ends = torch.zeros(len(traj_idxs), amp_obs_dim, device=self.device)
 
         for traj_idx in set(traj_idxs):
             trajectory = self.trajectories_full[traj_idx]
             traj_mask = traj_idxs == traj_idx
-            all_frame_starts[traj_mask] = trajectory[idx_low[traj_mask], AMPLoader.JOINT_POSE_START_IDX:AMPLoader.END_POS_END_IDX]
-            all_frame_ends[traj_mask] = trajectory[idx_high[traj_mask], AMPLoader.JOINT_POSE_START_IDX:AMPLoader.END_POS_END_IDX]
+            all_frame_starts[traj_mask] = trajectory[idx_low[traj_mask]]
+            all_frame_ends[traj_mask] = trajectory[idx_high[traj_mask]]
 
         blend = torch.tensor(p * n - idx_low, device=self.device, dtype=torch.float32).unsqueeze(-1)
         return self.slerp(all_frame_starts, all_frame_ends, blend)
@@ -207,8 +378,8 @@ class AMPLoader:
         for _ in range(num_mini_batch):
             if self.preload_transitions:
                 idxs = np.random.choice(self.preloaded_s.shape[0], size=mini_batch_size)
-                s = self.preloaded_s[idxs, AMPLoader.JOINT_POSE_START_IDX:AMPLoader.END_POS_END_IDX]
-                s_next = self.preloaded_s_next[idxs, AMPLoader.JOINT_POSE_START_IDX:AMPLoader.END_POS_END_IDX]
+                s = self.preloaded_s[idxs]
+                s_next = self.preloaded_s_next[idxs]
             else:
                 traj_idxs = self.weighted_traj_idx_sample_batch(mini_batch_size)
                 times = self.traj_time_sample_batch(traj_idxs)
@@ -225,7 +396,7 @@ class AMPLoader:
     @property
     def amp_obs_dim(self) -> int:
         """Dimension of AMP-specific observations."""
-        return AMPLoader.END_POS_END_IDX - AMPLoader.JOINT_POSE_START_IDX
+        return self._amp_obs_dim
 
     @property
     def num_motions(self) -> int:

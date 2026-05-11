@@ -56,6 +56,11 @@ class AMPPPO(MultiPPO):
             device=self.device,
             time_between_frames=amp_cfg.get("time_between_frames", 0.02),
             motion_files=motion_files,
+            loader_type=amp_cfg.get("loader_type", "joint_ee_json"),
+            body_names=amp_cfg.get("body_names", ()),
+            anchor_name=amp_cfg.get("anchor_name", ""),
+            motion_body_names=amp_cfg.get("motion_body_names", ()),
+            all_body_names=amp_cfg.get("all_body_names", ()),
             preload_transitions=amp_cfg.get("preload_transitions", True),
             num_preload_transitions=amp_cfg.get("num_preload_transitions", 100000),
         )
