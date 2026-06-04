@@ -18,6 +18,11 @@ class SharedPropMLPElevationMultiHeadCritic(nn.Module):
 
     is_recurrent: bool = False
 
+    _CNN_OBSERVATION_MODES = {
+        "elevationmap": 0,
+        "depthcamera": 1,
+    }
+
     def __init__(
         self,
         obs: TensorDict,
@@ -29,6 +34,9 @@ class SharedPropMLPElevationMultiHeadCritic(nn.Module):
         activation: str = "elu",
         obs_normalization: bool = False,
         elevation_set: str = "height_scan_critic",
+        cnn_observation_type: str = "elevationmap",
+        depth_camera_near: float = 0.05,
+        depth_camera_far: float = 6.0,
         vision_spatial_size: tuple[int, int] = (28, 20),
         vision_feature_dim: int = 64,
         elevation_history_length: int = 1,
@@ -37,6 +45,7 @@ class SharedPropMLPElevationMultiHeadCritic(nn.Module):
         cnn_strides: tuple[int, ...] | list[int] = (2, 2),
         prop_feature_dim: int = 64,
         prop_hidden_dims: tuple[int, ...] | list[int] = (128,),
+        head_hidden_dims: tuple[int, ...] | list[int] = (),
         distribution_cfg: dict | None = None,
     ) -> None:
         super().__init__()
@@ -44,6 +53,19 @@ class SharedPropMLPElevationMultiHeadCritic(nn.Module):
 
         self.obs_set = obs_set
         self.elevation_set = elevation_set
+        self.cnn_observation_type = cnn_observation_type.lower()
+        if self.cnn_observation_type not in self._CNN_OBSERVATION_MODES:
+            raise ValueError(
+                f"Unsupported cnn_observation_type '{cnn_observation_type}'. "
+                f"Expected one of {tuple(self._CNN_OBSERVATION_MODES.keys())}."
+            )
+        if depth_camera_far <= depth_camera_near:
+            raise ValueError(
+                f"depth_camera_far must be greater than depth_camera_near, got {depth_camera_far} <= {depth_camera_near}."
+            )
+        self._cnn_observation_mode = self._CNN_OBSERVATION_MODES[self.cnn_observation_type]
+        self.depth_camera_near = float(depth_camera_near)
+        self.depth_camera_far = float(depth_camera_far)
         self.num_heads = num_heads
         self.vision_spatial_size = tuple(vision_spatial_size)
         self.elevation_history_length = elevation_history_length
@@ -64,7 +86,9 @@ class SharedPropMLPElevationMultiHeadCritic(nn.Module):
             vision_spatial_size=vision_spatial_size,
         )
         self.shared_mlp = MLP(prop_feature_dim + vision_feature_dim, hidden_dims[-1], hidden_dims[:-1], activation)
-        self.value_heads = nn.ModuleList([nn.Linear(hidden_dims[-1], 1) for _ in range(num_heads)])
+        self.value_heads = nn.ModuleList(
+            [self._make_value_head(hidden_dims[-1], head_hidden_dims, activation) for _ in range(num_heads)]
+        )
 
     def forward(
         self,
@@ -82,7 +106,7 @@ class SharedPropMLPElevationMultiHeadCritic(nn.Module):
         proprio_obs = self.obs_normalizer(proprio_obs)
         proprio_features = self.prop_mlp(proprio_obs)
 
-        elevation_obs = self._normalize_elevation_map(obs[self.elevation_set])
+        elevation_obs = self._normalize_cnn_observation(obs[self.elevation_set])
         elevation_features = self.elevation_encoder(elevation_obs)
 
         return self.shared_mlp(torch.cat((proprio_features, elevation_features), dim=-1))
@@ -123,6 +147,29 @@ class SharedPropMLPElevationMultiHeadCritic(nn.Module):
             )
         return active_obs_groups, obs_dim
 
-    def _normalize_elevation_map(self, elevation_map: torch.Tensor) -> torch.Tensor:
-        elevation_mean = elevation_map.mean(dim=(-2, -1), keepdim=True)
-        return torch.clamp((elevation_map - elevation_mean) / 0.6, -3.0, 3.0)
+    @staticmethod
+    def _make_value_head(
+        input_dim: int,
+        head_hidden_dims: tuple[int, ...] | list[int],
+        activation: str,
+    ) -> nn.Module:
+        if len(head_hidden_dims) == 0:
+            return nn.Linear(input_dim, 1)
+        return MLP(input_dim, 1, head_hidden_dims, activation)
+
+    def _normalize_cnn_observation(self, cnn_observation: torch.Tensor) -> torch.Tensor:
+        if self._cnn_observation_mode == 0:
+            elevation_mean = cnn_observation.mean(dim=(-2, -1), keepdim=True)
+            return torch.clamp((cnn_observation - elevation_mean) / 0.6, -3.0, 3.0)
+
+        invalid_mask = (~torch.isfinite(cnn_observation)) | (cnn_observation <= 0.0)
+        cnn_observation = torch.where(
+            invalid_mask,
+            torch.full_like(cnn_observation, self.depth_camera_far),
+            cnn_observation,
+        )
+        cnn_observation = torch.clamp(cnn_observation, self.depth_camera_near, self.depth_camera_far)
+        cnn_observation = (cnn_observation - self.depth_camera_near) / (
+            self.depth_camera_far - self.depth_camera_near
+        )
+        return cnn_observation * 2.0 - 1.0
