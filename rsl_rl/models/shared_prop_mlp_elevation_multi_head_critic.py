@@ -45,7 +45,11 @@ class SharedPropMLPElevationMultiHeadCritic(nn.Module):
         cnn_strides: tuple[int, ...] | list[int] = (2, 2),
         prop_feature_dim: int = 64,
         prop_hidden_dims: tuple[int, ...] | list[int] = (128,),
-        head_hidden_dims: tuple[int, ...] | list[int] = (),
+        shared_hidden_dims: tuple[int, ...] | list[int] | None = None,
+        head_hidden_dims: tuple[int, ...]
+        | list[int]
+        | tuple[tuple[int, ...] | list[int], ...]
+        | list[tuple[int, ...] | list[int]] = (),
         distribution_cfg: dict | None = None,
     ) -> None:
         super().__init__()
@@ -85,9 +89,18 @@ class SharedPropMLPElevationMultiHeadCritic(nn.Module):
             out_dim=vision_feature_dim,
             vision_spatial_size=vision_spatial_size,
         )
-        self.shared_mlp = MLP(prop_feature_dim + vision_feature_dim, hidden_dims[-1], hidden_dims[:-1], activation)
+        fusion_feature_dim = prop_feature_dim + vision_feature_dim
+        if shared_hidden_dims is None:
+            shared_hidden_dims = hidden_dims
+        if len(shared_hidden_dims) == 0:
+            self.shared_mlp = nn.Identity()
+            head_input_dim = fusion_feature_dim
+        else:
+            self.shared_mlp = MLP(fusion_feature_dim, shared_hidden_dims[-1], shared_hidden_dims[:-1], activation)
+            head_input_dim = shared_hidden_dims[-1]
+        head_hidden_dims_per_head = self._resolve_head_hidden_dims(head_hidden_dims, num_heads)
         self.value_heads = nn.ModuleList(
-            [self._make_value_head(hidden_dims[-1], head_hidden_dims, activation) for _ in range(num_heads)]
+            [self._make_value_head(head_input_dim, head_dims, activation) for head_dims in head_hidden_dims_per_head]
         )
 
     def forward(
@@ -146,6 +159,27 @@ class SharedPropMLPElevationMultiHeadCritic(nn.Module):
                 f"The elevation branch expects [B, T, H, W], got {obs[elevation_set].shape} for '{elevation_set}'."
             )
         return active_obs_groups, obs_dim
+
+    @staticmethod
+    def _resolve_head_hidden_dims(
+        head_hidden_dims: tuple[int, ...]
+        | list[int]
+        | tuple[tuple[int, ...] | list[int], ...]
+        | list[tuple[int, ...] | list[int]],
+        num_heads: int,
+    ) -> list[tuple[int, ...]]:
+        if len(head_hidden_dims) == 0:
+            return [()] * num_heads
+
+        first_item = head_hidden_dims[0]
+        if isinstance(first_item, (list, tuple)):
+            if len(head_hidden_dims) != num_heads:
+                raise ValueError(
+                    f"Per-head hidden dims expects {num_heads} entries, got {len(head_hidden_dims)}."
+                )
+            return [tuple(head_dims) for head_dims in head_hidden_dims]
+
+        return [tuple(head_hidden_dims)] * num_heads
 
     @staticmethod
     def _make_value_head(
