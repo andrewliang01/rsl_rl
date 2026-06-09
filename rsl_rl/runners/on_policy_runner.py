@@ -67,8 +67,9 @@ class OnPolicyRunner:
 
         # Ensure all parameters are in-synced
         if self.is_distributed:
-            print(f"Synchronizing parameters for rank {self.gpu_global_rank}...")
+            print(f"[DIST] rank {self.gpu_global_rank} entering parameter sync...", flush=True)
             self.alg.broadcast_parameters()
+            print(f"[DIST] rank {self.gpu_global_rank} finished parameter sync.", flush=True)
 
         # Initialize the logging writer
         self.logger.init_logging_writer()
@@ -276,3 +277,9 @@ class OnPolicyRunner:
         torch.distributed.init_process_group(backend="nccl", rank=self.gpu_global_rank, world_size=self.gpu_world_size)
         # Set device to the local rank
         torch.cuda.set_device(self.gpu_local_rank)
+        print(
+            f"[DIST] init_process_group ready: "
+            f"rank={self.gpu_global_rank}, local_rank={self.gpu_local_rank}, "
+            f"world_size={self.gpu_world_size}, device={self.device}",
+            flush=True,
+        )
