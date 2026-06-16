@@ -31,9 +31,8 @@ from rsl_rl.algorithms.ppo import PPO
 from rsl_rl.env import VecEnv
 from rsl_rl.models import MLPModel
 from rsl_rl.storage import RolloutStorage
-from rsl_rl.utils import resolve_callable, resolve_obs_groups, resolve_optimizer
-from rsl_rl.extensions import resolve_rnd_config, resolve_symmetry_config
-from .ppo_factory import construct_ppo_algorithm
+from rsl_rl.utils import resolve_optimizer
+from .ppo_builders import construct_multi_critic_algorithm
 
 
 class MultiPPO(PPO):
@@ -609,5 +608,5 @@ class MultiPPO(PPO):
 
     @staticmethod
     def construct_algorithm(obs: TensorDict, env: VecEnv, cfg: dict, device: str):
-        """Construct the multi-critic PPO variant from the shared PPO config."""
-        return construct_ppo_algorithm(obs, env, cfg, device, variant="auto")
+        """Construct the multi-critic PPO variant from an explicit MultiPPO config."""
+        return construct_multi_critic_algorithm(MultiPPO, obs, env, cfg, device)

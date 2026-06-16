@@ -6,12 +6,11 @@ import torch.optim as optim
 from tensordict import TensorDict
 
 from rsl_rl.env import VecEnv
-from rsl_rl.extensions import resolve_rnd_config, resolve_symmetry_config
 from rsl_rl.models import AMPDiscriminator, MLPModel
 from rsl_rl.storage import ReplayBuffer, RolloutStorage
-from rsl_rl.utils import AMPLoader, resolve_callable, resolve_obs_groups
+from rsl_rl.utils import AMPLoader
 from .multi_ppo import MultiPPO
-from .ppo_factory import construct_ppo_algorithm
+from .ppo_builders import construct_multi_critic_algorithm
 
 
 class AMPPPO(MultiPPO):
@@ -491,4 +490,5 @@ class AMPPPO(MultiPPO):
 
     @staticmethod
     def construct_algorithm(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> "AMPPPO":
-        return construct_ppo_algorithm(obs, env, cfg, device, variant="auto")
+        """Construct AMP-PPO from an explicit AMPPPO config."""
+        return construct_multi_critic_algorithm(AMPPPO, obs, env, cfg, device, include_amp_obs=True)

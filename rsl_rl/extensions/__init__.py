@@ -7,9 +7,12 @@
 
 from .rnd import RandomNetworkDistillation, resolve_rnd_config
 from .symmetry import resolve_symmetry_config
+from .dwaq import DWAQ, resolve_dwaq_config
 
 __all__ = [
+    "DWAQ",
     "RandomNetworkDistillation",
+    "resolve_dwaq_config",
     "resolve_rnd_config",
     "resolve_symmetry_config",
 ]

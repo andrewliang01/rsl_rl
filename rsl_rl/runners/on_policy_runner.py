@@ -36,7 +36,9 @@ class OnPolicyRunner:
         obs = self.env.get_observations()
 
         # Create the algorithm
-        alg_class: type[PPO] = resolve_callable(self.cfg["algorithm"]["class_name"])  # type: ignore
+        alg_cfg = self.cfg["algorithm"]
+        self._validate_explicit_ppo_variant(alg_cfg)
+        alg_class: type[PPO] = resolve_callable(alg_cfg["class_name"])  # type: ignore
         self.alg = alg_class.construct_algorithm(obs, self.env, self.cfg, self.device)
 
         # Create the logger
@@ -52,6 +54,22 @@ class OnPolicyRunner:
         )
 
         self.current_learning_iteration = 0
+
+    def _validate_explicit_ppo_variant(self, alg_cfg: dict) -> None:
+        """Catch PPO-family configs that need an explicit algorithm class."""
+        class_name = alg_cfg.get("class_name", "")
+        short_name = class_name.replace(":", ".").rsplit(".", maxsplit=1)[-1]
+        uses_amp = alg_cfg.get("amp_cfg") is not None
+        uses_multi_critic = alg_cfg.get("num_critics", 1) > 1
+
+        if short_name == "PPO" and uses_amp:
+            raise ValueError('PPO config has amp_cfg. Set algorithm.class_name="AMPPPO" explicitly.')
+        if short_name == "PPO" and uses_multi_critic:
+            raise ValueError('PPO config has num_critics > 1. Set algorithm.class_name="MultiPPO" explicitly.')
+        if short_name == "MultiPPO" and uses_amp:
+            raise ValueError('MultiPPO config has amp_cfg. Use algorithm.class_name="AMPPPO" for AMP training.')
+        if short_name == "AMPPPO" and not uses_amp:
+            raise ValueError('AMPPPO config requires algorithm.amp_cfg.')
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
         """Run the learning loop for the specified number of iterations."""
@@ -80,20 +98,31 @@ class OnPolicyRunner:
         for it in range(start_it, total_it):
             start = time.time()
             # Rollout
-            with torch.inference_mode():
-                for _ in range(self.cfg["num_steps_per_env"]):
-                    # Sample actions
+            with torch.inference_mode(): #禁用梯度计算相关的开销，从而提升性能。
+                for _ in range(self.cfg["num_steps_per_env"]): 
+                # 每一次的学习迭代中，算法会在环境中执行cfg["num_steps_per_env"]步。
+                # 这意味着智能体将与环境进行多次交互，收集状态、奖励和其他相关信息，以用于后续的学习更新。
+                # 那为什么是环境收集24步信息，算法才优化迭代一次？
+                    
+                    # actor和critic的推理，更新分布参数（有了新的action的分布），存储obs、actions和values，返回actions
                     actions = self.alg.act(obs)
-                    # Step the environment
+                    
+                    # 给定actions，环境去交互，得到obs、rewards、dones和extras
                     obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
-                    # Check for NaN values from the environment
+
+                    # 检查环境返回的有没有异常值（NaN），如果有则抛出错误。这是为了确保训练过程中的数值稳定性和正确性。
                     if self.cfg.get("check_for_nan", True):
                         check_nan(obs, rewards, dones)
-                    # Move to device
+                    
+                    # 转移到GPU上进行后续处理
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
-                    # Process the step
+                    
+                    # 基于最新的obs做归一化处理，记录reward、dones，self.storage.add_transition(self.transition)
+                    # 对time_outs的情况做特殊处理，因为没有下一步的$V(s_{t+1})$, 得换成 $V(s_t)$
                     self.alg.process_env_step(obs, rewards, dones, extras)
+
                     # Extract intrinsic rewards if RND is used (only for logging)
+                    # TODO： RND没学过不懂啊，下次学了再来看吧
                     intrinsic_rewards = self.alg.intrinsic_rewards if self.cfg["algorithm"]["rnd_cfg"] else None
                     # Book keeping
                     # Handle multi-critic rewards: use the same group weights as advantage aggregation for logging.
@@ -106,7 +135,7 @@ class OnPolicyRunner:
                     else:
                         rewards_for_log = rewards.squeeze(-1) if rewards.dim() > 1 else rewards
 
-                    # Handle AMP rewards for logging
+                    # 记录AMP的奖励啊
                     amp_rewards = None
                     if hasattr(self.alg, 'amp_discriminator') and self.alg.amp_discriminator is not None:
                         amp_rewards = {
@@ -122,9 +151,13 @@ class OnPolicyRunner:
                 start = stop
 
                 # Compute returns
+                # 用优势函数估计每一步的return
                 self.alg.compute_returns(obs)
 
             # Update policy
+            # TODO： 时序网络的recurrent，MLP 路径下 24 步和 4096 envs 是全部拍扁打乱在一起切的，不是"24 步之间切"——这是 MLP 不依赖时序带来的便利，而 RNN 只能沿 env 切来保留时序完整性。
+            # TODO： symmetry我同样不太懂，先不管了。总之就是在切数据的时候要保证对称性的数据在一起被切到同一个batch里。
+
             loss_dict = self.alg.update()
 
             stop = time.time()

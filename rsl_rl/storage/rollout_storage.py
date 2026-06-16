@@ -33,6 +33,9 @@ class RolloutStorage:
             self.observations: TensorDict | None = None
             """Observations at the current step."""
 
+            self.next_observations: TensorDict | None = None
+            """Observations after taking the action."""
+
             self.actions: torch.Tensor | None = None
             """Actions taken at the current step."""
 
@@ -74,6 +77,7 @@ class RolloutStorage:
         def __init__(
             self,
             observations: TensorDict | None = None,
+            next_observations: TensorDict | None = None,
             actions: torch.Tensor | None = None,
             values: torch.Tensor | None = None,
             advantages: torch.Tensor | None = None,
@@ -88,6 +92,9 @@ class RolloutStorage:
             """Initialize a batch container over rollout data."""
             self.observations: TensorDict | None = observations
             """Batch of observations."""
+
+            self.next_observations: TensorDict | None = next_observations
+            """Batch of next observations."""
 
             # For reinforcement learning
             self.actions: torch.Tensor | None = actions
@@ -156,6 +163,11 @@ class RolloutStorage:
             batch_size=[num_transitions_per_env, num_envs],
             device=self.device,
         )
+        self.next_observations = TensorDict(
+            {key: torch.zeros(num_transitions_per_env, *value.shape, device=device) for key, value in obs.items()},
+            batch_size=[num_transitions_per_env, num_envs],
+            device=self.device,
+        )
         # Support multi-critic: rewards are [T, N, num_critics] instead of [T, N, 1]
         self.rewards = torch.zeros(num_transitions_per_env, num_envs, num_critics, device=self.device)
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
@@ -193,6 +205,8 @@ class RolloutStorage:
 
         # Core
         self.observations[self.step].copy_(transition.observations)
+        next_observations = transition.next_observations if transition.next_observations is not None else transition.observations
+        self.next_observations[self.step].copy_(next_observations)
         self.actions[self.step].copy_(transition.actions)  # type: ignore
         # Handle multi-critic rewards: [N] or [N, 1] -> [N, num_critics]
         if transition.rewards.dim() == 1:
@@ -255,6 +269,7 @@ class RolloutStorage:
         for i in range(self.num_transitions_per_env):
             yield RolloutStorage.Batch(
                 observations=self.observations[i],  # type: ignore
+                next_observations=self.next_observations[i],  # type: ignore
                 privileged_actions=self.privileged_actions[i],
                 dones=self.dones[i],
             )
@@ -277,6 +292,7 @@ class RolloutStorage:
 
         # Flatten the data
         observations = self.observations.flatten(0, 1)
+        next_observations = self.next_observations.flatten(0, 1)
         actions = self.actions.flatten(0, 1)
         values = self.values.flatten(0, 1)  # [batch_size, num_critics]
         returns = self.returns.flatten(0, 1)  # [batch_size, num_critics]
@@ -305,6 +321,7 @@ class RolloutStorage:
                 # Yield the mini-batch
                 yield RolloutStorage.Batch(
                     observations=observations[batch_idx],  # type: ignore
+                    next_observations=next_observations[batch_idx],  # type: ignore
                     actions=actions[batch_idx],
                     values=values[batch_idx],
                     advantages=advantages[batch_idx],

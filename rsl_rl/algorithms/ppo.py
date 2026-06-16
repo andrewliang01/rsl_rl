@@ -13,11 +13,11 @@ from itertools import chain
 from tensordict import TensorDict
 
 from rsl_rl.env import VecEnv
-from rsl_rl.extensions import RandomNetworkDistillation, resolve_rnd_config, resolve_symmetry_config
+from rsl_rl.extensions import DWAQ, RandomNetworkDistillation
 from rsl_rl.models import MLPModel
 from rsl_rl.storage import RolloutStorage
-from rsl_rl.utils import resolve_callable, resolve_obs_groups, resolve_optimizer
-from .ppo_factory import construct_ppo_algorithm
+from rsl_rl.utils import resolve_callable, resolve_optimizer
+from .ppo_builders import construct_single_critic_algorithm
 
 
 class PPO:
@@ -57,6 +57,7 @@ class PPO:
         rnd_cfg: dict | None = None,
         # Symmetry parameters
         symmetry_cfg: dict | None = None,
+        dwaq_cfg: dict | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
     ) -> None:
@@ -72,6 +73,17 @@ class PPO:
         else:
             self.gpu_global_rank = 0
             self.gpu_world_size = 1
+
+        # DWAQ components
+        if dwaq_cfg:
+            dwaq_lr = dwaq_cfg.pop("learning_rate", learning_rate)
+            self.dwaq = DWAQ(device=self.device, **dwaq_cfg)
+            self.dwaq_optimizer = optim.Adam(self.dwaq.parameters(), lr=dwaq_lr)
+            self.dwaq_bootstrap_rewards = None
+        else:
+            self.dwaq = None
+            self.dwaq_optimizer = None
+            self.dwaq_bootstrap_rewards = None
 
         # RND components
         if rnd_cfg:
@@ -141,8 +153,9 @@ class PPO:
         """Sample actions and store transition data."""
         # Record the hidden states for recurrent policies
         self.transition.hidden_states = (self.actor.get_hidden_state(), self.critic.get_hidden_state())
+        actor_obs = self._augment_obs_with_dwaq(obs, bootstrap_rewards=self.dwaq_bootstrap_rewards)
         # Compute the actions and values
-        self.transition.actions = self.actor(obs, stochastic_output=True).detach()
+        self.transition.actions = self.actor(actor_obs, stochastic_output=True).detach()
         self.transition.values = self.critic(obs).detach()
         self.transition.actions_log_prob = self.actor.get_output_log_prob(self.transition.actions).detach()  # type: ignore
         self.transition.distribution_params = tuple(p.detach() for p in self.actor.output_distribution_params)
@@ -150,25 +163,57 @@ class PPO:
         self.transition.observations = obs
         return self.transition.actions  # type: ignore
 
+    def _augment_obs_with_dwaq(
+        self,
+        obs: TensorDict,
+        bootstrap_rewards: torch.Tensor | None = None,
+    ) -> TensorDict:
+        """Append the DWAQ code to the actor observation without mutating stored transitions."""
+        if self.dwaq is None:
+            return obs
+
+        code_group = self.dwaq.code_append_obs_group
+        if code_group not in obs:
+            raise ValueError(
+                f"DWAQ code_append_obs_group '{code_group}' was not found in observations. "
+                f"Available observations: {list(obs.keys())}"
+            )
+
+        # Match DreamWaQ: the actor consumes the CENet code as an observation-like signal.
+        # PPO actor loss updates the actor weights, while DWAQ is trained by its own loss.
+        with torch.no_grad():
+            dwaq_code = self.dwaq.get_code(obs, deterministic=True, bootstrap_rewards=bootstrap_rewards)
+
+        actor_obs = obs.clone()
+        actor_obs[code_group] = torch.cat((obs[code_group], dwaq_code), dim=-1)
+        return actor_obs
+
     def process_env_step(
         self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
     ) -> None:
         """Record one environment step and update the normalizers."""
-        # Update the normalizers
-        self.actor.update_normalization(obs)
-        self.critic.update_normalization(obs)
-        if self.rnd:
-            self.rnd.update_normalization(obs)
-
         # Handle multi-critic rewards in single-critic mode
         # If rewards is [N, num_critics], use only the first column (task reward)
         if rewards.dim() > 1 and rewards.shape[-1] > 1:
             rewards = rewards[:, 0]
+        if self.dwaq:
+            self.dwaq_bootstrap_rewards = rewards.detach()
+
+        # Update the normalizers
+        self.critic.update_normalization(obs)
+        if self.rnd:
+            self.rnd.update_normalization(obs)
+        if self.dwaq:
+            self.dwaq.update_normalization(self.transition.observations, obs)
+            self.actor.update_normalization(self._augment_obs_with_dwaq(obs))
+        else:
+            self.actor.update_normalization(obs)
 
         # Record the rewards and dones
         # Note: We clone here because later on we bootstrap the rewards based on timeouts
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
+        self.transition.next_observations = obs
 
         # Compute the intrinsic rewards and add to extrinsic rewards
         if self.rnd:
@@ -233,6 +278,11 @@ class PPO:
         mean_entropy = 0
         # RND loss
         mean_rnd_loss = 0 if self.rnd else None
+        # DWAQ loss
+        mean_dwaq_loss = 0 if self.dwaq else None
+        mean_dwaq_vel_loss = 0 if self.dwaq else None
+        mean_dwaq_obs_loss = 0 if self.dwaq else None
+        mean_dwaq_dkl_loss = 0 if self.dwaq else None
         # Symmetry loss
         mean_symmetry_loss = 0 if self.symmetry else None
 
@@ -246,7 +296,15 @@ class PPO:
         for batch in generator:
             original_batch_size = batch.observations.batch_size[0]
 
+            # DWAQ loss uses the original transition pairs before optional symmetry augmentation.
+            if self.dwaq:
+                dwaq_loss = self.dwaq.compute_loss(
+                    batch.observations[:original_batch_size],
+                    batch.next_observations[:original_batch_size],
+                )
+
             # Check if we should normalize advantages per mini batch
+            # 每个batch自己归一化advantage还是之前一次性归一化
             if self.normalize_advantage_per_mini_batch:
                 with torch.no_grad():
                     batch.advantages = (batch.advantages - batch.advantages.mean()) / (batch.advantages.std() + 1e-8)  # type: ignore
@@ -271,8 +329,9 @@ class PPO:
 
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: We need to do this because we updated the policy with the new parameters
+            actor_observations = self._augment_obs_with_dwaq(batch.observations)
             self.actor(
-                batch.observations,
+                actor_observations,
                 masks=batch.masks,
                 hidden_state=batch.hidden_states[0],
                 stochastic_output=True,
@@ -336,12 +395,12 @@ class PPO:
                 # Note: If we did augmentation before then we don't need to augment again
                 if not self.symmetry["use_data_augmentation"]:
                     data_augmentation_func = self.symmetry["data_augmentation_func"]
-                    batch.observations, _ = data_augmentation_func(
-                        obs=batch.observations, actions=None, env=self.symmetry["_env"]
+                    actor_observations, _ = data_augmentation_func(
+                        obs=actor_observations, actions=None, env=self.symmetry["_env"]
                     )
 
                 # Actions predicted by the actor for symmetrically-augmented observations
-                mean_actions = self.actor(batch.observations.detach().clone())
+                mean_actions = self.actor(actor_observations.detach().clone())
 
                 # Compute the symmetrically augmented actions
                 # Note: We are assuming the first augmentation is the original one. We do not use the batch.actions from
@@ -378,11 +437,17 @@ class PPO:
 
             # Compute the gradients for PPO
             self.optimizer.zero_grad()
+            if self.rnd_optimizer:
+                self.rnd_optimizer.zero_grad()
+            if self.dwaq_optimizer:
+                self.dwaq_optimizer.zero_grad()
             loss.backward()
             # Compute the gradients for RND
             if self.rnd:
-                self.rnd_optimizer.zero_grad()
                 rnd_loss.backward()
+            # Compute the gradients for DWAQ
+            if self.dwaq:
+                dwaq_loss["total"].backward()
 
             # Collect gradients from all GPUs
             if self.is_multi_gpu:
@@ -395,6 +460,10 @@ class PPO:
             # Apply the gradients for RND
             if self.rnd_optimizer:
                 self.rnd_optimizer.step()
+            # Apply the gradients for DWAQ
+            if self.dwaq_optimizer:
+                nn.utils.clip_grad_norm_(self.dwaq.parameters(), self.max_grad_norm)
+                self.dwaq_optimizer.step()
 
             # Store the losses
             mean_value_loss += value_loss.item()
@@ -403,6 +472,12 @@ class PPO:
             # RND loss
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()
+            # DWAQ loss
+            if mean_dwaq_loss is not None:
+                mean_dwaq_loss += dwaq_loss["total"].item()
+                mean_dwaq_vel_loss += dwaq_loss["vel"].item()
+                mean_dwaq_obs_loss += dwaq_loss["obs"].item()
+                mean_dwaq_dkl_loss += dwaq_loss["dkl"].item()
             # Symmetry loss
             if mean_symmetry_loss is not None:
                 mean_symmetry_loss += symmetry_loss.item()
@@ -414,6 +489,11 @@ class PPO:
         mean_entropy /= num_updates
         if mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
+        if mean_dwaq_loss is not None:
+            mean_dwaq_loss /= num_updates
+            mean_dwaq_vel_loss /= num_updates
+            mean_dwaq_obs_loss /= num_updates
+            mean_dwaq_dkl_loss /= num_updates
         if mean_symmetry_loss is not None:
             mean_symmetry_loss /= num_updates
 
@@ -428,6 +508,11 @@ class PPO:
         }
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
+        if self.dwaq:
+            loss_dict["dwaq"] = mean_dwaq_loss
+            loss_dict["dwaq_vel"] = mean_dwaq_vel_loss
+            loss_dict["dwaq_obs"] = mean_dwaq_obs_loss
+            loss_dict["dwaq_dkl"] = mean_dwaq_dkl_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
 
@@ -439,6 +524,8 @@ class PPO:
         self.critic.train()
         if self.rnd:
             self.rnd.train()
+        if self.dwaq:
+            self.dwaq.train()
 
     def eval_mode(self) -> None:
         """Set evaluation mode for learnable models."""
@@ -446,6 +533,8 @@ class PPO:
         self.critic.eval()
         if self.rnd:
             self.rnd.eval()
+        if self.dwaq:
+            self.dwaq.eval()
 
     def save(self) -> dict:
         """Return a dict of all models for saving."""
@@ -457,6 +546,9 @@ class PPO:
         if self.rnd:
             saved_dict["rnd_state_dict"] = self.rnd.state_dict()
             saved_dict["rnd_optimizer_state_dict"] = self.rnd_optimizer.state_dict()
+        if self.dwaq:
+            saved_dict["dwaq_state_dict"] = self.dwaq.state_dict()
+            saved_dict["dwaq_optimizer_state_dict"] = self.dwaq_optimizer.state_dict()
         return saved_dict
 
     def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
@@ -469,6 +561,7 @@ class PPO:
                 "optimizer": True,
                 "iteration": True,
                 "rnd": True,
+                "dwaq": True,
             }
 
         # Load the specified models
@@ -481,6 +574,9 @@ class PPO:
         if load_cfg.get("rnd") and self.rnd:
             self.rnd.load_state_dict(loaded_dict["rnd_state_dict"], strict=strict)
             self.rnd_optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
+        if load_cfg.get("dwaq") and self.dwaq and "dwaq_state_dict" in loaded_dict:
+            self.dwaq.load_state_dict(loaded_dict["dwaq_state_dict"], strict=strict)
+            self.dwaq_optimizer.load_state_dict(loaded_dict["dwaq_optimizer_state_dict"])
         return load_cfg.get("iteration", False)
 
     def get_policy(self) -> MLPModel:
@@ -489,8 +585,8 @@ class PPO:
 
     @staticmethod
     def construct_algorithm(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> PPO:
-        """Construct PPO or one of its optional feature variants from the shared config."""
-        return construct_ppo_algorithm(obs, env, cfg, device, variant="auto")
+        """Construct the standard single-critic PPO algorithm."""
+        return construct_single_critic_algorithm(PPO, obs, env, cfg, device)
 
     def broadcast_parameters(self) -> None:
         """Broadcast model parameters to all GPUs."""
@@ -506,6 +602,8 @@ class PPO:
         _broadcast_module(self.critic)
         if self.rnd:
             _broadcast_module(self.rnd.predictor)
+        if self.dwaq:
+            _broadcast_module(self.dwaq)
 
     def reduce_parameters(self) -> None:
         """Collect gradients from all GPUs and average them.
@@ -516,6 +614,8 @@ class PPO:
         all_params = chain(self.actor.parameters(), self.critic.parameters())
         if self.rnd:
             all_params = chain(all_params, self.rnd.parameters())
+        if self.dwaq:
+            all_params = chain(all_params, self.dwaq.parameters())
         all_params = list(all_params)
         grads = [param.grad.view(-1) for param in all_params if param.grad is not None]
         all_grads = torch.cat(grads)
