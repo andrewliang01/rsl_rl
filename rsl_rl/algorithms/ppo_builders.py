@@ -155,6 +155,13 @@ def _augment_actor_obs_sample_for_dwaq(obs: TensorDict, alg_cfg: dict) -> Tensor
             f"Available observations: {list(obs.keys())}"
         )
 
+    num_history_len = int(dwaq_cfg.get("num_history_len", 1))
+    history_dim = obs[code_group].shape[-1]
+    if history_dim % num_history_len != 0:
+        raise ValueError(
+            f"DWAQ actor history dim ({history_dim}) must be divisible by num_history_len ({num_history_len})."
+        )
+    one_frame_dim = history_dim // num_history_len
     code_dim = int(dwaq_cfg.get("num_latent", 19))
     obs_for_actor = obs.clone()
     code_template = torch.zeros(
@@ -163,7 +170,8 @@ def _augment_actor_obs_sample_for_dwaq(obs: TensorDict, alg_cfg: dict) -> Tensor
         dtype=obs[code_group].dtype,
         device=obs[code_group].device,
     )
-    obs_for_actor[code_group] = torch.cat((obs[code_group], code_template), dim=-1)
+    current_obs_template = obs[code_group][..., -one_frame_dim:]
+    obs_for_actor[code_group] = torch.cat((current_obs_template, code_template), dim=-1)
     return obs_for_actor
 
 

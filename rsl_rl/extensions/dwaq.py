@@ -62,6 +62,10 @@ class DWAQ(torch.nn.Module):
         self.device = device
 
         # 单帧obs长度
+        if num_states % num_history_len != 0:
+            raise ValueError(
+                f"DWAQ encoder input dim ({num_states}) must be divisible by num_history_len ({num_history_len})."
+            )
         self.obs_one_frame_len: int = int(num_states / num_history_len)
         # 记录decoder输出的维度
         self.num_decoder = num_target_states if num_decode is None else num_decode
@@ -72,15 +76,10 @@ class DWAQ(torch.nn.Module):
             )
 
         if state_normalization:
-            if num_target_states != num_states:
+            if self.num_decoder > self.obs_one_frame_len:
                 raise ValueError(
-                    "DWAQ state_normalization=True requires obs_noise_free_group to have the same dimension as "
-                    f"the encoder input obs ({num_states}), got {num_target_states}."
-                )
-            if self.num_decoder > num_states:
-                raise ValueError(
-                    f"num_decode ({self.num_decoder}) can not be larger than the DWAQ input obs dimension "
-                    f"({num_states}) when state_normalization=True."
+                    f"num_decode ({self.num_decoder}) can not be larger than the DWAQ one-frame obs dimension "
+                    f"({self.obs_one_frame_len}) when state_normalization=True."
                 )
             self.state_normalizer = EmpiricalNormalization(shape=[num_states], until=int(1.0e8)).to(self.device)
         else:
@@ -161,8 +160,8 @@ class DWAQ(torch.nn.Module):
         input_obs = self.get_input_obs(observations)
         next_obs_noise_free = self.get_obs_noise_free(next_observations)
         if self.state_normalization:
-            input_obs = self.state_normalizer(input_obs)
-            next_obs_noise_free = self.state_normalizer(next_obs_noise_free)
+            input_obs = self.normalize_input_obs(input_obs)
+            next_obs_noise_free = self.normalize_single_frame_obs(next_obs_noise_free)
         next_obs_noise_free = next_obs_noise_free[..., : self.num_decoder]
         vel_obs = self.get_vel_obs(observations)
 
@@ -197,8 +196,22 @@ class DWAQ(torch.nn.Module):
         bootstrap_rewards: torch.Tensor | None = None,
     ) -> torch.Tensor:
         input_obs = self.get_input_obs(observations)
+        return self.get_code_from_input_obs(
+            input_obs,
+            observations,
+            deterministic=deterministic,
+            bootstrap_rewards=bootstrap_rewards,
+        )
+
+    def get_code_from_input_obs(
+        self,
+        input_obs: torch.Tensor,
+        observations: TensorDict,
+        deterministic: bool = True,
+        bootstrap_rewards: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if self.state_normalization:
-            input_obs = self.state_normalizer(input_obs)
+            input_obs = self.normalize_input_obs(input_obs)
         (
             code,
             latent_sample,
@@ -216,6 +229,26 @@ class DWAQ(torch.nn.Module):
         if self.use_adaboot and bootstrap_rewards is not None:
             return self.apply_adaboot(observations, vel_sample, latent_sample, bootstrap_rewards)
         return code
+
+    def get_actor_observation(
+        self,
+        observations: TensorDict,
+        deterministic: bool = True,
+        bootstrap_rewards: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        input_obs = self.get_input_obs(observations)
+        if self.state_normalization:
+            normalized_input_obs = self.normalize_input_obs(input_obs)
+        else:
+            normalized_input_obs = input_obs
+        current_obs = normalized_input_obs[:, -self.obs_one_frame_len :]
+        code = self.get_code_from_input_obs(
+            input_obs,
+            observations,
+            deterministic=deterministic,
+            bootstrap_rewards=bootstrap_rewards,
+        )
+        return torch.cat((current_obs, code), dim=-1)
 
     def apply_adaboot(
         self,
@@ -276,6 +309,18 @@ class DWAQ(torch.nn.Module):
 
     def get_vel_obs(self, obs: TensorDict) -> torch.Tensor:
         return obs[self.vel_obs_group]
+
+    def normalize_input_obs(self, obs: torch.Tensor) -> torch.Tensor:
+        if not self.state_normalization:
+            return obs
+        return self.state_normalizer(obs)  # type: ignore[operator]
+
+    def normalize_single_frame_obs(self, obs: torch.Tensor) -> torch.Tensor:
+        if not self.state_normalization:
+            return obs
+        mean = self.state_normalizer._mean[..., -obs.shape[-1] :]  # type: ignore[attr-defined]
+        std = self.state_normalizer._std[..., -obs.shape[-1] :]  # type: ignore[attr-defined]
+        return (obs - mean) / (std + self.state_normalizer.eps)  # type: ignore[attr-defined]
 
     def update_normalization(self, obs: TensorDict, next_obs: TensorDict | None = None) -> None:
         if self.state_normalization:

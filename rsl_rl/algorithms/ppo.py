@@ -168,7 +168,7 @@ class PPO:
         obs: TensorDict,
         bootstrap_rewards: torch.Tensor | None = None,
     ) -> TensorDict:
-        """Append the DWAQ code to the actor observation without mutating stored transitions."""
+        """Replace the actor obs with current-frame normalized obs plus detached DWAQ code."""
         if self.dwaq is None:
             return obs
 
@@ -182,10 +182,14 @@ class PPO:
         # Match DreamWaQ: the actor consumes the CENet code as an observation-like signal.
         # PPO actor loss updates the actor weights, while DWAQ is trained by its own loss.
         with torch.no_grad():
-            dwaq_code = self.dwaq.get_code(obs, deterministic=True, bootstrap_rewards=bootstrap_rewards)
+            actor_input = self.dwaq.get_actor_observation(
+                obs,
+                deterministic=True,
+                bootstrap_rewards=bootstrap_rewards,
+            )
 
         actor_obs = obs.clone()
-        actor_obs[code_group] = torch.cat((obs[code_group], dwaq_code), dim=-1)
+        actor_obs[code_group] = actor_input
         return actor_obs
 
     def process_env_step(
@@ -205,7 +209,6 @@ class PPO:
             self.rnd.update_normalization(obs)
         if self.dwaq:
             self.dwaq.update_normalization(self.transition.observations, obs)
-            self.actor.update_normalization(self._augment_obs_with_dwaq(obs))
         else:
             self.actor.update_normalization(obs)
 
