@@ -15,6 +15,7 @@ class DWAQ(torch.nn.Module):
         num_states: int, # actor的obs的维度
         num_target_states: int,
         input_obs_set: str = "actor",
+        critic_obs_set: str = "critic",
         obs_noise_free_group: str = "policy_noise_free",
         vel_obs_group: str = "vel",
         code_append_obs_group: str = "policy",
@@ -23,6 +24,7 @@ class DWAQ(torch.nn.Module):
         num_history_len: int = 5,
         num_latent: int = 19,  # 隐向量的长度 3(vel) + 16(z_t)
         num_decode: int | None = None,
+        frame_term_dims: tuple[int, ...] | list[int] | None = None,
         activation: str = "elu",
         VAE_beta: int = 1.0,
         use_adaboot: bool = False,
@@ -50,9 +52,11 @@ class DWAQ(torch.nn.Module):
         self.last_adaboot_probability: torch.Tensor | None = None
         self.num_history_len = num_history_len
         self.num_latent = num_latent
+        self.frame_term_dims = list(frame_term_dims) if frame_term_dims is not None else None
         # Get the observation dimensions
         self.obs_groups = obs_groups
         self.input_obs_set = input_obs_set
+        self.critic_obs_set = critic_obs_set
         self.obs_noise_free_group = obs_noise_free_group
         self.vel_obs_group = vel_obs_group
         self.code_append_obs_group = code_append_obs_group
@@ -67,6 +71,11 @@ class DWAQ(torch.nn.Module):
                 f"DWAQ encoder input dim ({num_states}) must be divisible by num_history_len ({num_history_len})."
             )
         self.obs_one_frame_len: int = int(num_states / num_history_len)
+        if self.frame_term_dims is not None and sum(self.frame_term_dims) != self.obs_one_frame_len:
+            raise ValueError(
+                f"DWAQ frame_term_dims sum ({sum(self.frame_term_dims)}) must match one-frame obs dim "
+                f"({self.obs_one_frame_len})."
+            )
         # 记录decoder输出的维度
         self.num_decoder = num_target_states if num_decode is None else num_decode
         if self.num_decoder > num_target_states:
@@ -163,7 +172,7 @@ class DWAQ(torch.nn.Module):
             input_obs = self.normalize_input_obs(input_obs)
             next_obs_noise_free = self.normalize_single_frame_obs(next_obs_noise_free)
         next_obs_noise_free = next_obs_noise_free[..., : self.num_decoder]
-        vel_obs = self.get_vel_obs(observations)
+        vel_obs = self.get_raw_critic_vel_obs(observations)
 
         _, _, vel_sample, _, _, latent_mean, latent_logvar, decode = self.encoder_forward(input_obs)
         if next_obs_noise_free.shape[-1] != self.num_decoder:
@@ -241,7 +250,7 @@ class DWAQ(torch.nn.Module):
             normalized_input_obs = self.normalize_input_obs(input_obs)
         else:
             normalized_input_obs = input_obs
-        current_obs = normalized_input_obs[:, -self.obs_one_frame_len :]
+        current_obs = self.extract_current_frame(normalized_input_obs)
         code = self.get_code_from_input_obs(
             input_obs,
             observations,
@@ -260,7 +269,7 @@ class DWAQ(torch.nn.Module):
         """Adaptively choose estimated velocity or simulator velocity for the actor code."""
         if estimated_vel.shape[-1] != 3:
             raise ValueError(f"DWAQ estimated velocity dim must be 3, got {estimated_vel.shape[-1]}.")
-        real_vel = self.get_vel_obs(observations)
+        real_vel = self.get_raw_critic_vel_obs(observations)
         if real_vel.shape[-1] != 3:
             raise ValueError(f"DWAQ AdaBoot velocity target dim must be 3, got {real_vel.shape[-1]}.")
 
@@ -304,6 +313,17 @@ class DWAQ(torch.nn.Module):
     def get_critic_obs(self, obs: TensorDict) -> torch.Tensor:
         return self._get_obs_by_set(obs, "critic")
 
+    def get_raw_critic_vel_obs(self, obs: TensorDict) -> torch.Tensor:
+        if self.critic_obs_set in self.obs_groups:
+            critic_obs = self._get_obs_by_set(obs, self.critic_obs_set)
+            if critic_obs.shape[-1] < 3:
+                raise ValueError(
+                    f"DWAQ critic obs set '{self.critic_obs_set}' must contain at least 3 velocity dims, "
+                    f"got {critic_obs.shape[-1]}."
+                )
+            return critic_obs[..., :3]
+        return self.get_vel_obs(obs)
+
     def get_obs_noise_free(self, obs: TensorDict) -> torch.Tensor:
         return obs[self.obs_noise_free_group]
 
@@ -318,13 +338,28 @@ class DWAQ(torch.nn.Module):
     def normalize_single_frame_obs(self, obs: torch.Tensor) -> torch.Tensor:
         if not self.state_normalization:
             return obs
-        mean = self.state_normalizer._mean[..., -obs.shape[-1] :]  # type: ignore[attr-defined]
-        std = self.state_normalizer._std[..., -obs.shape[-1] :]  # type: ignore[attr-defined]
+        mean = self.extract_current_frame(self.state_normalizer._mean)  # type: ignore[attr-defined]
+        std = self.extract_current_frame(self.state_normalizer._std)  # type: ignore[attr-defined]
+        if mean.shape[-1] != obs.shape[-1]:
+            mean = mean[..., : obs.shape[-1]]
+            std = std[..., : obs.shape[-1]]
         return (obs - mean) / (std + self.state_normalizer.eps)  # type: ignore[attr-defined]
 
     def update_normalization(self, obs: TensorDict, next_obs: TensorDict | None = None) -> None:
         if self.state_normalization:
             self.state_normalizer.update(self.get_input_obs(obs))  # type: ignore[attr-defined]
+
+    def extract_current_frame(self, obs_history: torch.Tensor) -> torch.Tensor:
+        if self.frame_term_dims is None:
+            return obs_history[..., -self.obs_one_frame_len :]
+
+        current_terms = []
+        offset = 0
+        for term_dim in self.frame_term_dims:
+            term_history_dim = term_dim * self.num_history_len
+            current_terms.append(obs_history[..., offset + term_history_dim - term_dim : offset + term_history_dim])
+            offset += term_history_dim
+        return torch.cat(current_terms, dim=-1)
 
 
 def resolve_dwaq_config(alg_cfg: dict, obs: TensorDict, obs_groups: dict[str, list[str]], env: VecEnv) -> dict:
@@ -342,6 +377,7 @@ def resolve_dwaq_config(alg_cfg: dict, obs: TensorDict, obs_groups: dict[str, li
     # Resolve dimension of dwaq gated state
     if "dwaq_cfg" in alg_cfg and alg_cfg["dwaq_cfg"] is not None:
         input_obs_set = alg_cfg["dwaq_cfg"].get("input_obs_set", "actor")
+        critic_obs_set = alg_cfg["dwaq_cfg"].get("critic_obs_set", "critic")
         obs_noise_free_group = alg_cfg["dwaq_cfg"].get("obs_noise_free_group", "policy_noise_free")
         vel_obs_group = alg_cfg["dwaq_cfg"].get("vel_obs_group", "vel")
         # Get dimension of dwaq encoder input state
@@ -364,6 +400,20 @@ def resolve_dwaq_config(alg_cfg: dict, obs: TensorDict, obs_groups: dict[str, li
                 raise ValueError(
                     f"The DWAQ module only supports 1D observations, got shape {obs[obs_group].shape} "
                     f"for '{obs_group}'."
+                )
+        if critic_obs_set in obs_groups:
+            critic_obs_dim = 0
+            for obs_group in obs_groups[critic_obs_set]:
+                if len(obs[obs_group].shape) != 2:
+                    raise ValueError(
+                        f"The DWAQ module only supports 1D observations, got shape {obs[obs_group].shape} "
+                        f"for '{obs_group}'."
+                    )
+                critic_obs_dim += obs[obs_group].shape[-1]
+            if critic_obs_dim < 3:
+                raise ValueError(
+                    f"DWAQ critic_obs_set '{critic_obs_set}' must contain at least 3 velocity dims, "
+                    f"got {critic_obs_dim}."
                 )
         num_target_states = obs[obs_noise_free_group].shape[-1]
         # Add dwaq gated state to config
