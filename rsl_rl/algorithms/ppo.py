@@ -79,11 +79,9 @@ class PPO:
             dwaq_lr = dwaq_cfg.pop("learning_rate", learning_rate)
             self.dwaq = DWAQ(device=self.device, **dwaq_cfg)
             self.dwaq_optimizer = optim.Adam(self.dwaq.parameters(), lr=dwaq_lr)
-            self.dwaq_bootstrap_rewards = None
         else:
             self.dwaq = None
             self.dwaq_optimizer = None
-            self.dwaq_bootstrap_rewards = None
 
         # RND components
         if rnd_cfg:
@@ -153,7 +151,10 @@ class PPO:
         """Sample actions and store transition data."""
         # Record the hidden states for recurrent policies
         self.transition.hidden_states = (self.actor.get_hidden_state(), self.critic.get_hidden_state())
-        actor_obs = self._augment_obs_with_dwaq(obs, bootstrap_rewards=self.dwaq_bootstrap_rewards)
+        # Reward-dependent AdaBoot choices are not replayable during PPO update unless
+        # the selected actor input is stored, so PPO samples actions from the
+        # deterministic estimated-code path.
+        actor_obs = self._augment_obs_with_dwaq(obs)
         # Compute the actions and values
         self.transition.actions = self.actor(actor_obs, stochastic_output=True).detach()
         self.transition.values = self.critic(obs).detach()
@@ -200,8 +201,6 @@ class PPO:
         # If rewards is [N, num_critics], use only the first column (task reward)
         if rewards.dim() > 1 and rewards.shape[-1] > 1:
             rewards = rewards[:, 0]
-        if self.dwaq:
-            self.dwaq_bootstrap_rewards = rewards.detach()
 
         # Update the normalizers
         self.critic.update_normalization(obs)
@@ -279,6 +278,7 @@ class PPO:
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
+        mean_kl = 0
         # RND loss
         mean_rnd_loss = 0 if self.rnd else None
         # DWAQ loss
@@ -298,13 +298,6 @@ class PPO:
         # Iterate over batches
         for batch in generator:
             original_batch_size = batch.observations.batch_size[0]
-
-            # DWAQ loss uses the original transition pairs before optional symmetry augmentation.
-            if self.dwaq:
-                dwaq_loss = self.dwaq.compute_loss(
-                    batch.observations[:original_batch_size],
-                    batch.next_observations[:original_batch_size],
-                )
 
             # Check if we should normalize advantages per mini batch
             # 每个batch自己归一化advantage还是之前一次性归一化
@@ -350,6 +343,7 @@ class PPO:
                 with torch.inference_mode():
                     kl = self.actor.get_kl_divergence(batch.old_distribution_params, distribution_params)  # type: ignore
                     kl_mean = torch.mean(kl)
+                    mean_kl += kl_mean.item()
 
                     # Reduce the KL divergence across all GPUs
                     if self.is_multi_gpu:
@@ -448,9 +442,6 @@ class PPO:
             # Compute the gradients for RND
             if self.rnd:
                 rnd_loss.backward()
-            # Compute the gradients for DWAQ
-            if self.dwaq:
-                dwaq_loss["total"].backward()
 
             # Collect gradients from all GPUs
             if self.is_multi_gpu:
@@ -463,10 +454,6 @@ class PPO:
             # Apply the gradients for RND
             if self.rnd_optimizer:
                 self.rnd_optimizer.step()
-            # Apply the gradients for DWAQ
-            if self.dwaq_optimizer:
-                nn.utils.clip_grad_norm_(self.dwaq.parameters(), self.max_grad_norm)
-                self.dwaq_optimizer.step()
 
             # Store the losses
             mean_value_loss += value_loss.item()
@@ -475,28 +462,43 @@ class PPO:
             # RND loss
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()
-            # DWAQ loss
-            if mean_dwaq_loss is not None:
+            # Symmetry loss
+            if mean_symmetry_loss is not None:
+                mean_symmetry_loss += symmetry_loss.item()
+
+        # Train DWAQ after PPO so the actor observations used for PPO stay fixed
+        # throughout the clipped-policy update.
+        dwaq_num_updates = 0
+        if self.dwaq:
+            dwaq_generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+            for batch in dwaq_generator:
+                dwaq_loss = self.dwaq.compute_loss(batch.observations, batch.next_observations)
+                self.dwaq_optimizer.zero_grad()
+                dwaq_loss["total"].backward()
+                if self.is_multi_gpu:
+                    self.reduce_dwaq_parameters()
+                nn.utils.clip_grad_norm_(self.dwaq.parameters(), self.max_grad_norm)
+                self.dwaq_optimizer.step()
+
                 mean_dwaq_loss += dwaq_loss["total"].item()
                 mean_dwaq_vel_loss += dwaq_loss["vel"].item()
                 mean_dwaq_obs_loss += dwaq_loss["obs"].item()
                 mean_dwaq_dkl_loss += dwaq_loss["dkl"].item()
-            # Symmetry loss
-            if mean_symmetry_loss is not None:
-                mean_symmetry_loss += symmetry_loss.item()
+                dwaq_num_updates += 1
 
         # Divide the losses by the number of updates
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
+        mean_kl /= num_updates
         if mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
         if mean_dwaq_loss is not None:
-            mean_dwaq_loss /= num_updates
-            mean_dwaq_vel_loss /= num_updates
-            mean_dwaq_obs_loss /= num_updates
-            mean_dwaq_dkl_loss /= num_updates
+            mean_dwaq_loss /= dwaq_num_updates
+            mean_dwaq_vel_loss /= dwaq_num_updates
+            mean_dwaq_obs_loss /= dwaq_num_updates
+            mean_dwaq_dkl_loss /= dwaq_num_updates
         if mean_symmetry_loss is not None:
             mean_symmetry_loss /= num_updates
 
@@ -509,6 +511,8 @@ class PPO:
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
         }
+        if self.desired_kl is not None and self.schedule == "adaptive":
+            loss_dict["kl"] = mean_kl
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
         if self.dwaq:
@@ -613,14 +617,24 @@ class PPO:
 
         This function is called after the backward pass to synchronize the gradients across all GPUs.
         """
-        # Create a tensor to store the gradients
         all_params = chain(self.actor.parameters(), self.critic.parameters())
         if self.rnd:
             all_params = chain(all_params, self.rnd.parameters())
         if self.dwaq:
             all_params = chain(all_params, self.dwaq.parameters())
+        self._reduce_gradients(all_params)
+
+    def reduce_dwaq_parameters(self) -> None:
+        """Collect DWAQ gradients from all GPUs and average them."""
+        if self.dwaq:
+            self._reduce_gradients(self.dwaq.parameters())
+
+    def _reduce_gradients(self, all_params) -> None:
+        """Average non-empty gradients across all GPUs."""
         all_params = list(all_params)
         grads = [param.grad.view(-1) for param in all_params if param.grad is not None]
+        if not grads:
+            return
         all_grads = torch.cat(grads)
         # Average the gradients across all GPUs
         torch.distributed.all_reduce(all_grads, op=torch.distributed.ReduceOp.SUM)
