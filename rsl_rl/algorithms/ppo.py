@@ -79,9 +79,13 @@ class PPO:
             dwaq_lr = dwaq_cfg.pop("learning_rate", learning_rate)
             self.dwaq = DWAQ(device=self.device, **dwaq_cfg)
             self.dwaq_optimizer = optim.Adam(self.dwaq.parameters(), lr=dwaq_lr)
+            self.dwaq_bootstrap_rewards = torch.full((storage.num_envs,), float("nan"), device=self.device)
+            self._dwaq_current_episode_returns = torch.zeros(storage.num_envs, device=self.device)
         else:
             self.dwaq = None
             self.dwaq_optimizer = None
+            self.dwaq_bootstrap_rewards = None
+            self._dwaq_current_episode_returns = None
 
         # RND components
         if rnd_cfg:
@@ -131,6 +135,8 @@ class PPO:
         # Add storage
         self.storage = storage
         self.transition = RolloutStorage.Transition()
+        self._current_actor_observations: TensorDict | None = None
+        self._actor_observations_storage: TensorDict | None = None
 
         # PPO parameters
         self.clip_param = clip_param
@@ -151,10 +157,11 @@ class PPO:
         """Sample actions and store transition data."""
         # Record the hidden states for recurrent policies
         self.transition.hidden_states = (self.actor.get_hidden_state(), self.critic.get_hidden_state())
-        # Reward-dependent AdaBoot choices are not replayable during PPO update unless
-        # the selected actor input is stored, so PPO samples actions from the
-        # deterministic estimated-code path.
-        actor_obs = self._augment_obs_with_dwaq(obs)
+        actor_obs = self._augment_obs_with_dwaq(
+            obs,
+            deterministic=self._dwaq_actor_code_is_deterministic(),
+            bootstrap_rewards=self.dwaq_bootstrap_rewards,
+        )
         # Compute the actions and values
         self.transition.actions = self.actor(actor_obs, stochastic_output=True).detach()
         self.transition.values = self.critic(obs).detach()
@@ -162,11 +169,13 @@ class PPO:
         self.transition.distribution_params = tuple(p.detach() for p in self.actor.output_distribution_params)
         # Record observations before env.step()
         self.transition.observations = obs
+        self._current_actor_observations = actor_obs
         return self.transition.actions  # type: ignore
 
     def _augment_obs_with_dwaq(
         self,
         obs: TensorDict,
+        deterministic: bool = True,
         bootstrap_rewards: torch.Tensor | None = None,
     ) -> TensorDict:
         """Replace the actor obs with current-frame normalized obs plus detached DWAQ code."""
@@ -185,7 +194,7 @@ class PPO:
         with torch.no_grad():
             actor_input = self.dwaq.get_actor_observation(
                 obs,
-                deterministic=True,
+                deterministic=deterministic,
                 bootstrap_rewards=bootstrap_rewards,
             )
 
@@ -197,10 +206,13 @@ class PPO:
         self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
     ) -> None:
         """Record one environment step and update the normalizers."""
+        dwaq_step_rewards = self._get_dwaq_step_rewards_for_return(rewards) if self.dwaq else None
         # Handle multi-critic rewards in single-critic mode
         # If rewards is [N, num_critics], use only the first column (task reward)
         if rewards.dim() > 1 and rewards.shape[-1] > 1:
             rewards = rewards[:, 0]
+        if dwaq_step_rewards is not None:
+            self._update_dwaq_episode_returns(dwaq_step_rewards, dones)
 
         # Update the normalizers
         self.critic.update_normalization(obs)
@@ -231,9 +243,13 @@ class PPO:
                 1,
             )
 
+        if self.dwaq and self._current_actor_observations is not None:
+            self._store_actor_observations(self._current_actor_observations)
+
         # Record the transition
         self.storage.add_transition(self.transition)
         self.transition.clear()
+        self._current_actor_observations = None
         self.actor.reset(dones)
         self.critic.reset(dones)
 
@@ -292,6 +308,8 @@ class PPO:
         # Get mini batch generator
         if self.actor.is_recurrent or self.critic.is_recurrent:
             generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+        elif self.dwaq and self._actor_observations_storage is not None:
+            generator = self._dwaq_mini_batch_generator()
         else:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
 
@@ -325,7 +343,12 @@ class PPO:
 
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: We need to do this because we updated the policy with the new parameters
-            actor_observations = self._augment_obs_with_dwaq(batch.observations)
+            actor_observations = getattr(batch, "actor_observations", None)
+            if actor_observations is None or actor_observations.batch_size[0] != batch.observations.batch_size[0]:
+                actor_observations = self._augment_obs_with_dwaq(
+                    batch.observations,
+                    deterministic=self._dwaq_actor_code_is_deterministic(),
+                )
             self.actor(
                 actor_observations,
                 masks=batch.masks,
@@ -524,6 +547,81 @@ class PPO:
             loss_dict["symmetry"] = mean_symmetry_loss
 
         return loss_dict
+
+    def _store_actor_observations(self, actor_observations: TensorDict) -> None:
+        if self._actor_observations_storage is None:
+            self._actor_observations_storage = TensorDict(
+                {
+                    key: torch.zeros(
+                        self.storage.num_transitions_per_env,
+                        *value.shape,
+                        device=self.device,
+                        dtype=value.dtype,
+                    )
+                    for key, value in actor_observations.items()
+                },
+                batch_size=[self.storage.num_transitions_per_env, self.storage.num_envs],
+                device=self.device,
+            )
+        self._actor_observations_storage[self.storage.step].copy_(actor_observations)
+
+    def _dwaq_actor_code_is_deterministic(self) -> bool:
+        return self.dwaq is None or self.dwaq.actor_code_mode == "mean"
+
+    def _get_dwaq_step_rewards_for_return(self, rewards: torch.Tensor) -> torch.Tensor:
+        if rewards.dim() > 1 and rewards.shape[-1] > 1:
+            return rewards.sum(dim=-1)
+        return rewards.reshape(-1)
+
+    def _update_dwaq_episode_returns(self, rewards: torch.Tensor, dones: torch.Tensor) -> None:
+        if self._dwaq_current_episode_returns is None or self.dwaq_bootstrap_rewards is None:
+            return
+
+        step_rewards = rewards.detach().reshape(-1).to(device=self.device)
+        done_mask = dones.detach().reshape(-1).to(device=self.device, dtype=torch.bool)
+        self._dwaq_current_episode_returns += step_rewards
+
+        if done_mask.any():
+            self.dwaq_bootstrap_rewards[done_mask] = self._dwaq_current_episode_returns[done_mask]
+            self._dwaq_current_episode_returns[done_mask] = 0.0
+
+    def _dwaq_mini_batch_generator(self):
+        batch_size = self.storage.num_envs * self.storage.num_transitions_per_env
+        mini_batch_size = batch_size // self.num_mini_batches
+        indices = torch.randperm(self.num_mini_batches * mini_batch_size, requires_grad=False, device=self.device)
+
+        observations = self.storage.observations.flatten(0, 1)
+        actor_observations = self._actor_observations_storage.flatten(0, 1)  # type: ignore[union-attr]
+        next_observations = self.storage.next_observations.flatten(0, 1)
+        actions = self.storage.actions.flatten(0, 1)
+        values = self.storage.values.flatten(0, 1)
+        returns = self.storage.returns.flatten(0, 1)
+        old_actions_log_prob = self.storage.actions_log_prob.flatten(0, 1)
+
+        advantages = self.storage.advantages.flatten(0, 1)
+        if self.storage.num_critics == 1:
+            advantages = advantages.squeeze(-1)
+
+        old_distribution_params = tuple(p.flatten(0, 1) for p in self.storage.distribution_params)  # type: ignore[arg-type]
+
+        for _ in range(self.num_learning_epochs):
+            for i in range(self.num_mini_batches):
+                start = i * mini_batch_size
+                stop = (i + 1) * mini_batch_size
+                batch_idx = indices[start:stop]
+
+                batch = RolloutStorage.Batch(
+                    observations=observations[batch_idx],  # type: ignore
+                    next_observations=next_observations[batch_idx],  # type: ignore
+                    actions=actions[batch_idx],
+                    values=values[batch_idx],
+                    advantages=advantages[batch_idx],
+                    returns=returns[batch_idx],
+                    old_actions_log_prob=old_actions_log_prob[batch_idx],
+                    old_distribution_params=tuple(p[batch_idx] for p in old_distribution_params),
+                )
+                batch.actor_observations = actor_observations[batch_idx]
+                yield batch
 
     def train_mode(self) -> None:
         """Set train mode for learnable models."""

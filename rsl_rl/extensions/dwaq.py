@@ -28,6 +28,7 @@ class DWAQ(torch.nn.Module):
         activation: str = "elu",
         VAE_beta: int = 1.0,
         use_adaboot: bool = False,
+        actor_code_mode: str = "mean",
         adaboot_eps: float = 1.0e-8,
         state_normalization: bool = True,
         vel_loss_coef: float = 1.0,
@@ -48,6 +49,9 @@ class DWAQ(torch.nn.Module):
         self.beta = VAE_beta
         # 是否使用adaboot
         self.use_adaboot = use_adaboot
+        if actor_code_mode not in ("mean", "sample"):
+            raise ValueError(f"DWAQ actor_code_mode must be 'mean' or 'sample', got '{actor_code_mode}'.")
+        self.actor_code_mode = actor_code_mode
         self.adaboot_eps = adaboot_eps
         self.last_adaboot_probability: torch.Tensor | None = None
         self.num_history_len = num_history_len
@@ -273,9 +277,15 @@ class DWAQ(torch.nn.Module):
         if real_vel.shape[-1] != 3:
             raise ValueError(f"DWAQ AdaBoot velocity target dim must be 3, got {real_vel.shape[-1]}.")
 
-        flat_rewards = rewards.float().reshape(-1)
-        cv_rewards = torch.std(flat_rewards, unbiased=False) / (torch.abs(torch.mean(flat_rewards)) + self.adaboot_eps)
-        p_boot = torch.clamp(1.0 - torch.tanh(cv_rewards), min=0.0, max=1.0)
+        flat_rewards = rewards.to(device=estimated_vel.device).float().reshape(-1)
+        flat_rewards = flat_rewards[torch.isfinite(flat_rewards)]
+        if flat_rewards.numel() < 2:
+            p_boot = torch.zeros((), device=estimated_vel.device)
+        else:
+            cv_rewards = torch.std(flat_rewards, unbiased=False) / (
+                torch.abs(torch.mean(flat_rewards)) + self.adaboot_eps
+            )
+            p_boot = torch.clamp(1.0 - torch.tanh(cv_rewards), min=0.0, max=1.0)
         self.last_adaboot_probability = p_boot.detach()
 
         use_estimated = torch.rand((), device=estimated_vel.device) < p_boot
