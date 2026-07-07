@@ -257,10 +257,32 @@ class OnPolicyRunner:
             save_path,
             export_params=True,
             opset_version=18,
+            external_data=False,
             verbose=verbose,
             input_names=onnx_model.input_names,  # type: ignore
             output_names=onnx_model.output_names,  # type: ignore
             dynamic_axes=getattr(onnx_model, "dynamic_axes", None),
+        )
+        self._rewrite_onnx_ir_version(save_path)
+
+    @staticmethod
+    def _rewrite_onnx_ir_version(save_path: str, target_ir_version: int = 8) -> None:
+        """Rewrite ONNX IR version for older deployment runtimes."""
+        try:
+            import onnx
+        except ImportError:
+            print("[WARNING]: Could not rewrite ONNX IR version because onnx is not installed.")
+            return
+
+        model = onnx.load(save_path)
+        if model.ir_version <= target_ir_version:
+            return
+
+        original_ir_version = model.ir_version
+        model.ir_version = target_ir_version
+        onnx.save(model, save_path, save_as_external_data=False)
+        print(
+            f"[INFO]: Rewrote ONNX IR version from {original_ir_version} to {target_ir_version}: {save_path}"
         )
 
     def add_git_repo_to_log(self, repo_file_path: str) -> None:
