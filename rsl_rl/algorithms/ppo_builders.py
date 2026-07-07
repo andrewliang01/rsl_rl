@@ -170,9 +170,30 @@ def _augment_actor_obs_sample_for_dwaq(obs: TensorDict, alg_cfg: dict) -> Tensor
         dtype=obs[code_group].dtype,
         device=obs[code_group].device,
     )
-    current_obs_template = obs[code_group][..., -one_frame_dim:]
+    current_obs_template = _extract_dwaq_current_frame_sample(obs[code_group], dwaq_cfg, one_frame_dim, num_history_len)
     obs_for_actor[code_group] = torch.cat((current_obs_template, code_template), dim=-1)
     return obs_for_actor
+
+
+def _extract_dwaq_current_frame_sample(
+    obs_history: torch.Tensor, dwaq_cfg: dict, one_frame_dim: int, num_history_len: int
+) -> torch.Tensor:
+    frame_term_dims = dwaq_cfg.get("frame_term_dims")
+    if frame_term_dims is None:
+        return obs_history[..., -one_frame_dim:]
+
+    if sum(frame_term_dims) != one_frame_dim:
+        raise ValueError(
+            f"DWAQ frame_term_dims sum ({sum(frame_term_dims)}) must match one-frame obs dim ({one_frame_dim})."
+        )
+
+    current_terms = []
+    offset = 0
+    for term_dim in frame_term_dims:
+        term_history_dim = term_dim * num_history_len
+        current_terms.append(obs_history[..., offset + term_history_dim - term_dim : offset + term_history_dim])
+        offset += term_history_dim
+    return torch.cat(current_terms, dim=-1)
 
 
 def _resolve_critic_cfg(cfg: dict, group_name: str | None = None) -> tuple[type[MLPModel], dict]:
