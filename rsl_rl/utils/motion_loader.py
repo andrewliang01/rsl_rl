@@ -310,21 +310,21 @@ class AMPLoader:
 
     def get_frame_at_time(self, traj_idx: int, time: float) -> torch.Tensor:
         """Get a single frame at a specific time from a trajectory."""
-        p = float(time) / self.trajectory_lens[traj_idx]
         n = self.trajectories[traj_idx].shape[0]
-        idx_low = min(int(np.floor(p * n)), n - 1)
-        idx_high = min(int(np.ceil(p * n)), n - 1)
+        frame = np.clip(float(time) / float(self.trajectory_frame_durations[traj_idx]), 0.0, n - 1)
+        idx_low = int(np.floor(frame))
+        idx_high = min(idx_low + 1, n - 1)
         frame_start = self.trajectories[traj_idx][idx_low]
         frame_end = self.trajectories[traj_idx][idx_high]
-        blend = p * n - idx_low
+        blend = frame - idx_low
         return self.slerp(frame_start, frame_end, blend)
 
     def get_frame_at_time_batch(self, traj_idxs: np.ndarray, times: np.ndarray) -> torch.Tensor:
         """Get frames at specific times for multiple trajectories."""
-        p = times / self.trajectory_lens[traj_idxs]
-        n = self.trajectory_num_frames[traj_idxs]
-        idx_low = np.minimum(np.floor(p * n).astype(np.int64), n.astype(np.int64) - 1)
-        idx_high = np.minimum(np.ceil(p * n).astype(np.int64), n.astype(np.int64) - 1)
+        n = self.trajectory_num_frames[traj_idxs].astype(np.int64)
+        frame = np.clip(times / self.trajectory_frame_durations[traj_idxs], 0.0, n - 1)
+        idx_low = np.floor(frame).astype(np.int64)
+        idx_high = np.minimum(idx_low + 1, n - 1)
 
         all_frame_starts = torch.zeros(len(traj_idxs), self.observation_dim, device=self.device)
         all_frame_ends = torch.zeros(len(traj_idxs), self.observation_dim, device=self.device)
@@ -335,26 +335,26 @@ class AMPLoader:
             all_frame_starts[traj_mask] = trajectory[idx_low[traj_mask]]
             all_frame_ends[traj_mask] = trajectory[idx_high[traj_mask]]
 
-        blend = torch.tensor(p * n - idx_low, device=self.device, dtype=torch.float32).unsqueeze(-1)
+        blend = torch.tensor(frame - idx_low, device=self.device, dtype=torch.float32).unsqueeze(-1)
         return self.slerp(all_frame_starts, all_frame_ends, blend)
 
     def get_full_frame_at_time(self, traj_idx: int, time: float) -> torch.Tensor:
         """Get full AMP frame at a specific time."""
-        p = float(time) / self.trajectory_lens[traj_idx]
         n = self.trajectories_full[traj_idx].shape[0]
-        idx_low = min(int(np.floor(p * n)), n - 1)
-        idx_high = min(int(np.ceil(p * n)), n - 1)
+        frame = np.clip(float(time) / float(self.trajectory_frame_durations[traj_idx]), 0.0, n - 1)
+        idx_low = int(np.floor(frame))
+        idx_high = min(idx_low + 1, n - 1)
         frame_start = self.trajectories_full[traj_idx][idx_low]
         frame_end = self.trajectories_full[traj_idx][idx_high]
-        blend = p * n - idx_low
+        blend = frame - idx_low
         return self.slerp(frame_start, frame_end, blend)
 
     def get_full_frame_at_time_batch(self, traj_idxs: np.ndarray, times: np.ndarray) -> torch.Tensor:
         """Get full AMP frames at specific times for multiple trajectories."""
-        p = times / self.trajectory_lens[traj_idxs]
-        n = self.trajectory_num_frames[traj_idxs]
-        idx_low = np.minimum(np.floor(p * n).astype(np.int64), n.astype(np.int64) - 1)
-        idx_high = np.minimum(np.ceil(p * n).astype(np.int64), n.astype(np.int64) - 1)
+        n = self.trajectory_num_frames[traj_idxs].astype(np.int64)
+        frame = np.clip(times / self.trajectory_frame_durations[traj_idxs], 0.0, n - 1)
+        idx_low = np.floor(frame).astype(np.int64)
+        idx_high = np.minimum(idx_low + 1, n - 1)
 
         amp_obs_dim = self.amp_obs_dim
         all_frame_starts = torch.zeros(len(traj_idxs), amp_obs_dim, device=self.device)
@@ -366,7 +366,7 @@ class AMPLoader:
             all_frame_starts[traj_mask] = trajectory[idx_low[traj_mask]]
             all_frame_ends[traj_mask] = trajectory[idx_high[traj_mask]]
 
-        blend = torch.tensor(p * n - idx_low, device=self.device, dtype=torch.float32).unsqueeze(-1)
+        blend = torch.tensor(frame - idx_low, device=self.device, dtype=torch.float32).unsqueeze(-1)
         return self.slerp(all_frame_starts, all_frame_ends, blend)
 
     def feed_forward_generator(self, num_mini_batch: int, mini_batch_size: int):
