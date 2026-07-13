@@ -36,6 +36,7 @@ class PropMLPElevationFusionModel(nn.Module):
     _CNN_OBSERVATION_MODES = {
         "elevationmap": 0,
         "depthcamera": 1,
+        "inverse_depth": 2,
     }
 
     def __init__(
@@ -52,6 +53,8 @@ class PropMLPElevationFusionModel(nn.Module):
         cnn_observation_type: str = "elevationmap",
         depth_camera_near: float = 0.05,
         depth_camera_far: float = 6.0,
+        vision_range_scale: float = 1.0,
+        vision_range_max: float = 10.0,
         vision_spatial_size: tuple[int, int] = (25, 17),
         vision_feature_dim: int = 64,
         elevation_history_length: int = 5,
@@ -60,6 +63,7 @@ class PropMLPElevationFusionModel(nn.Module):
         cnn_strides: tuple[int, ...] | list[int] = (2, 2, 2),
         prop_feature_dim: int = 64,
         prop_hidden_dims: tuple[int, ...] | list[int] = (128,),
+        use_prop_encoder: bool = True,
     ) -> None:
         """Initialize the proprio-elevation fusion model.
 
@@ -74,9 +78,11 @@ class PropMLPElevationFusionModel(nn.Module):
             distribution_cfg: Optional output distribution configuration.
             elevation_set: CNN observation-group name used by this model instance.
             cnn_observation_type: Normalization path for the CNN observation. Supported values are
-                ``"elevationmap"`` and ``"depthcamera"``.
+                ``"elevationmap"``, ``"depthcamera"``, and ``"inverse_depth"``.
             depth_camera_near: Near depth used by the depth-camera normalization branch.
             depth_camera_far: Far depth used by the depth-camera normalization branch.
+            vision_range_scale: Distance scale used by legacy inverse-depth normalization.
+            vision_range_max: Maximum distance used by legacy inverse-depth normalization.
             vision_spatial_size: Spatial size ``(H, W)`` of the elevation map.
             vision_feature_dim: Output dimension of the elevation encoder.
             elevation_history_length: Number of elevation-history frames, used as CNN input channels.
@@ -85,6 +91,7 @@ class PropMLPElevationFusionModel(nn.Module):
             cnn_strides: Strides of the elevation CNN.
             prop_feature_dim: Output feature dimension of the proprio MLP encoder.
             prop_hidden_dims: Hidden dimensions of the proprio MLP encoder.
+            use_prop_encoder: Whether to pass proprioception through the encoder before fusion.
         """
         super().__init__()
 
@@ -103,11 +110,18 @@ class PropMLPElevationFusionModel(nn.Module):
         self._cnn_observation_mode = self._CNN_OBSERVATION_MODES[self.cnn_observation_type]
         self.depth_camera_near = float(depth_camera_near)
         self.depth_camera_far = float(depth_camera_far)
+        self.vision_range_scale = float(vision_range_scale)
+        self.vision_range_max = float(vision_range_max)
+        if self.vision_range_scale <= 0.0:
+            raise ValueError(f"vision_range_scale must be positive, got {self.vision_range_scale}.")
+        if self.vision_range_max <= 0.0:
+            raise ValueError(f"vision_range_max must be positive, got {self.vision_range_max}.")
 
         self.vision_feature_dim = vision_feature_dim
         self.vision_spatial_size = tuple(vision_spatial_size)
         self.prop_feature_dim = prop_feature_dim
         self.elevation_history_length = elevation_history_length
+        self.use_prop_encoder = use_prop_encoder
 
         # Resolve proprio observation groups and dimension.
         self.obs_groups, self.obs_dim = self._get_prop_obs_dim(obs, obs_groups, obs_set, self.elevation_set)
@@ -129,7 +143,12 @@ class PropMLPElevationFusionModel(nn.Module):
             fusion_output_dim = output_dim
 
         # Proprio encoder.
-        self.prop_mlp = MLP(self.obs_dim, prop_feature_dim, prop_hidden_dims, activation)
+        if use_prop_encoder:
+            self.prop_mlp = MLP(self.obs_dim, prop_feature_dim, prop_hidden_dims, activation)
+            fusion_prop_dim = prop_feature_dim
+        else:
+            self.prop_mlp = nn.Identity()
+            fusion_prop_dim = self.obs_dim
 
         # Elevation encoder.
         self.elevation_encoder = Elevation2DCNNEncoder(
@@ -142,7 +161,7 @@ class PropMLPElevationFusionModel(nn.Module):
         )
 
         # Fusion head.
-        self.mlp = MLP(prop_feature_dim + vision_feature_dim, fusion_output_dim, hidden_dims, activation)
+        self.mlp = MLP(fusion_prop_dim + vision_feature_dim, fusion_output_dim, hidden_dims, activation)
 
         if self.distribution is not None:
             self.distribution.init_mlp_weights(self.mlp)
@@ -266,6 +285,10 @@ class PropMLPElevationFusionModel(nn.Module):
             elevation_mean = cnn_observation.mean(dim=(-2, -1), keepdim=True)
             return torch.clamp((cnn_observation - elevation_mean) / 0.6, -3.0, 3.0)
 
+        if self._cnn_observation_mode == 2:
+            distance_map = torch.clamp(cnn_observation, min=0.0, max=self.vision_range_max)
+            return 2.0 / (1.0 + distance_map / self.vision_range_scale) - 1.0
+
         invalid_mask = (~torch.isfinite(cnn_observation)) | (cnn_observation <= 0.0)
         cnn_observation = torch.where(
             invalid_mask,
@@ -291,6 +314,8 @@ class _TorchPropMLPElevationFusionModel(nn.Module):
         self._cnn_observation_mode = model._cnn_observation_mode
         self.depth_camera_near = model.depth_camera_near
         self.depth_camera_far = model.depth_camera_far
+        self.vision_range_scale = model.vision_range_scale
+        self.vision_range_max = model.vision_range_max
         if model.distribution is not None:
             self.deterministic_output = model.distribution.as_deterministic_output_module()
         else:
@@ -309,6 +334,10 @@ class _TorchPropMLPElevationFusionModel(nn.Module):
         if self._cnn_observation_mode == 0:
             elevation_mean = cnn_observation.mean(dim=(-2, -1), keepdim=True)
             return torch.clamp((cnn_observation - elevation_mean) / 0.6, -3.0, 3.0)
+
+        if self._cnn_observation_mode == 2:
+            distance_map = torch.clamp(cnn_observation, min=0.0, max=self.vision_range_max)
+            return 2.0 / (1.0 + distance_map / self.vision_range_scale) - 1.0
 
         invalid_mask = (~torch.isfinite(cnn_observation)) | (cnn_observation <= 0.0)
         cnn_observation = torch.where(
@@ -349,6 +378,8 @@ class _OnnxPropMLPElevationFusionModel(nn.Module):
         self._cnn_observation_mode = model._cnn_observation_mode
         self.depth_camera_near = model.depth_camera_near
         self.depth_camera_far = model.depth_camera_far
+        self.vision_range_scale = model.vision_range_scale
+        self.vision_range_max = model.vision_range_max
         self.proprio_input_size = model.obs_dim
         self.elevation_history_length = model.elevation_history_length
         self.vision_spatial_size = model.vision_spatial_size
@@ -378,6 +409,10 @@ class _OnnxPropMLPElevationFusionModel(nn.Module):
         if self._cnn_observation_mode == 0:
             elevation_mean = cnn_observation.mean(dim=(-2, -1), keepdim=True)
             return torch.clamp((cnn_observation - elevation_mean) / 0.6, -3.0, 3.0)
+
+        if self._cnn_observation_mode == 2:
+            distance_map = torch.clamp(cnn_observation, min=0.0, max=self.vision_range_max)
+            return 2.0 / (1.0 + distance_map / self.vision_range_scale) - 1.0
 
         invalid_mask = (~torch.isfinite(cnn_observation)) | (cnn_observation <= 0.0)
         cnn_observation = torch.where(
