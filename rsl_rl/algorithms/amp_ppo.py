@@ -33,6 +33,8 @@ class AMPPPO(MultiPPO):
         self.amp_optimizer: optim.Optimizer | None = None
         self.disc_update_decimation = 1
         self.disc_update_counter = 0
+        self.discriminator_follow_policy_lr = False
+        self.min_normalized_std: torch.Tensor | None = None
 
         self.task_rewards: torch.Tensor | None = None
         self.style_rewards: torch.Tensor | None = None
@@ -60,6 +62,8 @@ class AMPPPO(MultiPPO):
             anchor_name=amp_cfg.get("anchor_name", ""),
             motion_body_names=amp_cfg.get("motion_body_names", ()),
             all_body_names=amp_cfg.get("all_body_names", ()),
+            motion_quat_convention=amp_cfg.get("motion_quat_convention", "xyzw"),
+            expert_sampling_mode=amp_cfg.get("expert_sampling_mode", "continuous"),
             preload_transitions=amp_cfg.get("preload_transitions", True),
             num_preload_transitions=amp_cfg.get("num_preload_transitions", 100000),
         )
@@ -79,11 +83,76 @@ class AMPPPO(MultiPPO):
             buffer_size=amp_cfg.get("amp_buffer_size", 100000),
             device=self.device,
         )
+        self.discriminator_follow_policy_lr = amp_cfg.get("discriminator_follow_policy_lr", False)
+        discriminator_lr = (
+            self.learning_rate
+            if self.discriminator_follow_policy_lr
+            else amp_cfg.get("discriminator_learning_rate", 1e-4)
+        )
         self.amp_optimizer = optim.Adam(
-            self.amp_discriminator.parameters(),
-            lr=amp_cfg.get("discriminator_learning_rate", 1e-4),
+            [
+                {
+                    "params": self.amp_discriminator.trunk.parameters(),
+                    "weight_decay": amp_cfg.get("discriminator_trunk_weight_decay", 0.0),
+                    "name": "amp_trunk",
+                },
+                {
+                    "params": self.amp_discriminator.output_layer.parameters(),
+                    "weight_decay": amp_cfg.get("discriminator_head_weight_decay", 0.0),
+                    "name": "amp_head",
+                },
+            ],
+            lr=discriminator_lr,
         )
         self.disc_update_decimation = amp_cfg.get("discriminator_update_decimation", 1)
+        self.min_normalized_std = self._resolve_min_normalized_std(
+            amp_cfg.get("min_normalized_std", 0.0)
+        )
+
+    def _resolve_min_normalized_std(self, configured_min_std: float | list[float]) -> torch.Tensor | None:
+        """Resolve the configured normalized-action standard-deviation floor."""
+        distribution = getattr(self.actor, "distribution", None)
+        if distribution is None:
+            if torch.as_tensor(configured_min_std).max().item() > 0.0:
+                raise ValueError("min_normalized_std requires an actor with a stochastic output distribution.")
+            return None
+
+        if getattr(distribution, "std_type", None) == "scalar":
+            parameter = getattr(distribution, "std_param", None)
+        elif getattr(distribution, "std_type", None) == "log":
+            parameter = getattr(distribution, "log_std_param", None)
+        else:
+            parameter = None
+
+        configured = torch.as_tensor(configured_min_std, dtype=torch.float32, device=self.device).flatten()
+        if configured.numel() == 1:
+            configured = configured.expand(parameter.numel() if parameter is not None else 1)
+        if parameter is None or configured.numel() != parameter.numel():
+            raise ValueError(
+                "min_normalized_std must be a scalar or have one value per action for a Gaussian actor; "
+                f"got {configured.numel()} values."
+            )
+        if torch.any(configured < 0.0):
+            raise ValueError("min_normalized_std values must be non-negative.")
+        return configured
+
+    def _clamp_actor_std(self) -> None:
+        """Keep the Gaussian policy standard deviation above its configured floor."""
+        if self.min_normalized_std is None:
+            return
+        distribution = self.actor.distribution
+        with torch.no_grad():
+            if distribution.std_type == "scalar":
+                distribution.std_param.clamp_(min=self.min_normalized_std)
+            else:
+                distribution.log_std_param.clamp_(min=torch.log(self.min_normalized_std.clamp_min(1.0e-6)))
+
+    def _sync_discriminator_learning_rate(self) -> None:
+        """Apply PPO's current adaptive learning rate to the separate discriminator optimizer."""
+        if not self.discriminator_follow_policy_lr or self.amp_optimizer is None:
+            return
+        for param_group in self.amp_optimizer.param_groups:
+            param_group["lr"] = self.learning_rate
 
     def _extract_amp_task_rewards(self, rewards: torch.Tensor) -> torch.Tensor:
         if rewards.dim() == 1:
@@ -369,6 +438,7 @@ class AMPPPO(MultiPPO):
             for critic in self.critics:
                 nn.utils.clip_grad_norm_(critic.parameters(), self.max_grad_norm)
             self.optimizer.step()
+            self._clamp_actor_std()
             if self.rnd_optimizer:
                 self.rnd_optimizer.step()
 
@@ -418,6 +488,8 @@ class AMPPPO(MultiPPO):
             loss_dict["amp_grad_pen"] = (mean_grad_pen_loss / disc_actual_updates).item()
             loss_dict["amp_policy_pred"] = (mean_policy_pred / disc_actual_updates).item()
             loss_dict["amp_expert_pred"] = (mean_expert_pred / disc_actual_updates).item()
+        if self.amp_optimizer is not None:
+            loss_dict["amp_learning_rate"] = self.amp_optimizer.param_groups[0]["lr"]
 
         return loss_dict
 
@@ -434,10 +506,10 @@ class AMPPPO(MultiPPO):
             self.amp_discriminator.update_normalization(policy_state)
             self.amp_discriminator.update_normalization(expert_state)
             with torch.no_grad():
-                policy_state = self.amp_discriminator.obs_normalizer(policy_state)
-                policy_next_state = self.amp_discriminator.obs_normalizer(policy_next_state)
-                expert_state = self.amp_discriminator.obs_normalizer(expert_state)
-                expert_next_state = self.amp_discriminator.obs_normalizer(expert_next_state)
+                policy_state = self.amp_discriminator.normalize_observation(policy_state)
+                policy_next_state = self.amp_discriminator.normalize_observation(policy_next_state)
+                expert_state = self.amp_discriminator.normalize_observation(expert_state)
+                expert_next_state = self.amp_discriminator.normalize_observation(expert_next_state)
 
         policy_input = torch.cat([policy_state, policy_next_state], dim=-1)
         expert_input = torch.cat([expert_state, expert_next_state], dim=-1).requires_grad_(True)
@@ -451,6 +523,7 @@ class AMPPPO(MultiPPO):
         grad_pen_loss = self.amp_discriminator.compute_grad_pen_from_disc(expert_input, expert_d, lambda_=10.0)
         total_loss = amp_loss + grad_pen_loss
 
+        self._sync_discriminator_learning_rate()
         self.amp_optimizer.zero_grad(set_to_none=True)
         total_loss.backward()
         nn.utils.clip_grad_norm_(self.amp_discriminator.parameters(), self.max_grad_norm)
@@ -486,6 +559,8 @@ class AMPPPO(MultiPPO):
             self.amp_discriminator.load_state_dict(loaded_dict["amp_discriminator_state_dict"], strict=strict)
         if self.amp_optimizer is not None and "amp_optimizer_state_dict" in loaded_dict:
             self.amp_optimizer.load_state_dict(loaded_dict["amp_optimizer_state_dict"])
+        self._sync_discriminator_learning_rate()
+        self._clamp_actor_std()
         return result
 
     @staticmethod

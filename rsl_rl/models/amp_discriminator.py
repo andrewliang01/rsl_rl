@@ -48,14 +48,13 @@ class AMPDiscriminator(nn.Module):
         # Observation normalizer (optional)
         self.normalize = normalize
         if normalize:
-            # Normalize single state (input_dim is state + next_state)
-            self.obs_normalizer = EmpiricalNormalization(input_dim // 2)
+            # Match the AMP running normalizer: normalize a single state and
+            # clip extreme normalized features before discriminator use.
+            self.obs_normalizer = EmpiricalNormalization(input_dim // 2, eps=1.0e-4)
+            self.normalization_clip = 10.0
         else:
             self.obs_normalizer = nn.Identity()
-
-        # Initialize output layer with small weights for stable training
-        nn.init.uniform_(self.output_layer.weight, -0.01, 0.01)
-        nn.init.uniform_(self.output_layer.bias, -0.01, 0.01)
+            self.normalization_clip = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through the discriminator.
@@ -69,6 +68,13 @@ class AMPDiscriminator(nn.Module):
         h = self.trunk(x)
         d = self.output_layer(h)
         return d
+
+    def normalize_observation(self, obs: torch.Tensor) -> torch.Tensor:
+        """Normalize and clip one AMP state with the shared running statistics."""
+        if not self.normalize:
+            return obs
+        normalized = self.obs_normalizer(obs)
+        return torch.clamp(normalized, -self.normalization_clip, self.normalization_clip)
 
     def compute_grad_pen(
         self, expert_state: torch.Tensor, expert_next_state: torch.Tensor, lambda_: float = 10.0
@@ -142,8 +148,8 @@ class AMPDiscriminator(nn.Module):
 
             # Normalize if enabled
             if self.normalize:
-                state = self.obs_normalizer(state)
-                next_state = self.obs_normalizer(next_state)
+                state = self.normalize_observation(state)
+                next_state = self.normalize_observation(next_state)
 
             # Compute discriminator output
             disc_input = torch.cat([state, next_state], dim=-1)

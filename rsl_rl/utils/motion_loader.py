@@ -56,12 +56,20 @@ class AMPLoader:
         all_body_names: Sequence[str] = (),
         preload_transitions: bool = True,
         num_preload_transitions: int = 100000,
+        motion_quat_convention: str = "xyzw",
+        expert_sampling_mode: str = "continuous",
     ) -> None:
         self.device = device
         self.time_between_frames = time_between_frames
         self.preload_transitions = preload_transitions
         self.num_preload_transitions = num_preload_transitions
         self.loader_type = self._normalize_loader_type(loader_type)
+        if expert_sampling_mode not in ("continuous", "adjacent"):
+            raise ValueError(
+                "[AMPLoader] expert_sampling_mode must be 'continuous' or 'adjacent', "
+                f"got {expert_sampling_mode!r}"
+            )
+        self.expert_sampling_mode = expert_sampling_mode
         self._amp_obs_dim = 0
 
         # Load trajectories from motion files
@@ -75,7 +83,14 @@ class AMPLoader:
         self.trajectory_num_frames = []
 
         if self.loader_type == self.BODY_KINEMATICS_LOADER_TYPE:
-            self._load_body_kinematics_npz(motion_files, body_names, anchor_name, motion_body_names, all_body_names)
+            self._load_body_kinematics_npz(
+                motion_files,
+                body_names,
+                anchor_name,
+                motion_body_names,
+                all_body_names,
+                motion_quat_convention,
+            )
         else:
             self._load_joint_ee_json(motion_files)
 
@@ -169,6 +184,7 @@ class AMPLoader:
         anchor_name: str,
         motion_body_names: Sequence[str],
         all_body_names: Sequence[str],
+        motion_quat_convention: str,
     ) -> None:
         if not body_names:
             raise ValueError("[AMPLoader] body_kinematics_npz requires non-empty body_names")
@@ -213,6 +229,13 @@ class AMPLoader:
 
             body_pos_w = torch.tensor(data["body_pos_w"], dtype=torch.float32, device=self.device)
             body_quat_w = torch.tensor(data["body_quat_w"], dtype=torch.float32, device=self.device)
+            if motion_quat_convention == "wxyz":
+                body_quat_w = math_utils.convert_quat(body_quat_w, to="xyzw")
+            elif motion_quat_convention != "xyzw":
+                raise ValueError(
+                    "[AMPLoader] motion_quat_convention must be 'xyzw' or 'wxyz', "
+                    f"got {motion_quat_convention!r}"
+                )
             body_lin_vel_w = torch.tensor(data["body_lin_vel_w"], dtype=torch.float32, device=self.device)
             body_ang_vel_w = torch.tensor(data["body_ang_vel_w"], dtype=torch.float32, device=self.device)
 
@@ -277,12 +300,39 @@ class AMPLoader:
     def _preload_transitions(self) -> None:
         """Preload transitions into memory for faster sampling."""
         traj_idxs = self.weighted_traj_idx_sample_batch(self.num_preload_transitions)
-        times = self.traj_time_sample_batch(traj_idxs)
+        if self.expert_sampling_mode == "adjacent":
+            self.preloaded_s, self.preloaded_s_next = self.get_adjacent_frame_batch(traj_idxs)
+        else:
+            times = self.traj_time_sample_batch(traj_idxs)
+            self.preloaded_s = self.get_full_frame_at_time_batch(traj_idxs, times)
+            self.preloaded_s_next = self.get_full_frame_at_time_batch(
+                traj_idxs, times + self.time_between_frames
+            )
 
-        self.preloaded_s = self.get_full_frame_at_time_batch(traj_idxs, times)
-        self.preloaded_s_next = self.get_full_frame_at_time_batch(
-            traj_idxs, times + self.time_between_frames
-        )
+    def get_adjacent_frame_batch(self, traj_idxs: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample exact ``frame[i] -> frame[i + 1]`` transitions from each selected trajectory."""
+        traj_idxs = np.asarray(traj_idxs, dtype=np.int64)
+        frame_idxs = np.zeros(len(traj_idxs), dtype=np.int64)
+
+        for traj_idx in np.unique(traj_idxs):
+            traj_mask = traj_idxs == traj_idx
+            num_frames = int(self.trajectory_num_frames[traj_idx])
+            if num_frames > 1:
+                # The exclusive upper bound keeps frame + 1 inside the trajectory
+                # and avoids introducing a duplicated final-frame transition.
+                frame_idxs[traj_mask] = np.random.randint(0, num_frames - 1, size=int(traj_mask.sum()))
+
+        states = torch.zeros(len(traj_idxs), self.amp_obs_dim, device=self.device)
+        next_states = torch.zeros_like(states)
+        for traj_idx in np.unique(traj_idxs):
+            traj_mask = traj_idxs == traj_idx
+            trajectory = self.trajectories_full[int(traj_idx)]
+            current_idxs = frame_idxs[traj_mask]
+            next_idxs = np.minimum(current_idxs + 1, trajectory.shape[0] - 1)
+            states[traj_mask] = trajectory[current_idxs]
+            next_states[traj_mask] = trajectory[next_idxs]
+
+        return states, next_states
 
     def weighted_traj_idx_sample(self) -> int:
         """Sample a trajectory index based on weights."""
@@ -382,9 +432,12 @@ class AMPLoader:
                 s_next = self.preloaded_s_next[idxs]
             else:
                 traj_idxs = self.weighted_traj_idx_sample_batch(mini_batch_size)
-                times = self.traj_time_sample_batch(traj_idxs)
-                s = self.get_full_frame_at_time_batch(traj_idxs, times)
-                s_next = self.get_full_frame_at_time_batch(traj_idxs, times + self.time_between_frames)
+                if self.expert_sampling_mode == "adjacent":
+                    s, s_next = self.get_adjacent_frame_batch(traj_idxs)
+                else:
+                    times = self.traj_time_sample_batch(traj_idxs)
+                    s = self.get_full_frame_at_time_batch(traj_idxs, times)
+                    s_next = self.get_full_frame_at_time_batch(traj_idxs, times + self.time_between_frames)
 
             yield s, s_next
 
