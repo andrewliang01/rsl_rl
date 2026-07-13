@@ -64,6 +64,9 @@ class AMPPPO(MultiPPO):
             all_body_names=amp_cfg.get("all_body_names", ()),
             motion_quat_convention=amp_cfg.get("motion_quat_convention", "xyzw"),
             expert_sampling_mode=amp_cfg.get("expert_sampling_mode", "continuous"),
+            expert_trajectory_sampling_mode=amp_cfg.get(
+                "expert_trajectory_sampling_mode", "weighted_random"
+            ),
             preload_transitions=amp_cfg.get("preload_transitions", True),
             num_preload_transitions=amp_cfg.get("num_preload_transitions", 100000),
         )

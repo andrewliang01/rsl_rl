@@ -58,6 +58,7 @@ class AMPLoader:
         num_preload_transitions: int = 100000,
         motion_quat_convention: str = "xyzw",
         expert_sampling_mode: str = "continuous",
+        expert_trajectory_sampling_mode: str = "weighted_random",
     ) -> None:
         self.device = device
         self.time_between_frames = time_between_frames
@@ -70,6 +71,17 @@ class AMPLoader:
                 f"got {expert_sampling_mode!r}"
             )
         self.expert_sampling_mode = expert_sampling_mode
+        if expert_trajectory_sampling_mode not in ("weighted_random", "round_robin"):
+            raise ValueError(
+                "[AMPLoader] expert_trajectory_sampling_mode must be 'weighted_random' or "
+                f"'round_robin', got {expert_trajectory_sampling_mode!r}"
+            )
+        if expert_trajectory_sampling_mode == "round_robin" and preload_transitions:
+            raise ValueError(
+                "[AMPLoader] round_robin trajectory sampling requires preload_transitions=False "
+                "so each minibatch can be sampled from one selected motion clip."
+            )
+        self.expert_trajectory_sampling_mode = expert_trajectory_sampling_mode
         self._amp_obs_dim = 0
 
         # Load trajectories from motion files
@@ -425,13 +437,19 @@ class AMPLoader:
         Yields:
             Tuple of (state, next_state) tensors.
         """
-        for _ in range(num_mini_batch):
+        for batch_idx in range(num_mini_batch):
             if self.preload_transitions:
                 idxs = np.random.choice(self.preloaded_s.shape[0], size=mini_batch_size)
                 s = self.preloaded_s[idxs]
                 s_next = self.preloaded_s_next[idxs]
             else:
-                traj_idxs = self.weighted_traj_idx_sample_batch(mini_batch_size)
+                if self.expert_trajectory_sampling_mode == "round_robin":
+                    # Match AMP_mjlab: each discriminator expert minibatch comes
+                    # from one clip, and clips are traversed deterministically.
+                    traj_idx = self.trajectory_idxs[batch_idx % len(self.trajectory_idxs)]
+                    traj_idxs = np.full(mini_batch_size, traj_idx, dtype=np.int64)
+                else:
+                    traj_idxs = self.weighted_traj_idx_sample_batch(mini_batch_size)
                 if self.expert_sampling_mode == "adjacent":
                     s, s_next = self.get_adjacent_frame_batch(traj_idxs)
                 else:

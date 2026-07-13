@@ -42,7 +42,16 @@ class AMPDiscriminator(nn.Module):
         self.task_reward_lerp = task_reward_lerp
 
         # Build discriminator network: MLP trunk + output layer
-        self.trunk = MLP(input_dim, hidden_dims[-1], hidden_dims[:-1], activation)
+        # ``hidden_dims`` describes discriminator hidden layers, so every one of
+        # them is followed by the configured activation.  MLP treats its
+        # ``output_dim`` as linear unless ``last_activation`` is specified.
+        self.trunk = MLP(
+            input_dim,
+            hidden_dims[-1],
+            hidden_dims[:-1],
+            activation,
+            last_activation=activation,
+        )
         self.output_layer = nn.Linear(hidden_dims[-1], 1)
 
         # Observation normalizer (optional)
