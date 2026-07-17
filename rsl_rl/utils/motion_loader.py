@@ -226,7 +226,7 @@ class AMPLoader:
         num_bodies = len(body_indexes)
         self._amp_obs_dim = num_bodies * (3 + 6 + 3 + 3)
 
-        for i, motion_file in enumerate(self._expand_motion_files(motion_files, (".npz",))):
+        for motion_file in self._expand_motion_files(motion_files, (".npz",)):
             data = np.load(motion_file)
             required_keys = (
                 "fps",
@@ -291,23 +291,62 @@ class AMPLoader:
                 dim=-1,
             )
 
-            self.trajectory_names.append(os.path.splitext(motion_file)[0])
-            self.trajectories.append(trajectory)
-            self.trajectories_full.append(trajectory)
-            self.trajectory_idxs.append(i)
-            self.trajectory_weights.append(1.0)
+            default_fps = float(np.asarray(data["fps"]).reshape(-1)[0])
+            if "clip_lengths" in data.files:
+                clip_lengths = np.asarray(data["clip_lengths"], dtype=np.int64).reshape(-1)
+                if clip_lengths.size == 0 or np.any(clip_lengths <= 0):
+                    raise ValueError(f"[AMPLoader] {motion_file} has invalid clip_lengths: {clip_lengths}")
+                if int(clip_lengths.sum()) != int(trajectory.shape[0]):
+                    raise ValueError(
+                        f"[AMPLoader] {motion_file} clip_lengths sum to {clip_lengths.sum()}, "
+                        f"but the concatenated arrays contain {trajectory.shape[0]} frames"
+                    )
+                clip_fps = (
+                    np.asarray(data["clip_fps"], dtype=np.float64).reshape(-1)
+                    if "clip_fps" in data.files
+                    else np.full(clip_lengths.shape, default_fps, dtype=np.float64)
+                )
+                clip_names = (
+                    np.asarray(data["clip_names"]).astype(str).reshape(-1)
+                    if "clip_names" in data.files
+                    else np.asarray([f"clip_{clip_idx:04d}" for clip_idx in range(len(clip_lengths))])
+                )
+                if len(clip_fps) != len(clip_lengths) or len(clip_names) != len(clip_lengths):
+                    raise ValueError(
+                        f"[AMPLoader] {motion_file} clip metadata lengths do not match: "
+                        f"lengths={len(clip_lengths)}, fps={len(clip_fps)}, names={len(clip_names)}"
+                    )
+            else:
+                clip_lengths = np.asarray([trajectory.shape[0]], dtype=np.int64)
+                clip_fps = np.asarray([default_fps], dtype=np.float64)
+                clip_names = np.asarray([os.path.basename(os.path.splitext(motion_file)[0])])
 
-            fps = float(np.asarray(data["fps"]).reshape(-1)[0])
-            frame_duration = 1.0 / fps
-            self.trajectory_frame_durations.append(frame_duration)
-            traj_len = max(0.0, (trajectory.shape[0] - 1) * frame_duration)
-            self.trajectory_lens.append(traj_len)
-            self.trajectory_num_frames.append(float(trajectory.shape[0]))
+            frame_start = 0
+            for clip_name, clip_length, fps in zip(clip_names, clip_lengths, clip_fps):
+                clip_name = str(clip_name)
+                frame_end = frame_start + int(clip_length)
+                clip_trajectory = trajectory[frame_start:frame_end]
+                trajectory_name = os.path.splitext(motion_file)[0]
+                if len(clip_lengths) > 1:
+                    trajectory_name = f"{trajectory_name}::{clip_name}"
 
-            print(
-                f"[AMPLoader] Loaded {traj_len:.2f}s {self.loader_type} motion "
-                f"from {motion_file} with amp_obs_dim={self._amp_obs_dim}"
-            )
+                self.trajectory_names.append(trajectory_name)
+                self.trajectories.append(clip_trajectory)
+                self.trajectories_full.append(clip_trajectory)
+                self.trajectory_idxs.append(len(self.trajectory_idxs))
+                self.trajectory_weights.append(1.0)
+
+                frame_duration = 1.0 / float(fps)
+                self.trajectory_frame_durations.append(frame_duration)
+                traj_len = max(0.0, (clip_trajectory.shape[0] - 1) * frame_duration)
+                self.trajectory_lens.append(traj_len)
+                self.trajectory_num_frames.append(float(clip_trajectory.shape[0]))
+
+                print(
+                    f"[AMPLoader] Loaded {traj_len:.2f}s {self.loader_type} motion "
+                    f"{clip_name!r} from {motion_file} with amp_obs_dim={self._amp_obs_dim}"
+                )
+                frame_start = frame_end
 
     def _preload_transitions(self) -> None:
         """Preload transitions into memory for faster sampling."""
