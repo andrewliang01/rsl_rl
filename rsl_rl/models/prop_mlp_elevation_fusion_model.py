@@ -12,6 +12,7 @@ import torch.nn as nn
 from tensordict import TensorDict
 
 from rsl_rl.modules import MLP, EmpiricalNormalization, HiddenState
+from rsl_rl.modules.ame2_encoder import AME2Encoder
 from rsl_rl.modules.distribution import Distribution
 from rsl_rl.modules.elevation_2D_cnn_encoder import Elevation2DCNNEncoder
 from rsl_rl.utils import resolve_callable, unpad_trajectories
@@ -38,6 +39,7 @@ class PropMLPElevationFusionModel(nn.Module):
         "depthcamera": 1,
         "inverse_depth": 2,
     }
+    _ELEVATION_ENCODER_TYPES = {"cnn", "ame2"}
 
     def __init__(
         self,
@@ -64,6 +66,12 @@ class PropMLPElevationFusionModel(nn.Module):
         prop_feature_dim: int = 64,
         prop_hidden_dims: tuple[int, ...] | list[int] = (128,),
         use_prop_encoder: bool = True,
+        elevation_encoder_type: str = "cnn",
+        ame2_history_index: int = -1,
+        ame2_local_channels: tuple[int, ...] | list[int] = (8, 16),
+        ame2_point_feature_dim: int = 64,
+        ame2_attention_dim: int = 64,
+        ame2_height_scale: float = 0.6,
     ) -> None:
         """Initialize the proprio-elevation fusion model.
 
@@ -92,11 +100,23 @@ class PropMLPElevationFusionModel(nn.Module):
             prop_feature_dim: Output feature dimension of the proprio MLP encoder.
             prop_hidden_dims: Hidden dimensions of the proprio MLP encoder.
             use_prop_encoder: Whether to pass proprioception through the encoder before fusion.
+            elevation_encoder_type: Elevation encoder implementation. ``"cnn"`` preserves the baseline.
+            ame2_history_index: History frame selected by the minimal AME2 encoder.
+            ame2_local_channels: Local CNN channels used by the minimal AME2 encoder.
+            ame2_point_feature_dim: Point-wise local feature dimension.
+            ame2_attention_dim: Query/key/value dimension for single-head attention.
+            ame2_height_scale: Scale applied after spatial mean centering the selected height map.
         """
         super().__init__()
 
         self.obs_set = obs_set
         self.elevation_set = elevation_set
+        self.elevation_encoder_type = elevation_encoder_type.lower()
+        if self.elevation_encoder_type not in self._ELEVATION_ENCODER_TYPES:
+            raise ValueError(
+                f"Unsupported elevation_encoder_type '{elevation_encoder_type}'. "
+                f"Expected one of {tuple(sorted(self._ELEVATION_ENCODER_TYPES))}."
+            )
         self.cnn_observation_type = cnn_observation_type.lower()
         if self.cnn_observation_type not in self._CNN_OBSERVATION_MODES:
             raise ValueError(
@@ -150,15 +170,44 @@ class PropMLPElevationFusionModel(nn.Module):
             self.prop_mlp = nn.Identity()
             fusion_prop_dim = self.obs_dim
 
-        # Elevation encoder.
-        self.elevation_encoder = Elevation2DCNNEncoder(
-            in_channels=elevation_history_length,
-            hidden_dims=list(cnn_hidden_dims),
-            kernel_sizes=list(cnn_kernel_sizes),
-            strides=list(cnn_strides),
-            out_dim=vision_feature_dim,
-            vision_spatial_size=vision_spatial_size,
-        )
+        # Elevation encoder. Keep the default CNN construction byte-for-byte compatible with existing checkpoints.
+        if self.elevation_encoder_type == "cnn":
+            self.elevation_encoder = Elevation2DCNNEncoder(
+                in_channels=elevation_history_length,
+                hidden_dims=list(cnn_hidden_dims),
+                kernel_sizes=list(cnn_kernel_sizes),
+                strides=list(cnn_strides),
+                out_dim=vision_feature_dim,
+                vision_spatial_size=vision_spatial_size,
+            )
+        else:
+            if self.cnn_observation_type != "elevationmap":
+                raise ValueError(
+                    "The minimal AME2 encoder only supports cnn_observation_type='elevationmap', "
+                    f"got '{cnn_observation_type}'."
+                )
+            elevation_shape = obs[elevation_set].shape
+            if elevation_shape[1] != elevation_history_length:
+                raise ValueError(
+                    "AME2 elevation history mismatch: "
+                    f"observation has {elevation_shape[1]} frames, config expects {elevation_history_length}."
+                )
+            if tuple(elevation_shape[-2:]) != self.vision_spatial_size:
+                raise ValueError(
+                    "AME2 elevation spatial shape mismatch: "
+                    f"observation has {tuple(elevation_shape[-2:])}, config expects {self.vision_spatial_size}."
+                )
+            self.elevation_encoder = AME2Encoder(
+                history_length=elevation_history_length,
+                history_index=ame2_history_index,
+                vision_spatial_size=vision_spatial_size,
+                proprio_feature_dim=fusion_prop_dim,
+                local_channels=ame2_local_channels,
+                point_feature_dim=ame2_point_feature_dim,
+                attention_dim=ame2_attention_dim,
+                output_dim=vision_feature_dim,
+                height_scale=ame2_height_scale,
+            )
 
         # Fusion head.
         self.mlp = MLP(fusion_prop_dim + vision_feature_dim, fusion_output_dim, hidden_dims, activation)
@@ -194,8 +243,11 @@ class PropMLPElevationFusionModel(nn.Module):
         proprio_features = self.prop_mlp(proprio_obs)
 
         elevation_obs = obs[self.elevation_set]
-        elevation_obs = self._normalize_cnn_observation(elevation_obs)
-        elevation_features = self.elevation_encoder(elevation_obs)
+        if self.elevation_encoder_type == "cnn":
+            elevation_obs = self._normalize_cnn_observation(elevation_obs)
+            elevation_features = self.elevation_encoder(elevation_obs)
+        else:
+            elevation_features = self.elevation_encoder(elevation_obs, proprio_features)
 
         return torch.cat((proprio_features, elevation_features), dim=-1)
 
@@ -243,10 +295,14 @@ class PropMLPElevationFusionModel(nn.Module):
 
     def as_jit(self) -> nn.Module:
         """Return a version of the model compatible with Torch JIT export."""
+        if self.elevation_encoder_type != "cnn":
+            raise NotImplementedError("AME2 Torch JIT export is deferred to Phase 2.")
         return _TorchPropMLPElevationFusionModel(self)
 
     def as_onnx(self, verbose: bool, input_mode: str = "split") -> nn.Module:
         """Return a version of the model compatible with ONNX export."""
+        if self.elevation_encoder_type != "cnn":
+            raise NotImplementedError("AME2 ONNX export is deferred to Phase 2.")
         return _OnnxPropMLPElevationFusionModel(self, verbose, input_mode)
 
     def update_normalization(self, obs: TensorDict) -> None:
