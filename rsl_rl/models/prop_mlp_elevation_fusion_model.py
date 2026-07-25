@@ -67,10 +67,15 @@ class PropMLPElevationFusionModel(nn.Module):
         prop_hidden_dims: tuple[int, ...] | list[int] = (128,),
         use_prop_encoder: bool = True,
         elevation_encoder_type: str = "cnn",
+        ame2_map_extent: tuple[float, float] = (1.35, 0.95),
         ame2_history_index: int = -1,
+        ame2_token_spatial_size: tuple[int, int] = (7, 5),
         ame2_local_channels: tuple[int, ...] | list[int] = (8, 16),
+        ame2_position_feature_dim: int = 16,
         ame2_point_feature_dim: int = 64,
-        ame2_attention_dim: int = 64,
+        ame2_global_feature_dim: int = 32,
+        ame2_attention_dim: int = 32,
+        ame2_num_heads: int = 4,
         ame2_height_scale: float = 0.6,
     ) -> None:
         """Initialize the proprio-elevation fusion model.
@@ -101,10 +106,15 @@ class PropMLPElevationFusionModel(nn.Module):
             prop_hidden_dims: Hidden dimensions of the proprio MLP encoder.
             use_prop_encoder: Whether to pass proprioception through the encoder before fusion.
             elevation_encoder_type: Elevation encoder implementation. ``"cnn"`` preserves the baseline.
-            ame2_history_index: History frame selected by the minimal AME2 encoder.
-            ame2_local_channels: Local CNN channels used by the minimal AME2 encoder.
+            ame2_map_extent: Metric ``(x, y)`` extent of the AME2 elevation map.
+            ame2_history_index: History frame selected by the AME2 encoder.
+            ame2_token_spatial_size: Spatial size of the AME2 local-token grid.
+            ame2_local_channels: Local CNN channels used by the AME2 encoder.
+            ame2_position_feature_dim: Dimension of pooled xyz positional features.
             ame2_point_feature_dim: Point-wise local feature dimension.
-            ame2_attention_dim: Query/key/value dimension for single-head attention.
+            ame2_global_feature_dim: Dimension of the pooled global map feature.
+            ame2_attention_dim: Query/key/value dimension for multi-head attention.
+            ame2_num_heads: Number of AME2 attention heads.
             ame2_height_scale: Scale applied after spatial mean centering the selected height map.
         """
         super().__init__()
@@ -183,7 +193,7 @@ class PropMLPElevationFusionModel(nn.Module):
         else:
             if self.cnn_observation_type != "elevationmap":
                 raise ValueError(
-                    "The minimal AME2 encoder only supports cnn_observation_type='elevationmap', "
+                    "The AME2 encoder only supports cnn_observation_type='elevationmap', "
                     f"got '{cnn_observation_type}'."
                 )
             elevation_shape = obs[elevation_set].shape
@@ -201,12 +211,17 @@ class PropMLPElevationFusionModel(nn.Module):
                 history_length=elevation_history_length,
                 history_index=ame2_history_index,
                 vision_spatial_size=vision_spatial_size,
+                token_spatial_size=ame2_token_spatial_size,
                 proprio_feature_dim=fusion_prop_dim,
+                map_extent=ame2_map_extent,
                 local_channels=ame2_local_channels,
+                position_feature_dim=ame2_position_feature_dim,
                 point_feature_dim=ame2_point_feature_dim,
+                global_feature_dim=ame2_global_feature_dim,
                 attention_dim=ame2_attention_dim,
                 output_dim=vision_feature_dim,
                 height_scale=ame2_height_scale,
+                num_heads=ame2_num_heads,
             )
 
         # Fusion head.
@@ -295,14 +310,14 @@ class PropMLPElevationFusionModel(nn.Module):
 
     def as_jit(self) -> nn.Module:
         """Return a version of the model compatible with Torch JIT export."""
-        if self.elevation_encoder_type != "cnn":
-            raise NotImplementedError("AME2 Torch JIT export is deferred to Phase 2.")
+        if self.elevation_encoder_type == "ame2":
+            return _TorchAME2PropMLPElevationFusionModel(self)
         return _TorchPropMLPElevationFusionModel(self)
 
     def as_onnx(self, verbose: bool, input_mode: str = "split") -> nn.Module:
         """Return a version of the model compatible with ONNX export."""
-        if self.elevation_encoder_type != "cnn":
-            raise NotImplementedError("AME2 ONNX export is deferred to Phase 2.")
+        if self.elevation_encoder_type == "ame2":
+            return _OnnxAME2PropMLPElevationFusionModel(self, verbose, input_mode)
         return _OnnxPropMLPElevationFusionModel(self, verbose, input_mode)
 
     def update_normalization(self, obs: TensorDict) -> None:
@@ -412,6 +427,37 @@ class _TorchPropMLPElevationFusionModel(nn.Module):
         pass
 
 
+class _TorchAME2PropMLPElevationFusionModel(nn.Module):
+    """Exportable AME2 actor for Torch JIT.
+
+    Unlike the CNN wrapper, raw elevation history is passed directly to the
+    AME2 encoder together with the encoded proprioception features.
+    """
+
+    def __init__(self, model: PropMLPElevationFusionModel) -> None:
+        super().__init__()
+        self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
+        self.prop_mlp = copy.deepcopy(model.prop_mlp)
+        self.elevation_encoder = copy.deepcopy(model.elevation_encoder)
+        self.mlp = copy.deepcopy(model.mlp)
+        if model.distribution is not None:
+            self.deterministic_output = model.distribution.as_deterministic_output_module()
+        else:
+            self.deterministic_output = nn.Identity()
+
+    def forward(self, proprio_obs: torch.Tensor, elevation_obs: torch.Tensor) -> torch.Tensor:
+        proprio_obs = self.obs_normalizer(proprio_obs)
+        proprio_features = self.prop_mlp(proprio_obs)
+        elevation_features = self.elevation_encoder(elevation_obs, proprio_features)
+        fused_features = torch.cat((proprio_features, elevation_features), dim=-1)
+        out = self.mlp(fused_features)
+        return self.deterministic_output(out)
+
+    @torch.jit.export
+    def reset(self) -> None:
+        pass
+
+
 class _OnnxPropMLPElevationFusionModel(nn.Module):
     """Exportable fusion model for ONNX."""
 
@@ -443,13 +489,27 @@ class _OnnxPropMLPElevationFusionModel(nn.Module):
     def forward(self, proprio_obs: torch.Tensor, elevation_obs: torch.Tensor | None = None) -> torch.Tensor:
         if self.input_mode == "single":
             obs = proprio_obs
-            batch_size = obs.shape[0]
             elevation_size = self.elevation_history_length * self.vision_spatial_size[0] * self.vision_spatial_size[1]
             proprio_obs = obs[:, :self.proprio_input_size]
             elevation_obs = obs[:, self.proprio_input_size:self.proprio_input_size + elevation_size]
-            elevation_obs = elevation_obs.reshape(
-                batch_size, self.elevation_history_length, self.vision_spatial_size[0], self.vision_spatial_size[1]
-            )
+            if torch.compiler.is_compiling():
+                # The Dynamo ONNX exporter preserves the symbolic batch through unflatten.
+                elevation_obs = elevation_obs.unflatten(
+                    1,
+                    (
+                        self.elevation_history_length,
+                        self.vision_spatial_size[0],
+                        self.vision_spatial_size[1],
+                    ),
+                )
+            else:
+                # Eager and legacy ONNX paths must infer, rather than capture, batch size.
+                elevation_obs = elevation_obs.reshape(
+                    -1,
+                    self.elevation_history_length,
+                    self.vision_spatial_size[0],
+                    self.vision_spatial_size[1],
+                )
         elif elevation_obs is None:
             raise ValueError("elevation_obs is required when ONNX input_mode='split'")
 
@@ -483,6 +543,93 @@ class _OnnxPropMLPElevationFusionModel(nn.Module):
         return cnn_observation * 2.0 - 1.0
 
     def get_dummy_inputs(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.input_mode == "single":
+            elevation_size = self.elevation_history_length * self.vision_spatial_size[0] * self.vision_spatial_size[1]
+            return (torch.zeros(1, self.proprio_input_size + elevation_size),)
+        return (
+            torch.zeros(1, self.proprio_input_size),
+            torch.zeros(1, self.elevation_history_length, *self.vision_spatial_size),
+        )
+
+    @property
+    def input_names(self) -> list[str]:
+        if self.input_mode == "single":
+            return ["obs"]
+        return ["proprio_obs", "elevation_obs"]
+
+    @property
+    def output_names(self) -> list[str]:
+        return ["actions"]
+
+    @property
+    def dynamic_axes(self) -> dict[str, dict[int, str]]:
+        if self.input_mode == "single":
+            return {"obs": {0: "batch_size"}, "actions": {0: "batch_size"}}
+        return {
+            "proprio_obs": {0: "batch_size"},
+            "elevation_obs": {0: "batch_size"},
+            "actions": {0: "batch_size"},
+        }
+
+
+class _OnnxAME2PropMLPElevationFusionModel(nn.Module):
+    """Exportable AME2 actor for split-input and flat single-input ONNX."""
+
+    is_recurrent: bool = False
+
+    def __init__(self, model: PropMLPElevationFusionModel, verbose: bool, input_mode: str = "split") -> None:
+        super().__init__()
+        if input_mode not in ("split", "single"):
+            raise ValueError(f"Unsupported ONNX input mode: {input_mode}")
+        self.verbose = verbose
+        self.input_mode = input_mode
+        self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
+        self.prop_mlp = copy.deepcopy(model.prop_mlp)
+        self.elevation_encoder = copy.deepcopy(model.elevation_encoder)
+        self.mlp = copy.deepcopy(model.mlp)
+        if model.distribution is not None:
+            self.deterministic_output = model.distribution.as_deterministic_output_module()
+        else:
+            self.deterministic_output = nn.Identity()
+        self.proprio_input_size = model.obs_dim
+        self.elevation_history_length = model.elevation_history_length
+        self.vision_spatial_size = model.vision_spatial_size
+
+    def forward(self, proprio_obs: torch.Tensor, elevation_obs: torch.Tensor | None = None) -> torch.Tensor:
+        if self.input_mode == "single":
+            obs = proprio_obs
+            elevation_size = self.elevation_history_length * self.vision_spatial_size[0] * self.vision_spatial_size[1]
+            proprio_obs = obs[:, :self.proprio_input_size]
+            elevation_obs = obs[:, self.proprio_input_size:self.proprio_input_size + elevation_size]
+            if torch.compiler.is_compiling():
+                # The Dynamo ONNX exporter preserves the symbolic batch through unflatten.
+                elevation_obs = elevation_obs.unflatten(
+                    1,
+                    (
+                        self.elevation_history_length,
+                        self.vision_spatial_size[0],
+                        self.vision_spatial_size[1],
+                    ),
+                )
+            else:
+                # Eager and legacy ONNX paths must infer, rather than capture, batch size.
+                elevation_obs = elevation_obs.reshape(
+                    -1,
+                    self.elevation_history_length,
+                    self.vision_spatial_size[0],
+                    self.vision_spatial_size[1],
+                )
+        elif elevation_obs is None:
+            raise ValueError("elevation_obs is required when ONNX input_mode='split'")
+
+        proprio_obs = self.obs_normalizer(proprio_obs)
+        proprio_features = self.prop_mlp(proprio_obs)
+        elevation_features = self.elevation_encoder(elevation_obs, proprio_features)
+        fused_features = torch.cat((proprio_features, elevation_features), dim=-1)
+        out = self.mlp(fused_features)
+        return self.deterministic_output(out)
+
+    def get_dummy_inputs(self) -> tuple[torch.Tensor, ...]:
         if self.input_mode == "single":
             elevation_size = self.elevation_history_length * self.vision_spatial_size[0] * self.vision_spatial_size[1]
             return (torch.zeros(1, self.proprio_input_size + elevation_size),)
