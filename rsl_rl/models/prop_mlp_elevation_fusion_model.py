@@ -63,6 +63,7 @@ class PropMLPElevationFusionModel(nn.Module):
         cnn_hidden_dims: tuple[int, ...] | list[int] = (16, 32, 64),
         cnn_kernel_sizes: tuple[int, ...] | list[int] = (3, 3, 3),
         cnn_strides: tuple[int, ...] | list[int] = (2, 2, 2),
+        cnn_history_index: int | None = None,
         prop_feature_dim: int = 64,
         prop_hidden_dims: tuple[int, ...] | list[int] = (128,),
         use_prop_encoder: bool = True,
@@ -102,6 +103,8 @@ class PropMLPElevationFusionModel(nn.Module):
             cnn_hidden_dims: Hidden channels of the elevation CNN.
             cnn_kernel_sizes: Kernel sizes of the elevation CNN.
             cnn_strides: Strides of the elevation CNN.
+            cnn_history_index: Optional history frame used by the CNN. ``None`` preserves
+                the baseline multi-frame input; an integer selects exactly one frame.
             prop_feature_dim: Output feature dimension of the proprio MLP encoder.
             prop_hidden_dims: Hidden dimensions of the proprio MLP encoder.
             use_prop_encoder: Whether to pass proprioception through the encoder before fusion.
@@ -152,6 +155,26 @@ class PropMLPElevationFusionModel(nn.Module):
         self.prop_feature_dim = prop_feature_dim
         self.elevation_history_length = elevation_history_length
         self.use_prop_encoder = use_prop_encoder
+        self._cnn_use_single_frame = cnn_history_index is not None
+        self._cnn_history_index = 0
+        if self._cnn_use_single_frame:
+            if self.elevation_encoder_type != "cnn":
+                raise ValueError("cnn_history_index is only supported by the CNN elevation encoder.")
+            resolved_history_index = int(cnn_history_index)  # type: ignore[arg-type]
+            if resolved_history_index < 0:
+                resolved_history_index += elevation_history_length
+            if resolved_history_index < 0 or resolved_history_index >= elevation_history_length:
+                raise ValueError(
+                    "cnn_history_index is out of range for elevation history: "
+                    f"got {cnn_history_index}, history length {elevation_history_length}."
+                )
+            elevation_shape = obs[elevation_set].shape
+            if elevation_shape[1] != elevation_history_length:
+                raise ValueError(
+                    "CNN elevation history mismatch: "
+                    f"observation has {elevation_shape[1]} frames, config expects {elevation_history_length}."
+                )
+            self._cnn_history_index = resolved_history_index
 
         # Resolve proprio observation groups and dimension.
         self.obs_groups, self.obs_dim = self._get_prop_obs_dim(obs, obs_groups, obs_set, self.elevation_set)
@@ -183,7 +206,7 @@ class PropMLPElevationFusionModel(nn.Module):
         # Elevation encoder. Keep the default CNN construction byte-for-byte compatible with existing checkpoints.
         if self.elevation_encoder_type == "cnn":
             self.elevation_encoder = Elevation2DCNNEncoder(
-                in_channels=elevation_history_length,
+                in_channels=1 if self._cnn_use_single_frame else elevation_history_length,
                 hidden_dims=list(cnn_hidden_dims),
                 kernel_sizes=list(cnn_kernel_sizes),
                 strides=list(cnn_strides),
@@ -259,6 +282,8 @@ class PropMLPElevationFusionModel(nn.Module):
 
         elevation_obs = obs[self.elevation_set]
         if self.elevation_encoder_type == "cnn":
+            if self._cnn_use_single_frame:
+                elevation_obs = elevation_obs[:, self._cnn_history_index : self._cnn_history_index + 1]
             elevation_obs = self._normalize_cnn_observation(elevation_obs)
             elevation_features = self.elevation_encoder(elevation_obs)
         else:
@@ -387,6 +412,8 @@ class _TorchPropMLPElevationFusionModel(nn.Module):
         self.depth_camera_far = model.depth_camera_far
         self.vision_range_scale = model.vision_range_scale
         self.vision_range_max = model.vision_range_max
+        self.use_single_frame = model._cnn_use_single_frame
+        self.history_index = model._cnn_history_index
         if model.distribution is not None:
             self.deterministic_output = model.distribution.as_deterministic_output_module()
         else:
@@ -395,6 +422,8 @@ class _TorchPropMLPElevationFusionModel(nn.Module):
     def forward(self, proprio_obs: torch.Tensor, elevation_obs: torch.Tensor) -> torch.Tensor:
         proprio_obs = self.obs_normalizer(proprio_obs)
         proprio_features = self.prop_mlp(proprio_obs)
+        if self.use_single_frame:
+            elevation_obs = elevation_obs[:, self.history_index : self.history_index + 1]
         elevation_obs = self._normalize_cnn_observation(elevation_obs)
         elevation_features = self.elevation_encoder(elevation_obs)
         fused_features = torch.cat((proprio_features, elevation_features), dim=-1)
@@ -485,6 +514,8 @@ class _OnnxPropMLPElevationFusionModel(nn.Module):
         self.proprio_input_size = model.obs_dim
         self.elevation_history_length = model.elevation_history_length
         self.vision_spatial_size = model.vision_spatial_size
+        self.use_single_frame = model._cnn_use_single_frame
+        self.history_index = model._cnn_history_index
 
     def forward(self, proprio_obs: torch.Tensor, elevation_obs: torch.Tensor | None = None) -> torch.Tensor:
         if self.input_mode == "single":
@@ -515,6 +546,8 @@ class _OnnxPropMLPElevationFusionModel(nn.Module):
 
         proprio_obs = self.obs_normalizer(proprio_obs)
         proprio_features = self.prop_mlp(proprio_obs)
+        if self.use_single_frame:
+            elevation_obs = elevation_obs[:, self.history_index : self.history_index + 1]
         elevation_obs = self._normalize_cnn_observation(elevation_obs)
         elevation_features = self.elevation_encoder(elevation_obs)
         fused_features = torch.cat((proprio_features, elevation_features), dim=-1)
