@@ -5,6 +5,9 @@
 
 from __future__ import annotations
 
+from typing import Any
+
+import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
@@ -28,6 +31,54 @@ def _make_ray_history(
     return torch.stack((metric_range, hit_mask), dim=2)
 
 
+def _make_ray_time_actor(
+    *,
+    history_length: int,
+    use_query_attention: bool,
+    batch_size: int = 3,
+) -> tuple[PropMLPElevationFusionModel, TensorDict]:
+    obs = TensorDict(
+        {
+            "policy": torch.randn(batch_size, 96),
+            "mid360_policy": _make_ray_history(
+                batch_size=batch_size,
+                history_length=history_length,
+            ).half(),
+        },
+        batch_size=[batch_size],
+    )
+    model = PropMLPElevationFusionModel(
+        obs=obs,
+        obs_groups={"actor": ["policy", "mid360_policy"]},
+        obs_set="actor",
+        output_dim=29,
+        hidden_dims=[128, 64],
+        activation="elu",
+        obs_normalization=True,
+        distribution_cfg={
+            "class_name": "GaussianDistribution",
+            "init_std": 1.0,
+            "std_type": "scalar",
+        },
+        elevation_encoder_type="ray_time",
+        ray_time_set="mid360_policy",
+        ray_time_history_length=history_length,
+        ray_time_spatial_size=(16, 96),
+        ray_time_use_query_attention=use_query_attention,
+        prop_feature_dim=64,
+        prop_hidden_dims=[128],
+        vision_feature_dim=64,
+    )
+    calibration_obs = TensorDict(
+        {"policy": 2.0 * torch.randn(11, 96) + 1.5},
+        batch_size=[11],
+    )
+    model.update_normalization(calibration_obs)
+    with torch.no_grad():
+        model.distribution.std_param.fill_(3.0)
+    return model.eval(), obs
+
+
 def test_forward_shapes_attention_normalization_and_fixed_encodings() -> None:
     torch.manual_seed(701)
     encoder = RayTimeAttentionEncoder().eval()
@@ -40,6 +91,7 @@ def test_forward_shapes_attention_normalization_and_fixed_encodings() -> None:
     )
 
     assert encoder.token_spatial_size == (4, 12)
+    assert encoder.hit_pool_kernel == (4, 8)
     assert encoder.num_spatial_tokens == 48
     assert encoder.num_tokens == 240
     assert output.shape == (3, 64)
@@ -56,6 +108,19 @@ def test_forward_shapes_attention_normalization_and_fixed_encodings() -> None:
     )
     assert "spherical_position_encoding" not in encoder.state_dict()
     assert "time_encoding" not in encoder.state_dict()
+    assert "hit_pool_kernel" not in encoder.state_dict()
+
+    flattened_hit = ray_history[:, :, 1].float().flatten(0, 1)
+    torch.testing.assert_close(
+        F.max_pool2d(
+            flattened_hit,
+            kernel_size=encoder.hit_pool_kernel,
+            stride=encoder.hit_pool_kernel,
+        ),
+        F.adaptive_max_pool2d(flattened_hit, encoder.token_spatial_size),
+        rtol=0.0,
+        atol=0.0,
+    )
 
 
 def test_backward_reaches_every_history_frame_and_attention_parameters() -> None:
@@ -329,7 +394,7 @@ def test_attention_and_global_ablation_have_matched_active_capacity_and_gradient
     assert abs(attention_active - global_active) / attention_active < 0.01
 
 
-def test_fusion_model_ray_time_aliases_actor_contract_and_export_error() -> None:
+def test_fusion_model_ray_time_aliases_actor_contract() -> None:
     torch.manual_seed(733)
     batch_size = 3
     obs = TensorDict(
@@ -370,10 +435,180 @@ def test_fusion_model_ray_time_aliases_actor_contract_and_export_error() -> None
     assert output.dtype == torch.float32
     assert torch.isfinite(output).all()
 
-    with pytest.raises(NotImplementedError, match="ray_time"):
-        model.as_jit()
-    with pytest.raises(NotImplementedError, match="ray_time"):
-        model.as_onnx(verbose=False)
+    assert model.as_jit() is not None
+    assert model.as_onnx(verbose=False, input_mode="split") is not None
+    assert model.as_onnx(verbose=False, input_mode="single") is not None
+
+
+@pytest.mark.parametrize("history_length", (1, 5))
+@pytest.mark.parametrize("use_query_attention", (False, True))
+def test_ray_time_jit_matches_eager_for_k1_k5_global_and_attention(
+    history_length: int,
+    use_query_attention: bool,
+) -> None:
+    torch.manual_seed(739 + history_length + int(use_query_attention))
+    model, obs = _make_ray_time_actor(
+        history_length=history_length,
+        use_query_attention=use_query_attention,
+    )
+    jit_wrapper = model.as_jit().eval()
+
+    assert int(jit_wrapper.obs_normalizer.count) == 11
+    torch.testing.assert_close(
+        jit_wrapper.obs_normalizer._mean,
+        model.obs_normalizer._mean,
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(
+        jit_wrapper.obs_normalizer._std,
+        model.obs_normalizer._std,
+        rtol=0.0,
+        atol=0.0,
+    )
+    assert not torch.equal(
+        model.obs_normalizer._mean,
+        torch.zeros_like(model.obs_normalizer._mean),
+    )
+
+    scripted_model = torch.jit.script(jit_wrapper)
+    with torch.inference_mode():
+        eager_output = model(obs, stochastic_output=False)
+        scripted_half_output = scripted_model(
+            obs["policy"],
+            obs["mid360_policy"],
+        )
+        scripted_float_output = scripted_model(
+            obs["policy"],
+            obs["mid360_policy"].float(),
+        )
+
+    assert obs["mid360_policy"].dtype == torch.float16
+    assert eager_output.dtype == torch.float32
+    torch.testing.assert_close(scripted_half_output, eager_output, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(scripted_float_output, eager_output, rtol=0.0, atol=0.0)
+    scripted_model.reset()
+
+
+@pytest.mark.parametrize("history_length", (1, 5))
+@pytest.mark.parametrize("use_query_attention", (False, True))
+@pytest.mark.parametrize("input_mode", ("split", "single"))
+def test_ray_time_onnx_dynamic_batch_three_matches_eager(
+    tmp_path: Any,
+    history_length: int,
+    use_query_attention: bool,
+    input_mode: str,
+) -> None:
+    onnx = pytest.importorskip("onnx")
+    torch.manual_seed(751 + history_length + int(use_query_attention))
+    model, obs = _make_ray_time_actor(
+        history_length=history_length,
+        use_query_attention=use_query_attention,
+    )
+    onnx_model = model.as_onnx(verbose=False, input_mode=input_mode).eval()
+    export_path = tmp_path / (
+        f"ray_time_k{history_length}_"
+        f"{'attention' if use_query_attention else 'global'}_{input_mode}.onnx"
+    )
+
+    dummy_inputs = onnx_model.get_dummy_inputs()
+    assert all(dummy.dtype == torch.float32 for dummy in dummy_inputs)
+    assert dummy_inputs[0].shape[0] == 1
+    if input_mode == "split":
+        assert dummy_inputs[0].shape == (1, 96)
+        assert dummy_inputs[1].shape == (1, history_length, 2, 16, 96)
+        runtime_inputs = (
+            obs["policy"],
+            obs["mid360_policy"].float(),
+        )
+    else:
+        assert dummy_inputs[0].shape == (
+            1,
+            96 + history_length * 2 * 16 * 96,
+        )
+        flat_obs = torch.cat(
+            (
+                obs["policy"],
+                obs["mid360_policy"].float().flatten(start_dim=1),
+            ),
+            dim=-1,
+        )
+        runtime_inputs = (flat_obs,)
+
+    with torch.inference_mode():
+        eager_output = model(obs, stochastic_output=False)
+        wrapper_output = onnx_model(*runtime_inputs)
+    torch.testing.assert_close(wrapper_output, eager_output, rtol=0.0, atol=0.0)
+
+    torch.onnx.export(
+        onnx_model,
+        dummy_inputs,
+        export_path,
+        export_params=True,
+        opset_version=18,
+        external_data=False,
+        verbose=False,
+        input_names=onnx_model.input_names,
+        output_names=onnx_model.output_names,
+        dynamic_axes=onnx_model.dynamic_axes,
+    )
+
+    graph = onnx.load(export_path)
+    onnx.checker.check_model(graph)
+    assert all(
+        graph_input.type.tensor_type.elem_type == onnx.TensorProto.FLOAT
+        for graph_input in graph.graph.input
+    )
+    assert all(
+        graph_input.type.tensor_type.shape.dim[0].dim_param
+        for graph_input in graph.graph.input
+    )
+
+    if input_mode == "split":
+        feeds = {
+            "proprio_obs": obs["policy"].detach().cpu().numpy(),
+            "ray_history": obs["mid360_policy"].float().detach().cpu().numpy(),
+        }
+    else:
+        feeds = {"obs": runtime_inputs[0].detach().cpu().numpy()}
+
+    try:
+        import onnxruntime
+    except ImportError:
+        from onnx.reference import ReferenceEvaluator
+
+        onnx_output = ReferenceEvaluator(graph).run(None, feeds)[0]
+    else:
+        session = onnxruntime.InferenceSession(
+            str(export_path),
+            providers=["CPUExecutionProvider"],
+        )
+        onnx_output = session.run(None, feeds)[0]
+
+    assert onnx_output.shape == (3, 29)
+    np.testing.assert_allclose(
+        onnx_output,
+        eager_output.detach().cpu().numpy(),
+        rtol=1.0e-4,
+        atol=1.0e-5,
+    )
+
+
+def test_ray_time_onnx_single_input_layout_is_strict() -> None:
+    model, _ = _make_ray_time_actor(
+        history_length=5,
+        use_query_attention=True,
+    )
+    onnx_model = model.as_onnx(verbose=False, input_mode="single").eval()
+    expected_size = 96 + 5 * 2 * 16 * 96
+
+    with pytest.raises(ValueError, match=r"layout.*proprio.*flatten"):
+        onnx_model(torch.zeros(3, expected_size + 1))
+    with pytest.raises(ValueError, match=r"layout.*proprio.*flatten"):
+        onnx_model(torch.zeros(3, expected_size - 1))
+
+    with pytest.raises(ValueError, match="Unsupported ONNX input mode"):
+        model.as_onnx(verbose=False, input_mode="combined")
 
 
 def test_fusion_model_accepts_single_packet_ray_time_history() -> None:

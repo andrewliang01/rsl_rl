@@ -175,6 +175,16 @@ class RayTimeAttentionEncoder(nn.Module):
         self.token_spatial_size = tuple(int(value) for value in encoded_dummy.shape[-2:])
         self.num_spatial_tokens = self.token_spatial_size[0] * self.token_spatial_size[1]
         self.num_tokens = self.history_length * self.num_spatial_tokens
+        if (
+            self.vision_spatial_size[0] % self.token_spatial_size[0] == 0
+            and self.vision_spatial_size[1] % self.token_spatial_size[1] == 0
+        ):
+            self.hit_pool_kernel = (
+                self.vision_spatial_size[0] // self.token_spatial_size[0],
+                self.vision_spatial_size[1] // self.token_spatial_size[1],
+            )
+        else:
+            self.hit_pool_kernel = (0, 0)
 
         self.spatial_projection = nn.Conv2d(channel_3, self.token_dim, kernel_size=1, bias=False)
         self.spatial_norm = nn.GroupNorm(_group_count(self.token_dim), self.token_dim)
@@ -296,10 +306,21 @@ class RayTimeAttentionEncoder(nn.Module):
         tokens = self.temporal_norm(tokens + temporal_update)
         tokens = tokens.flatten(start_dim=1, end_dim=2)
 
-        token_valid = F.adaptive_max_pool2d(
-            hit_mask.flatten(0, 1),
-            self.token_spatial_size,
-        )
+        flattened_hit_mask = hit_mask.flatten(0, 1)
+        if self.hit_pool_kernel[0] > 0:
+            # This is exactly equivalent to adaptive max-pooling when the
+            # fixed input raster is divisible by the token raster (including
+            # MID-360's 16x96 -> 4x12 path), and has complete ONNX support.
+            token_valid = F.max_pool2d(
+                flattened_hit_mask,
+                kernel_size=self.hit_pool_kernel,
+                stride=self.hit_pool_kernel,
+            )
+        else:
+            token_valid = F.adaptive_max_pool2d(
+                flattened_hit_mask,
+                self.token_spatial_size,
+            )
         token_valid = token_valid.reshape(
             batch_size,
             self.history_length,
@@ -400,7 +421,7 @@ class RayTimeAttentionEncoder(nn.Module):
         )
         logits = logits.masked_fill(
             ~safe_valid[:, None, None, :],
-            torch.finfo(logits.dtype).min,
+            -3.4028234663852886e38,
         )
         attention_weights = torch.softmax(logits, dim=-1)
         attended = torch.matmul(attention_weights, values)

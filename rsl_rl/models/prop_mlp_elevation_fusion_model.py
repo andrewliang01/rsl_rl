@@ -400,9 +400,7 @@ class PropMLPElevationFusionModel(nn.Module):
     def as_jit(self) -> nn.Module:
         """Return a version of the model compatible with Torch JIT export."""
         if self.elevation_encoder_type == "ray_time":
-            raise NotImplementedError(
-                "Torch JIT export is not implemented for elevation_encoder_type='ray_time'."
-            )
+            return _TorchRayTimePropMLPElevationFusionModel(self)
         if self.elevation_encoder_type == "ame2":
             return _TorchAME2PropMLPElevationFusionModel(self)
         return _TorchPropMLPElevationFusionModel(self)
@@ -410,9 +408,7 @@ class PropMLPElevationFusionModel(nn.Module):
     def as_onnx(self, verbose: bool, input_mode: str = "split") -> nn.Module:
         """Return a version of the model compatible with ONNX export."""
         if self.elevation_encoder_type == "ray_time":
-            raise NotImplementedError(
-                "ONNX export is not implemented for elevation_encoder_type='ray_time'."
-            )
+            return _OnnxRayTimePropMLPElevationFusionModel(self, verbose, input_mode)
         if self.elevation_encoder_type == "ame2":
             return _OnnxAME2PropMLPElevationFusionModel(self, verbose, input_mode)
         return _OnnxPropMLPElevationFusionModel(self, verbose, input_mode)
@@ -562,6 +558,38 @@ class _TorchAME2PropMLPElevationFusionModel(nn.Module):
         proprio_features = self.prop_mlp(proprio_obs)
         elevation_features = self.elevation_encoder(elevation_obs, proprio_features)
         fused_features = torch.cat((proprio_features, elevation_features), dim=-1)
+        out = self.mlp(fused_features)
+        return self.deterministic_output(out)
+
+    @torch.jit.export
+    def reset(self) -> None:
+        pass
+
+
+class _TorchRayTimePropMLPElevationFusionModel(nn.Module):
+    """Exportable Ray-Time actor for Torch JIT.
+
+    The deployment interface accepts proprioception as ``float32`` and the
+    Ray-Time history as either ``float16`` (matching rollout storage) or
+    ``float32``. The encoder promotes the history to ``float32`` internally.
+    """
+
+    def __init__(self, model: PropMLPElevationFusionModel) -> None:
+        super().__init__()
+        self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
+        self.prop_mlp = copy.deepcopy(model.prop_mlp)
+        self.elevation_encoder = copy.deepcopy(model.elevation_encoder)
+        self.mlp = copy.deepcopy(model.mlp)
+        if model.distribution is not None:
+            self.deterministic_output = model.distribution.as_deterministic_output_module()
+        else:
+            self.deterministic_output = nn.Identity()
+
+    def forward(self, proprio_obs: torch.Tensor, ray_history: torch.Tensor) -> torch.Tensor:
+        proprio_obs = self.obs_normalizer(proprio_obs)
+        proprio_features = self.prop_mlp(proprio_obs)
+        ray_features = self.elevation_encoder(ray_history, proprio_features)
+        fused_features = torch.cat((proprio_features, ray_features), dim=-1)
         out = self.mlp(fused_features)
         return self.deterministic_output(out)
 
@@ -771,5 +799,123 @@ class _OnnxAME2PropMLPElevationFusionModel(nn.Module):
         return {
             "proprio_obs": {0: "batch_size"},
             "elevation_obs": {0: "batch_size"},
+            "actions": {0: "batch_size"},
+        }
+
+
+class _OnnxRayTimePropMLPElevationFusionModel(nn.Module):
+    """Exportable Ray-Time actor for split-input and flat single-input ONNX.
+
+    ONNX inputs are ``float32``. In ``single`` mode the exact feature layout is
+    ``[proprio, ray_history.flatten()]``, where ``ray_history`` has logical
+    shape ``[K, 2, H, W]`` in row-major order.
+    """
+
+    is_recurrent: bool = False
+
+    def __init__(self, model: PropMLPElevationFusionModel, verbose: bool, input_mode: str = "split") -> None:
+        super().__init__()
+        if input_mode not in ("split", "single"):
+            raise ValueError(f"Unsupported ONNX input mode: {input_mode}")
+        self.verbose = verbose
+        self.input_mode = input_mode
+        self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
+        self.prop_mlp = copy.deepcopy(model.prop_mlp)
+        self.elevation_encoder = copy.deepcopy(model.elevation_encoder)
+        self.mlp = copy.deepcopy(model.mlp)
+        if model.distribution is not None:
+            self.deterministic_output = model.distribution.as_deterministic_output_module()
+        else:
+            self.deterministic_output = nn.Identity()
+        self.proprio_input_size = model.obs_dim
+        self.ray_history_length = model.elevation_history_length
+        self.vision_spatial_size = model.vision_spatial_size
+        self.single_input_size = (
+            self.proprio_input_size
+            + self.ray_history_length
+            * 2
+            * self.vision_spatial_size[0]
+            * self.vision_spatial_size[1]
+        )
+
+    def forward(self, proprio_obs: torch.Tensor, ray_history: torch.Tensor | None = None) -> torch.Tensor:
+        if self.input_mode == "single":
+            obs = proprio_obs
+            if (
+                not torch.jit.is_tracing()
+                and not torch.compiler.is_compiling()
+                and (obs.ndim != 2 or obs.shape[1] != self.single_input_size)
+            ):
+                raise ValueError(
+                    "Single-input Ray-Time observations must have shape "
+                    f"[B, {self.single_input_size}] with layout "
+                    "[proprio, flatten(K, 2, H, W)]."
+                )
+            ray_size = (
+                self.ray_history_length
+                * 2
+                * self.vision_spatial_size[0]
+                * self.vision_spatial_size[1]
+            )
+            proprio_obs = obs[:, :self.proprio_input_size]
+            ray_history = obs[:, self.proprio_input_size:self.proprio_input_size + ray_size]
+            if torch.compiler.is_compiling():
+                ray_history = ray_history.unflatten(
+                    1,
+                    (
+                        self.ray_history_length,
+                        2,
+                        self.vision_spatial_size[0],
+                        self.vision_spatial_size[1],
+                    ),
+                )
+            else:
+                ray_history = ray_history.reshape(
+                    -1,
+                    self.ray_history_length,
+                    2,
+                    self.vision_spatial_size[0],
+                    self.vision_spatial_size[1],
+                )
+        elif ray_history is None:
+            raise ValueError("ray_history is required when ONNX input_mode='split'")
+
+        proprio_obs = self.obs_normalizer(proprio_obs)
+        proprio_features = self.prop_mlp(proprio_obs)
+        ray_features = self.elevation_encoder(ray_history, proprio_features)
+        fused_features = torch.cat((proprio_features, ray_features), dim=-1)
+        out = self.mlp(fused_features)
+        return self.deterministic_output(out)
+
+    def get_dummy_inputs(self) -> tuple[torch.Tensor, ...]:
+        if self.input_mode == "single":
+            return (torch.zeros(1, self.single_input_size),)
+        return (
+            torch.zeros(1, self.proprio_input_size),
+            torch.zeros(
+                1,
+                self.ray_history_length,
+                2,
+                *self.vision_spatial_size,
+            ),
+        )
+
+    @property
+    def input_names(self) -> list[str]:
+        if self.input_mode == "single":
+            return ["obs"]
+        return ["proprio_obs", "ray_history"]
+
+    @property
+    def output_names(self) -> list[str]:
+        return ["actions"]
+
+    @property
+    def dynamic_axes(self) -> dict[str, dict[int, str]]:
+        if self.input_mode == "single":
+            return {"obs": {0: "batch_size"}, "actions": {0: "batch_size"}}
+        return {
+            "proprio_obs": {0: "batch_size"},
+            "ray_history": {0: "batch_size"},
             "actions": {0: "batch_size"},
         }
