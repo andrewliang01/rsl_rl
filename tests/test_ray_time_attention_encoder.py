@@ -183,6 +183,60 @@ def test_global_only_ablation_disables_attention_but_preserves_contract() -> Non
     torch.testing.assert_close(changed_valid, token_valid, rtol=0.0, atol=0.0)
 
 
+def test_global_encoder_supports_parameter_matched_k1_and_k5_histories() -> None:
+    encoders: dict[int, RayTimeAttentionEncoder] = {}
+    state_dicts: dict[int, dict[str, torch.Tensor]] = {}
+
+    for history_length in (1, 5):
+        torch.manual_seed(728)
+        encoder = RayTimeAttentionEncoder(
+            history_length=history_length,
+            use_query_attention=False,
+        ).train()
+        ray_history = _make_ray_history(
+            batch_size=3,
+            history_length=history_length,
+        ).requires_grad_()
+        proprio_features = torch.randn(3, 64, requires_grad=True)
+
+        output, attention, token_valid = encoder.forward_with_attention(
+            ray_history,
+            proprio_features,
+        )
+        output.square().mean().backward()
+
+        assert output.shape == (3, 64)
+        assert attention.shape == (
+            3,
+            4,
+            4,
+            history_length * encoder.num_spatial_tokens,
+        )
+        assert token_valid.shape == (
+            3,
+            history_length * encoder.num_spatial_tokens,
+        )
+        assert ray_history.grad is not None
+        assert torch.isfinite(ray_history.grad).all()
+        assert torch.isfinite(output).all()
+
+        encoders[history_length] = encoder
+        state_dicts[history_length] = {
+            name: value.detach().clone()
+            for name, value in encoder.state_dict().items()
+        }
+
+    assert sum(
+        parameter.numel() for parameter in encoders[1].parameters()
+    ) == sum(parameter.numel() for parameter in encoders[5].parameters())
+    assert state_dicts[1].keys() == state_dicts[5].keys()
+    for name in state_dicts[1]:
+        assert state_dicts[1][name].shape == state_dicts[5][name].shape
+
+    encoders[1].load_state_dict(state_dicts[5], strict=True)
+    encoders[5].load_state_dict(state_dicts[1], strict=True)
+
+
 def test_attention_and_global_ablation_have_matched_active_capacity_and_gradients() -> None:
     torch.manual_seed(729)
     ray_history = _make_ray_history(batch_size=3)
@@ -320,6 +374,49 @@ def test_fusion_model_ray_time_aliases_actor_contract_and_export_error() -> None
         model.as_jit()
     with pytest.raises(NotImplementedError, match="ray_time"):
         model.as_onnx(verbose=False)
+
+
+def test_fusion_model_accepts_single_packet_ray_time_history() -> None:
+    batch_size = 3
+    obs = TensorDict(
+        {
+            "policy": torch.randn(batch_size, 96),
+            "mid360_policy": _make_ray_history(
+                batch_size=batch_size,
+                history_length=1,
+            ).half(),
+        },
+        batch_size=[batch_size],
+    )
+    model = PropMLPElevationFusionModel(
+        obs=obs,
+        obs_groups={"actor": ["policy", "mid360_policy"]},
+        obs_set="actor",
+        output_dim=29,
+        hidden_dims=[128, 64],
+        activation="elu",
+        obs_normalization=True,
+        distribution_cfg={
+            "class_name": "GaussianDistribution",
+            "init_std": 1.0,
+            "std_type": "scalar",
+        },
+        elevation_encoder_type="ray_time",
+        ray_time_set="mid360_policy",
+        ray_time_history_length=1,
+        ray_time_spatial_size=(16, 96),
+        ray_time_use_query_attention=False,
+        prop_feature_dim=64,
+        prop_hidden_dims=[128],
+        vision_feature_dim=64,
+    ).eval()
+
+    output = model(obs)
+    assert model.elevation_history_length == 1
+    assert model.elevation_encoder.history_length == 1
+    assert output.shape == (batch_size, 29)
+    assert output.dtype == torch.float32
+    assert torch.isfinite(output).all()
 
 
 @pytest.mark.parametrize(
