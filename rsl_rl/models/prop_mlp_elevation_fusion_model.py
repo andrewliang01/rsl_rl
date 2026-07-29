@@ -15,6 +15,7 @@ from rsl_rl.modules import MLP, EmpiricalNormalization, HiddenState
 from rsl_rl.modules.ame2_encoder import AME2Encoder
 from rsl_rl.modules.distribution import Distribution
 from rsl_rl.modules.elevation_2D_cnn_encoder import Elevation2DCNNEncoder
+from rsl_rl.modules.ray_time_attention_encoder import RayTimeAttentionEncoder
 from rsl_rl.utils import resolve_callable, unpad_trajectories
 
 
@@ -39,7 +40,7 @@ class PropMLPElevationFusionModel(nn.Module):
         "depthcamera": 1,
         "inverse_depth": 2,
     }
-    _ELEVATION_ENCODER_TYPES = {"cnn", "ame2"}
+    _ELEVATION_ENCODER_TYPES = {"cnn", "ame2", "ray_time"}
 
     def __init__(
         self,
@@ -78,6 +79,17 @@ class PropMLPElevationFusionModel(nn.Module):
         ame2_attention_dim: int = 32,
         ame2_num_heads: int = 4,
         ame2_height_scale: float = 0.6,
+        ray_time_set: str | None = None,
+        ray_time_history_length: int | None = None,
+        ray_time_spatial_size: tuple[int, int] | None = None,
+        ray_time_spatial_channels: tuple[int, ...] | list[int] = (24, 32, 64),
+        ray_time_token_dim: int = 64,
+        ray_time_num_heads: int = 4,
+        ray_time_num_queries: int = 4,
+        ray_time_min_range: float = 0.1,
+        ray_time_max_range: float = 6.0,
+        ray_time_vertical_fov_degrees: tuple[float, float] = (-52.0, 7.0),
+        ray_time_use_query_attention: bool = True,
     ) -> None:
         """Initialize the proprio-elevation fusion model.
 
@@ -119,17 +131,37 @@ class PropMLPElevationFusionModel(nn.Module):
             ame2_attention_dim: Query/key/value dimension for multi-head attention.
             ame2_num_heads: Number of AME2 attention heads.
             ame2_height_scale: Scale applied after spatial mean centering the selected height map.
+            ray_time_set: Optional observation-group alias used by the ray-time config.
+            ray_time_history_length: Optional ray-time history-length alias.
+            ray_time_spatial_size: Optional ray-time ``(H, W)`` alias.
+            ray_time_spatial_channels: Per-frame circular CNN channels.
+            ray_time_token_dim: Ray-time token dimension.
+            ray_time_num_heads: Number of cross-attention heads.
+            ray_time_num_queries: Number of proprioception-conditioned queries.
+            ray_time_min_range: Minimum metric LiDAR range.
+            ray_time_max_range: Maximum metric LiDAR range.
+            ray_time_vertical_fov_degrees: Lower/upper elevation angles for fixed position encoding.
+            ray_time_use_query_attention: Enable query attention; false is the global-only ablation.
         """
         super().__init__()
 
         self.obs_set = obs_set
-        self.elevation_set = elevation_set
         self.elevation_encoder_type = elevation_encoder_type.lower()
         if self.elevation_encoder_type not in self._ELEVATION_ENCODER_TYPES:
             raise ValueError(
                 f"Unsupported elevation_encoder_type '{elevation_encoder_type}'. "
                 f"Expected one of {tuple(sorted(self._ELEVATION_ENCODER_TYPES))}."
             )
+        if self.elevation_encoder_type == "ray_time":
+            # These aliases let the dedicated lab-side config use modality
+            # names without changing the legacy fusion model/checkpoint API.
+            if ray_time_set is not None:
+                elevation_set = ray_time_set
+            if ray_time_history_length is not None:
+                elevation_history_length = int(ray_time_history_length)
+            if ray_time_spatial_size is not None:
+                vision_spatial_size = ray_time_spatial_size
+        self.elevation_set = elevation_set
         self.cnn_observation_type = cnn_observation_type.lower()
         if self.cnn_observation_type not in self._CNN_OBSERVATION_MODES:
             raise ValueError(
@@ -177,7 +209,13 @@ class PropMLPElevationFusionModel(nn.Module):
             self._cnn_history_index = resolved_history_index
 
         # Resolve proprio observation groups and dimension.
-        self.obs_groups, self.obs_dim = self._get_prop_obs_dim(obs, obs_groups, obs_set, self.elevation_set)
+        self.obs_groups, self.obs_dim = self._get_prop_obs_dim(
+            obs,
+            obs_groups,
+            obs_set,
+            self.elevation_set,
+            expected_perception_ndim=5 if self.elevation_encoder_type == "ray_time" else 4,
+        )
 
         # Observation normalization only applies to proprio inputs.
         self.obs_normalization = obs_normalization
@@ -213,7 +251,7 @@ class PropMLPElevationFusionModel(nn.Module):
                 out_dim=vision_feature_dim,
                 vision_spatial_size=vision_spatial_size,
             )
-        else:
+        elif self.elevation_encoder_type == "ame2":
             if self.cnn_observation_type != "elevationmap":
                 raise ValueError(
                     "The AME2 encoder only supports cnn_observation_type='elevationmap', "
@@ -245,6 +283,32 @@ class PropMLPElevationFusionModel(nn.Module):
                 output_dim=vision_feature_dim,
                 height_scale=ame2_height_scale,
                 num_heads=ame2_num_heads,
+            )
+        else:
+            ray_shape = obs[elevation_set].shape
+            expected_ray_shape = (
+                elevation_history_length,
+                2,
+                *self.vision_spatial_size,
+            )
+            if tuple(ray_shape[1:]) != expected_ray_shape:
+                raise ValueError(
+                    "Ray-time observation shape mismatch: expected [B, T, 2, H, W] "
+                    f"with [T, 2, H, W]={expected_ray_shape}, got {tuple(ray_shape)}."
+                )
+            self.elevation_encoder = RayTimeAttentionEncoder(
+                history_length=elevation_history_length,
+                vision_spatial_size=self.vision_spatial_size,
+                proprio_feature_dim=fusion_prop_dim,
+                output_dim=vision_feature_dim,
+                spatial_channels=ray_time_spatial_channels,
+                token_dim=ray_time_token_dim,
+                num_heads=ray_time_num_heads,
+                num_queries=ray_time_num_queries,
+                min_range=ray_time_min_range,
+                max_range=ray_time_max_range,
+                vertical_fov_degrees=ray_time_vertical_fov_degrees,
+                use_query_attention=ray_time_use_query_attention,
             )
 
         # Fusion head.
@@ -335,12 +399,20 @@ class PropMLPElevationFusionModel(nn.Module):
 
     def as_jit(self) -> nn.Module:
         """Return a version of the model compatible with Torch JIT export."""
+        if self.elevation_encoder_type == "ray_time":
+            raise NotImplementedError(
+                "Torch JIT export is not implemented for elevation_encoder_type='ray_time'."
+            )
         if self.elevation_encoder_type == "ame2":
             return _TorchAME2PropMLPElevationFusionModel(self)
         return _TorchPropMLPElevationFusionModel(self)
 
     def as_onnx(self, verbose: bool, input_mode: str = "split") -> nn.Module:
         """Return a version of the model compatible with ONNX export."""
+        if self.elevation_encoder_type == "ray_time":
+            raise NotImplementedError(
+                "ONNX export is not implemented for elevation_encoder_type='ray_time'."
+            )
         if self.elevation_encoder_type == "ame2":
             return _OnnxAME2PropMLPElevationFusionModel(self, verbose, input_mode)
         return _OnnxPropMLPElevationFusionModel(self, verbose, input_mode)
@@ -352,7 +424,12 @@ class PropMLPElevationFusionModel(nn.Module):
             self.obs_normalizer.update(proprio_obs)  # type: ignore
 
     def _get_prop_obs_dim(
-        self, obs: TensorDict, obs_groups: dict[str, list[str]], obs_set: str, elevation_set: str
+        self,
+        obs: TensorDict,
+        obs_groups: dict[str, list[str]],
+        obs_set: str,
+        elevation_set: str,
+        expected_perception_ndim: int = 4,
     ) -> tuple[list[str], int]:
         """Select proprio observation groups and compute their flattened dimension."""
         active_obs_groups = []
@@ -368,9 +445,15 @@ class PropMLPElevationFusionModel(nn.Module):
             active_obs_groups.append(obs_group)
             obs_dim += obs[obs_group].shape[-1]
 
-        if len(obs[elevation_set].shape) != 4:
+        if len(obs[elevation_set].shape) != expected_perception_ndim:
+            expected_layout = (
+                "[B, T, 2, H, W]"
+                if expected_perception_ndim == 5
+                else "[B, T, H, W]"
+            )
             raise ValueError(
-                f"The elevation branch expects a 4D tensor [B, T, H, W], got shape {obs[elevation_set].shape} "
+                f"The perception branch expects a {expected_perception_ndim}D tensor "
+                f"{expected_layout}, got shape {obs[elevation_set].shape} "
                 f"for '{elevation_set}'."
             )
         return active_obs_groups, obs_dim
