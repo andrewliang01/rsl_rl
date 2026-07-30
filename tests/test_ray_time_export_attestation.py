@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import copy
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +21,7 @@ from rsl_rl.utils.ray_time_export_attestation import (
     build_ray_time_export_attestation,
     capture_ray_time_checkpoint_snapshot,
     validate_ray_time_export_attestation,
+    validate_ray_time_export_attestation_document,
 )
 from tests.test_ray_time_attention_encoder import _make_ray_time_actor
 
@@ -188,6 +190,56 @@ def test_build_and_validate_ray_time_export_attestation(
         history_length=1,
     )
     assert fresh["artifacts"] == attestation["artifacts"]
+
+
+def test_document_preflight_binds_all_files_and_passed_evidence(
+    export_bundles: tuple[_ExportBundle, _ExportBundle],
+) -> None:
+    actor_a, actor_b = export_bundles
+    attestation = _build(actor_a)
+    validate_ray_time_export_attestation_document(
+        attestation,
+        checkpoint_path=actor_a.checkpoint,
+        torchscript_path=actor_a.torchscript,
+        onnx_path=actor_a.onnx,
+    )
+
+    with pytest.raises(
+        RayTimeExportAttestationError,
+        match="Checkpoint does not match",
+    ):
+        validate_ray_time_export_attestation_document(
+            attestation,
+            checkpoint_path=actor_b.checkpoint,
+            torchscript_path=actor_a.torchscript,
+            onnx_path=actor_a.onnx,
+        )
+    with pytest.raises(
+        RayTimeExportAttestationError,
+        match="TorchScript artifact does not match",
+    ):
+        validate_ray_time_export_attestation_document(
+            attestation,
+            checkpoint_path=actor_a.checkpoint,
+            torchscript_path=actor_b.torchscript,
+            onnx_path=actor_a.onnx,
+        )
+
+    forged = copy.deepcopy(attestation)
+    forged["verification"]["cases"][0]["comparisons"][
+        "eager_vs_torchscript"
+    ]["allclose"] = False
+    payload = {
+        key: value for key, value in forged.items() if key != "integrity"
+    }
+    forged["integrity"]["payload_sha256"] = (
+        attestation_module.canonical_json_sha256(payload)
+    )
+    with pytest.raises(
+        RayTimeExportAttestationError,
+        match="did not pass allclose",
+    ):
+        validate_ray_time_export_attestation_document(forged)
 
 
 def test_external_data_hidden_in_unused_onnx_function_is_rejected(

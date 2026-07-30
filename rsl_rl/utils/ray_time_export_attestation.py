@@ -1167,6 +1167,269 @@ def _validate_expected_document(attestation: Mapping[str, Any]) -> None:
         _fail("Expected attestation integrity digest does not match its payload.")
 
 
+def _validate_attested_file_pair(
+    value: Any,
+    *,
+    label: str,
+    path: str | os.PathLike[str] | None,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != {
+        "file",
+        "after_validation",
+        "stable",
+        "interface",
+    }:
+        _fail(f"{label} attestation record has an invalid structure.")
+    before = _validate_file_record(value["file"], label=f"{label}.file")
+    after = _validate_file_record(
+        value["after_validation"],
+        label=f"{label}.after_validation",
+    )
+    if value["stable"] is not True or before != after:
+        _fail(f"{label} attestation does not record one stable artifact.")
+    if not isinstance(value["interface"], Mapping):
+        _fail(f"{label}.interface must be a mapping.")
+    if path is not None:
+        actual, _ = _file_record(Path(path), label=label)
+        if actual != before:
+            _fail(
+                f"{label} does not match its attested file record: "
+                f"expected {before}, got {actual}."
+            )
+    return before
+
+
+def _validate_passed_verification(value: Any) -> None:
+    if not isinstance(value, Mapping) or set(value) != {
+        "test_suite",
+        "onnx_runtime_backend",
+        "rtol",
+        "atol",
+        "cases",
+    }:
+        _fail("Expected verification record has an invalid structure.")
+    if value["test_suite"] != "deterministic-unknown-and-structured-v1":
+        _fail("Expected attestation deterministic test suite is unsupported.")
+    if value["onnx_runtime_backend"] not in (
+        "onnx.reference",
+        "onnxruntime-cpu",
+    ):
+        _fail("Expected attestation ONNX runtime backend is unsupported.")
+    _finite_nonnegative(value["rtol"], label="expected rtol")
+    _finite_nonnegative(value["atol"], label="expected atol")
+    cases = value["cases"]
+    if not isinstance(cases, list) or len(cases) != 2:
+        _fail("Expected attestation must contain exactly two verification cases.")
+    expected_cases = (
+        (
+            "unknown",
+            1,
+            ("eager_vs_torchscript", "eager_vs_onnx"),
+        ),
+        (
+            "structured",
+            3,
+            (
+                "eager_vs_torchscript",
+                "eager_vs_onnx",
+                "eager_vs_torchscript_fp16_ray",
+            ),
+        ),
+    )
+    for case, (name, batch_size, comparison_names) in zip(
+        cases,
+        expected_cases,
+    ):
+        if not isinstance(case, Mapping) or set(case) != {
+            "name",
+            "batch_size",
+            "inputs",
+            "outputs",
+            "comparisons",
+        }:
+            _fail(f"Expected {name} verification case is malformed.")
+        if case["name"] != name or case["batch_size"] != batch_size:
+            _fail(f"Expected {name} verification case identity is invalid.")
+        if not isinstance(case["inputs"], Mapping) or not isinstance(
+            case["outputs"],
+            Mapping,
+        ):
+            _fail(f"Expected {name} verification tensors are malformed.")
+        comparisons = case["comparisons"]
+        if not isinstance(comparisons, Mapping) or set(comparisons) != set(
+            comparison_names
+        ):
+            _fail(f"Expected {name} verification comparisons are malformed.")
+        for comparison_name in comparison_names:
+            comparison = comparisons[comparison_name]
+            if not isinstance(comparison, Mapping) or set(comparison) != {
+                "allclose",
+                "max_abs_error",
+                "max_rel_error",
+            }:
+                _fail(
+                    f"Expected {name}.{comparison_name} comparison is malformed."
+                )
+            if comparison["allclose"] is not True:
+                _fail(
+                    f"Expected {name}.{comparison_name} did not pass allclose."
+                )
+            _finite_nonnegative(
+                comparison["max_abs_error"],
+                label=f"{name}.{comparison_name}.max_abs_error",
+            )
+            _finite_nonnegative(
+                comparison["max_rel_error"],
+                label=f"{name}.{comparison_name}.max_rel_error",
+            )
+
+
+def validate_ray_time_export_attestation_document(
+    attestation: Mapping[str, Any],
+    *,
+    checkpoint_path: str | os.PathLike[str] | None = None,
+    torchscript_path: str | os.PathLike[str] | None = None,
+    onnx_path: str | os.PathLike[str] | None = None,
+) -> None:
+    """Validate a sealed attestation document and its optional file bindings.
+
+    This is a document-integrity and byte-binding preflight.  It deliberately
+    does not claim graph equivalence: consumers that have the loaded eager
+    policy must additionally call :func:`validate_ray_time_export_attestation`
+    to re-run state binding and deterministic cross-backend execution.
+    """
+    _validate_expected_document(attestation)
+
+    checkpoint = attestation["checkpoint"]
+    if not isinstance(checkpoint, Mapping) or set(checkpoint) != {
+        "before_export",
+        "after_validation",
+        "stable",
+    }:
+        _fail("Expected checkpoint attestation record is malformed.")
+    checkpoint_before = _validate_file_record(
+        checkpoint["before_export"],
+        label="checkpoint.before_export",
+    )
+    checkpoint_after = _validate_file_record(
+        checkpoint["after_validation"],
+        label="checkpoint.after_validation",
+    )
+    if checkpoint["stable"] is not True or checkpoint_before != checkpoint_after:
+        _fail("Expected attestation does not record one stable checkpoint.")
+    if checkpoint_path is not None:
+        actual_checkpoint, _ = _file_record(
+            Path(checkpoint_path),
+            label="checkpoint",
+        )
+        if actual_checkpoint != checkpoint_before:
+            _fail(
+                "Checkpoint does not match its attested file record: "
+                f"expected {checkpoint_before}, got {actual_checkpoint}."
+            )
+
+    layout = attestation["layout"]
+    if not isinstance(layout, Mapping) or set(layout) != {
+        "history_length",
+        "ray_channels",
+        "image_height",
+        "image_width",
+        "proprio_size",
+        "action_size",
+        "onnx_flat_input_size",
+        "vertical_fov_degrees",
+    }:
+        _fail("Expected attestation layout is malformed.")
+    history_length = _positive_int(
+        layout["history_length"],
+        label="layout.history_length",
+    )
+    if layout["ray_channels"] != 2:
+        _fail("layout.ray_channels must be exactly two.")
+    image_height = _positive_int(
+        layout["image_height"],
+        label="layout.image_height",
+    )
+    image_width = _positive_int(
+        layout["image_width"],
+        label="layout.image_width",
+    )
+    proprio_size = _positive_int(
+        layout["proprio_size"],
+        label="layout.proprio_size",
+    )
+    action_size = _positive_int(
+        layout["action_size"],
+        label="layout.action_size",
+    )
+    expected_flat_size = (
+        proprio_size + history_length * 2 * image_height * image_width
+    )
+    if layout["onnx_flat_input_size"] != expected_flat_size:
+        _fail(
+            "layout.onnx_flat_input_size does not match the attested tensor "
+            "layout."
+        )
+    vertical_fov = layout["vertical_fov_degrees"]
+    if (
+        not isinstance(vertical_fov, list)
+        or len(vertical_fov) != 2
+        or any(
+            isinstance(item, bool)
+            or not isinstance(item, (int, float))
+            or not math.isfinite(float(item))
+            for item in vertical_fov
+        )
+        or float(vertical_fov[1]) <= float(vertical_fov[0])
+    ):
+        _fail("layout.vertical_fov_degrees must be finite and increasing.")
+
+    state_binding = attestation["state_binding"]
+    if not isinstance(state_binding, Mapping):
+        _fail("Expected state_binding must be a mapping.")
+    if state_binding.get("status") != "passed" or state_binding.get(
+        "bit_exact"
+    ) is not True:
+        _fail("Expected state binding did not pass bit-exact validation.")
+    if state_binding.get("checkpoint_only_allowlist") != list(
+        _CHECKPOINT_ONLY_KEYS
+    ):
+        _fail("Expected checkpoint-only state allowlist is unsupported.")
+    if state_binding.get("torchscript_only_allowlist") != list(
+        _TORCHSCRIPT_ONLY_KEYS
+    ):
+        _fail("Expected TorchScript-only state allowlist is unsupported.")
+    analytic_buffers = state_binding.get("analytic_buffers")
+    if not isinstance(analytic_buffers, Mapping) or set(
+        analytic_buffers
+    ) != set(_TORCHSCRIPT_ONLY_KEYS):
+        _fail("Expected analytic buffer evidence is incomplete.")
+    for name in _TORCHSCRIPT_ONLY_KEYS:
+        record = analytic_buffers[name]
+        if not isinstance(record, Mapping) or record.get(
+            "analytic_match"
+        ) is not True:
+            _fail(f"Expected analytic buffer {name} did not pass validation.")
+
+    artifacts = attestation["artifacts"]
+    if not isinstance(artifacts, Mapping) or set(artifacts) != {
+        "torchscript",
+        "onnx",
+    }:
+        _fail("Expected artifact attestation record is malformed.")
+    _validate_attested_file_pair(
+        artifacts["torchscript"],
+        label="TorchScript artifact",
+        path=torchscript_path,
+    )
+    _validate_attested_file_pair(
+        artifacts["onnx"],
+        label="ONNX artifact",
+        path=onnx_path,
+    )
+    _validate_passed_verification(attestation["verification"])
+
+
 def validate_ray_time_export_attestation(
     attestation: Mapping[str, Any],
     *,
@@ -1192,7 +1455,12 @@ def validate_ray_time_export_attestation(
     the reference evaluator; artifact identity, interfaces, eager/JIT output
     identities, deterministic inputs, and all tolerance checks are exact.
     """
-    _validate_expected_document(attestation)
+    validate_ray_time_export_attestation_document(
+        attestation,
+        checkpoint_path=checkpoint_path,
+        torchscript_path=torchscript_path,
+        onnx_path=onnx_path,
+    )
     checkpoint = attestation["checkpoint"]
     verification = attestation["verification"]
     if not isinstance(checkpoint, Mapping) or not isinstance(

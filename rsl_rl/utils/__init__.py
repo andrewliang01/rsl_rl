@@ -41,6 +41,7 @@ from .ray_time_export_attestation import (
     RayTimeExportAttestationError,
     build_ray_time_export_attestation,
     capture_ray_time_checkpoint_snapshot,
+    validate_ray_time_export_attestation_document,
     validate_ray_time_export_attestation,
 )
 
@@ -93,6 +94,7 @@ __all__ = [
     "split_and_pad_trajectories",
     "unpad_trajectories",
     "validate_ray_time_deployment_manifest",
+    "validate_ray_time_export_attestation_document",
     "validate_ray_time_export_attestation",
     "write_ray_time_deployment_manifest",
 ]
