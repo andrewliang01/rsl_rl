@@ -35,6 +35,7 @@ def _make_ray_time_actor(
     *,
     history_length: int,
     use_query_attention: bool,
+    fusion_mode: str | None = None,
     batch_size: int = 3,
 ) -> tuple[PropMLPElevationFusionModel, TensorDict]:
     obs = TensorDict(
@@ -65,6 +66,7 @@ def _make_ray_time_actor(
         ray_time_history_length=history_length,
         ray_time_spatial_size=(16, 96),
         ray_time_use_query_attention=use_query_attention,
+        ray_time_fusion_mode=fusion_mode,
         prop_feature_dim=64,
         prop_hidden_dims=[128],
         vision_feature_dim=64,
@@ -248,6 +250,167 @@ def test_global_only_ablation_disables_attention_but_preserves_contract() -> Non
     torch.testing.assert_close(changed_valid, token_valid, rtol=0.0, atol=0.0)
 
 
+def test_explicit_fusion_modes_preserve_legacy_numerics_and_checkpoint_schema() -> None:
+    torch.manual_seed(728)
+    ray_history = _make_ray_history(batch_size=3)
+    proprio_features = torch.randn(3, 64)
+
+    legacy_attention = RayTimeAttentionEncoder(use_query_attention=True).eval()
+    explicit_attention = RayTimeAttentionEncoder(
+        use_query_attention=False,
+        fusion_mode="attention",
+    ).eval()
+    explicit_attention.load_state_dict(legacy_attention.state_dict(), strict=True)
+
+    legacy_global = RayTimeAttentionEncoder(use_query_attention=False).eval()
+    explicit_global = RayTimeAttentionEncoder(
+        use_query_attention=True,
+        fusion_mode="global",
+    ).eval()
+    explicit_global.load_state_dict(legacy_global.state_dict(), strict=True)
+
+    with torch.inference_mode():
+        legacy_attention_output = legacy_attention.forward_with_attention(
+            ray_history,
+            proprio_features,
+        )
+        explicit_attention_output = explicit_attention.forward_with_attention(
+            ray_history,
+            proprio_features,
+        )
+        legacy_global_output = legacy_global.forward_with_attention(
+            ray_history,
+            proprio_features,
+        )
+        explicit_global_output = explicit_global.forward_with_attention(
+            ray_history,
+            proprio_features,
+        )
+
+    for legacy, explicit in zip(
+        legacy_attention_output,
+        explicit_attention_output,
+        strict=True,
+    ):
+        torch.testing.assert_close(explicit, legacy, rtol=0.0, atol=0.0)
+    for legacy, explicit in zip(
+        legacy_global_output,
+        explicit_global_output,
+        strict=True,
+    ):
+        torch.testing.assert_close(explicit, legacy, rtol=0.0, atol=0.0)
+
+    query_global = RayTimeAttentionEncoder(fusion_mode="query_global")
+    legacy_state = legacy_attention.state_dict()
+    query_global_state = query_global.state_dict()
+    assert query_global_state.keys() == legacy_state.keys()
+    for name in legacy_state:
+        assert query_global_state[name].shape == legacy_state[name].shape
+    query_global.load_state_dict(legacy_state, strict=True)
+
+    legacy_actor, _ = _make_ray_time_actor(
+        history_length=5,
+        use_query_attention=True,
+    )
+    query_global_actor, _ = _make_ray_time_actor(
+        history_length=5,
+        use_query_attention=True,
+        fusion_mode="query_global",
+    )
+    legacy_actor_state = legacy_actor.state_dict()
+    query_global_actor_state = query_global_actor.state_dict()
+    assert query_global_actor_state.keys() == legacy_actor_state.keys()
+    for name in legacy_actor_state:
+        assert query_global_actor_state[name].shape == legacy_actor_state[name].shape
+    query_global_actor.load_state_dict(legacy_actor_state, strict=True)
+    assert query_global_actor.elevation_encoder.fusion_mode == "query_global"
+    assert not query_global_actor.elevation_encoder.use_query_attention
+
+
+def test_query_global_is_proprio_conditioned_without_spatial_token_selection() -> None:
+    torch.manual_seed(729)
+    encoder = RayTimeAttentionEncoder(fusion_mode="query_global").eval()
+    ray_history = _make_ray_history(batch_size=3)
+    proprio_features = torch.randn(3, 64)
+
+    with torch.inference_mode():
+        output, gate_weights, token_valid = encoder.forward_with_attention(
+            ray_history,
+            proprio_features,
+        )
+        changed_output, changed_gate_weights, changed_valid = (
+            encoder.forward_with_attention(
+                ray_history,
+                proprio_features + 3.0,
+            )
+        )
+        all_unknown, unknown_gate_weights, unknown_valid = (
+            encoder.forward_with_attention(
+                torch.zeros_like(ray_history),
+                proprio_features,
+            )
+        )
+
+    assert output.shape == (3, 64)
+    assert gate_weights.shape == (3, 4, 4, 240)
+    assert token_valid.shape == (3, 240)
+    assert not torch.equal(changed_output, output)
+    assert not torch.equal(changed_gate_weights, gate_weights)
+    torch.testing.assert_close(changed_valid, token_valid, rtol=0.0, atol=0.0)
+
+    # QueryGlobal exposes each sigmoid gate uniformly over valid diagnostic
+    # tokens; therefore it cannot encode a spatial/time selection.
+    safe_valid = torch.where(
+        token_valid.any(dim=1, keepdim=True),
+        token_valid,
+        torch.ones_like(token_valid),
+    )
+    expected_uniform = safe_valid.to(gate_weights.dtype)
+    expected_uniform = expected_uniform / expected_uniform.sum(
+        dim=1,
+        keepdim=True,
+    )
+    recovered_gates = gate_weights.sum(dim=-1)
+    torch.testing.assert_close(
+        gate_weights,
+        recovered_gates.unsqueeze(-1)
+        * expected_uniform[:, None, None, :],
+        rtol=0.0,
+        atol=1.0e-9,
+    )
+    assert torch.all(recovered_gates > 0.0)
+    assert torch.all(recovered_gates < 2.0)
+
+    assert torch.isfinite(all_unknown).all()
+    assert torch.isfinite(unknown_gate_weights).all()
+    assert torch.count_nonzero(unknown_valid) == 0
+
+
+def test_query_global_zero_logit_gate_has_unit_attention_scale() -> None:
+    encoder = RayTimeAttentionEncoder(fusion_mode="query_global").eval()
+    with torch.no_grad():
+        encoder.query_projection.weight.zero_()
+        encoder.query_projection.bias.zero_()
+        encoder.query_bias.zero_()
+        encoder.key_projection.weight.zero_()
+        encoder.key_projection.bias.zero_()
+
+    global_token = torch.randn(7, encoder.token_dim)
+    proprio_features = torch.randn(7, encoder.proprio_feature_dim)
+    with torch.inference_mode():
+        _, query_gates = encoder._query_global(
+            global_token,
+            proprio_features,
+        )
+
+    torch.testing.assert_close(
+        query_gates,
+        torch.ones_like(query_gates),
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
 def test_global_encoder_supports_parameter_matched_k1_and_k5_histories() -> None:
     encoders: dict[int, RayTimeAttentionEncoder] = {}
     state_dicts: dict[int, dict[str, torch.Tensor]] = {}
@@ -310,6 +473,9 @@ def test_attention_and_global_ablation_have_matched_active_capacity_and_gradient
 
     attention_encoder = RayTimeAttentionEncoder(use_query_attention=True).train()
     global_encoder = RayTimeAttentionEncoder(use_query_attention=False).train()
+    query_global_encoder = RayTimeAttentionEncoder(
+        fusion_mode="query_global",
+    ).train()
 
     attention_loss = F.mse_loss(
         attention_encoder(ray_history, proprio_features),
@@ -319,8 +485,13 @@ def test_attention_and_global_ablation_have_matched_active_capacity_and_gradient
         global_encoder(ray_history, proprio_features),
         target,
     )
+    query_global_loss = F.mse_loss(
+        query_global_encoder(ray_history, proprio_features),
+        target,
+    )
     attention_loss.backward()
     global_loss.backward()
+    query_global_loss.backward()
 
     attention_prefixes = (
         "query_projection",
@@ -354,8 +525,16 @@ def test_attention_and_global_ablation_have_matched_active_capacity_and_gradient
         global_encoder,
         attention_prefixes,
     )
+    query_global_branch = _parameters_with_prefix(
+        query_global_encoder,
+        attention_prefixes,
+    )
+    inactive_query_global_adapter = _parameters_with_prefix(
+        query_global_encoder,
+        (global_prefix,),
+    )
 
-    for branch in (attention_branch, global_branch):
+    for branch in (attention_branch, global_branch, query_global_branch):
         assert branch
         assert all(parameter.grad is not None for parameter in branch)
         assert all(
@@ -373,12 +552,29 @@ def test_attention_and_global_ablation_have_matched_active_capacity_and_gradient
         )
     assert all(parameter.grad is None for parameter in inactive_global_branch)
     assert all(parameter.grad is None for parameter in inactive_attention_branch)
+    assert all(parameter.grad is None for parameter in inactive_query_global_adapter)
 
     attention_total = sum(
         parameter.numel() for parameter in attention_encoder.parameters()
     )
     global_total = sum(parameter.numel() for parameter in global_encoder.parameters())
+    query_global_total = sum(
+        parameter.numel() for parameter in query_global_encoder.parameters()
+    )
     assert attention_total == global_total
+    assert attention_total == query_global_total
+
+    attention_active_names = {
+        name
+        for name, parameter in attention_encoder.named_parameters()
+        if parameter.grad is not None
+    }
+    query_global_active_names = {
+        name
+        for name, parameter in query_global_encoder.named_parameters()
+        if parameter.grad is not None
+    }
+    assert query_global_active_names == attention_active_names
 
     attention_active = sum(
         parameter.numel()
@@ -390,8 +586,14 @@ def test_attention_and_global_ablation_have_matched_active_capacity_and_gradient
         for parameter in global_encoder.parameters()
         if parameter.grad is not None
     )
+    query_global_active = sum(
+        parameter.numel()
+        for parameter in query_global_encoder.parameters()
+        if parameter.grad is not None
+    )
     assert abs(attention_active - global_active) == 320
     assert abs(attention_active - global_active) / attention_active < 0.01
+    assert query_global_active == attention_active
 
 
 def test_fusion_model_ray_time_aliases_actor_contract() -> None:
@@ -441,15 +643,29 @@ def test_fusion_model_ray_time_aliases_actor_contract() -> None:
 
 
 @pytest.mark.parametrize("history_length", (1, 5))
-@pytest.mark.parametrize("use_query_attention", (False, True))
-def test_ray_time_jit_matches_eager_for_k1_k5_global_and_attention(
+@pytest.mark.parametrize(
+    ("use_query_attention", "fusion_mode"),
+    (
+        pytest.param(False, None, id="global"),
+        pytest.param(True, None, id="attention"),
+        pytest.param(True, "query_global", id="query_global"),
+    ),
+)
+def test_ray_time_jit_matches_eager_for_k1_k5_all_fusion_modes(
     history_length: int,
     use_query_attention: bool,
+    fusion_mode: str | None,
 ) -> None:
-    torch.manual_seed(739 + history_length + int(use_query_attention))
+    torch.manual_seed(
+        739
+        + history_length
+        + int(use_query_attention)
+        + int(fusion_mode == "query_global")
+    )
     model, obs = _make_ray_time_actor(
         history_length=history_length,
         use_query_attention=use_query_attention,
+        fusion_mode=fusion_mode,
     )
     jit_wrapper = model.as_jit().eval()
 
@@ -491,24 +707,39 @@ def test_ray_time_jit_matches_eager_for_k1_k5_global_and_attention(
 
 
 @pytest.mark.parametrize("history_length", (1, 5))
-@pytest.mark.parametrize("use_query_attention", (False, True))
+@pytest.mark.parametrize(
+    ("use_query_attention", "fusion_mode"),
+    (
+        pytest.param(False, None, id="global"),
+        pytest.param(True, None, id="attention"),
+        pytest.param(True, "query_global", id="query_global"),
+    ),
+)
 @pytest.mark.parametrize("input_mode", ("split", "single"))
 def test_ray_time_onnx_dynamic_batch_three_matches_eager(
     tmp_path: Any,
     history_length: int,
     use_query_attention: bool,
+    fusion_mode: str | None,
     input_mode: str,
 ) -> None:
     onnx = pytest.importorskip("onnx")
-    torch.manual_seed(751 + history_length + int(use_query_attention))
+    torch.manual_seed(
+        751
+        + history_length
+        + int(use_query_attention)
+        + int(fusion_mode == "query_global")
+    )
     model, obs = _make_ray_time_actor(
         history_length=history_length,
         use_query_attention=use_query_attention,
+        fusion_mode=fusion_mode,
     )
     onnx_model = model.as_onnx(verbose=False, input_mode=input_mode).eval()
+    mode_name = fusion_mode or ("attention" if use_query_attention else "global")
     export_path = tmp_path / (
         f"ray_time_k{history_length}_"
-        f"{'attention' if use_query_attention else 'global'}_{input_mode}.onnx"
+        f"{mode_name}_{input_mode}.onnx"
     )
 
     dummy_inputs = onnx_model.get_dummy_inputs()

@@ -90,6 +90,7 @@ class PropMLPElevationFusionModel(nn.Module):
         ray_time_max_range: float = 6.0,
         ray_time_vertical_fov_degrees: tuple[float, float] = (-52.0, 7.0),
         ray_time_use_query_attention: bool = True,
+        ray_time_fusion_mode: str | None = None,
     ) -> None:
         """Initialize the proprio-elevation fusion model.
 
@@ -142,6 +143,9 @@ class PropMLPElevationFusionModel(nn.Module):
             ray_time_max_range: Maximum metric LiDAR range.
             ray_time_vertical_fov_degrees: Lower/upper elevation angles for fixed position encoding.
             ray_time_use_query_attention: Enable query attention; false is the global-only ablation.
+            ray_time_fusion_mode: Optional explicit fusion mode. ``None`` preserves
+                ``ray_time_use_query_attention``; supported values are ``"attention"``,
+                ``"global"``, and the non-spatial ``"query_global"`` causal control.
         """
         super().__init__()
 
@@ -309,6 +313,7 @@ class PropMLPElevationFusionModel(nn.Module):
                 max_range=ray_time_max_range,
                 vertical_fov_degrees=ray_time_vertical_fov_degrees,
                 use_query_attention=ray_time_use_query_attention,
+                fusion_mode=ray_time_fusion_mode,
             )
 
         # Fusion head.

@@ -11,7 +11,7 @@ That boundary is explicit because Livox driver message fields, timestamp
 domains, point units, and coordinate-frame conventions differ between
 deployments and cannot be inferred safely here.
 
-Schema-v1 preserves only successful returns.  A zero hit mask means
+Ray-time schemas v1/v2 preserve only successful returns.  A zero hit mask means
 ``unknown``: it intentionally does not distinguish an unscanned direction, a
 no-return, a filtered point, or a lost packet.  In particular, the synthetic
 20-percent phase mask used during simulation is never applied to real points.
@@ -36,7 +36,7 @@ from .ray_time_deployment_manifest import (
 MID360_NORMALIZED_SENSOR_FRAME = (
     "mid360_physical_sensor_frame_x_forward_y_left_z_up_metres"
 )
-"""The sole coordinate convention accepted by the schema-v1 point builder."""
+"""The sole coordinate convention accepted by the ray-time point builder."""
 
 MID360_TIMESTAMP_LIVOX_CUSTOM_MSG = (
     "livox_custom_msg_timebase_ns_plus_point_offset_time_ns"
@@ -239,11 +239,11 @@ class Mid360RayTimeTensorBuilder:
         history_length, channels, image_height, image_width = ray["shape"]
         if channels != 2:
             raise RayTimeManifestError(
-                "Schema-v1 real builder requires exactly two ray channels."
+                "Ray-time real builder requires exactly two ray channels."
             )
         if ray["dtype"] != "float16":
             raise RayTimeManifestError(
-                "Schema-v1 real builder requires float16 ray history."
+                "Ray-time real builder requires float16 ray history."
             )
         if tensorization["real_packet_mask"] != (
             "use actual sensor-observed rays; never apply the simulation "

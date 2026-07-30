@@ -10,6 +10,7 @@ from rsl_rl.utils.ray_time_deployment_manifest import (
     RayTimeManifestError,
     build_ray_time_deployment_manifest,
     canonical_json_bytes,
+    canonical_json_sha256,
     collect_git_provenance,
     default_ray_time_channels,
     default_ray_time_mount_geometry,
@@ -27,9 +28,21 @@ from rsl_rl.utils.ray_time_deployment_manifest import (
 _JOINT_ORDER = tuple(f"joint_{index:02d}" for index in range(29))
 _DEFAULTS = tuple(index * 0.01 for index in range(29))
 _SCALES = tuple(0.1 + index * 0.001 for index in range(29))
+_FUSION_MODE_BY_VARIANT = {
+    "Attention": "attention",
+    "Global": "global",
+    "QueryGlobal": "query_global",
+}
+_LEGACY_BOOL_BY_FUSION_MODE = {
+    "attention": True,
+    "global": False,
+    "query_global": True,
+}
+_FUSION_MODE_UNSET = object()
 
 
 def _training_contract(history_length: int, variant: str) -> dict:
+    fusion_mode = _FUSION_MODE_BY_VARIANT[variant]
     joint_terms = {"joint_pos", "joint_vel"}
     term_callables = (
         ("base_ang_vel", "isaaclab.envs.mdp.observations.base_ang_vel"),
@@ -53,8 +66,9 @@ def _training_contract(history_length: int, variant: str) -> dict:
     }
     return {
         "encoder_variant": variant,
+        "fusion_mode": fusion_mode,
         "history_length": history_length,
-        "use_query_attention": variant == "Attention",
+        "use_query_attention": _LEGACY_BOOL_BY_FUSION_MODE[fusion_mode],
         "actor_spatial_size": [16, 96],
         "actor_valid_range_m": {"min": 0.1, "max": 6.0},
         "actor_vertical_fov_degrees": [-52.0, 7.0],
@@ -112,6 +126,7 @@ def _manifest(
     *,
     history_length: int,
     variant: str,
+    fusion_mode: str | None | object = _FUSION_MODE_UNSET,
 ) -> dict:
     torchscript = checkpoint.with_name(f"{checkpoint.stem}.jit.pt")
     onnx = checkpoint.with_name(f"{checkpoint.stem}.onnx")
@@ -123,6 +138,11 @@ def _manifest(
     env_yaml.write_bytes(b"environment metadata")
     return build_ray_time_deployment_manifest(
         encoder_variant=variant,
+        fusion_mode=(
+            _FUSION_MODE_BY_VARIANT[variant]
+            if fusion_mode is _FUSION_MODE_UNSET
+            else fusion_mode
+        ),
         history_length=history_length,
         proprio_terms=default_ray_time_proprio_terms(),
         ray_shape=(history_length, 2, 16, 96),
@@ -165,11 +185,28 @@ def _manifest(
     )
 
 
+def _reseal_manifest(manifest: dict) -> None:
+    manifest.pop("integrity", None)
+    manifest["integrity"] = {
+        "algorithm": "sha256",
+        "canonicalization": (
+            "RFC8259 JSON; UTF-8; sorted keys; no whitespace; no NaN"
+        ),
+        "payload_scope": "all top-level fields except integrity",
+        "payload_sha256": canonical_json_sha256(manifest),
+    }
+
+
 @pytest.mark.parametrize(
     ("history_length", "variant"),
-    ((1, "Global"), (5, "Global"), (5, "Attention")),
+    (
+        (1, "Global"),
+        (5, "Global"),
+        (5, "Attention"),
+        (5, "QueryGlobal"),
+    ),
 )
-def test_k1_k5_global_attention_manifests_are_self_consistent(
+def test_k1_k5_all_fusion_mode_manifests_are_self_consistent(
     tmp_path: Path,
     history_length: int,
     variant: str,
@@ -182,6 +219,7 @@ def test_k1_k5_global_attention_manifests_are_self_consistent(
         variant=variant,
     )
 
+    assert manifest["schema"]["version"] == 2
     validate_ray_time_deployment_manifest(
         manifest,
         checkpoint_path=checkpoint,
@@ -190,6 +228,7 @@ def test_k1_k5_global_attention_manifests_are_self_consistent(
         ),
         onnx_path=checkpoint.with_name(f"{checkpoint.stem}.onnx"),
         expected_encoder_variant=variant,
+        expected_fusion_mode=_FUSION_MODE_BY_VARIANT[variant],
         expected_history_length=history_length,
         expected_proprio_shape=(96,),
         expected_proprio_order=(
@@ -210,12 +249,116 @@ def test_k1_k5_global_attention_manifests_are_self_consistent(
     assert manifest["contract"]["ray_history"]["history_order"] == (
         "oldest_to_newest"
     )
+    assert manifest["contract"]["encoder"]["fusion_mode"] == (
+        _FUSION_MODE_BY_VARIANT[variant]
+    )
     assert manifest["contract"]["action"]["decoding_formula"] == (
         ray_time_action_formula((-50.0, 50.0))
     )
     assert manifest["contract"]["export_interfaces"]["onnx"]["input"][
         "shape"
     ] == ["B", 96 + history_length * 2 * 16 * 96]
+
+
+@pytest.mark.parametrize(
+    ("variant", "expected_fusion_mode"),
+    (("Attention", "attention"), ("Global", "global")),
+)
+def test_schema_v1_manifest_without_fusion_mode_uses_legacy_fallback(
+    tmp_path: Path,
+    variant: str,
+    expected_fusion_mode: str,
+) -> None:
+    checkpoint = tmp_path / f"legacy_{variant}.pt"
+    checkpoint.write_bytes(b"legacy checkpoint")
+    manifest = _manifest(
+        checkpoint,
+        history_length=5,
+        variant=variant,
+    )
+    manifest["schema"]["version"] = 1
+    del manifest["contract"]["encoder"]["fusion_mode"]
+    del manifest["checkpoint"]["training_metadata"]["resolved_contract"][
+        "fusion_mode"
+    ]
+    manifest["contract"]["ray_history"]["tensorization"]["range_encoding"][
+        "unobserved_or_no_return"
+    ] = "[0.0, 0.0]; schema v1 intentionally conflates these cases"
+    _reseal_manifest(manifest)
+
+    validate_ray_time_deployment_manifest(
+        manifest,
+        require_export_artifact=False,
+        expected_encoder_variant=variant,
+        expected_fusion_mode=expected_fusion_mode,
+    )
+    legacy_path = tmp_path / f"legacy_{variant}.manifest.json"
+    write_ray_time_deployment_manifest(legacy_path, manifest)
+    loaded = read_ray_time_deployment_manifest(
+        legacy_path,
+        require_export_artifact=False,
+        expected_encoder_variant=variant,
+        expected_fusion_mode=expected_fusion_mode,
+    )
+    assert "fusion_mode" not in loaded["contract"]["encoder"]
+
+
+def test_fusion_mode_conflicts_and_ambiguous_query_global_fail_closed(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "model.pt"
+    checkpoint.write_bytes(b"model")
+    with pytest.raises(RayTimeManifestError, match="cannot be inferred"):
+        _manifest(
+            checkpoint,
+            history_length=5,
+            variant="QueryGlobal",
+            fusion_mode=None,
+        )
+    manifest = _manifest(
+        checkpoint,
+        history_length=5,
+        variant="Attention",
+    )
+
+    conflicting_encoder = deepcopy(manifest)
+    conflicting_encoder["contract"]["encoder"]["fusion_mode"] = "global"
+    with pytest.raises(RayTimeManifestError, match="conflicts"):
+        validate_ray_time_deployment_manifest(
+            conflicting_encoder,
+            require_export_artifact=False,
+        )
+
+    conflicting_training = deepcopy(manifest)
+    conflicting_training["checkpoint"]["training_metadata"][
+        "resolved_contract"
+    ]["fusion_mode"] = "query_global"
+    with pytest.raises(RayTimeManifestError, match="resolved_contract"):
+        validate_ray_time_deployment_manifest(
+            conflicting_training,
+            require_export_artifact=False,
+        )
+
+    query_global_checkpoint = tmp_path / "query_global.pt"
+    query_global_checkpoint.write_bytes(b"query-global checkpoint")
+    ambiguous_query_global = _manifest(
+        query_global_checkpoint,
+        history_length=5,
+        variant="QueryGlobal",
+    )
+    # A schema-v1 checkpoint has no field capable of distinguishing Attention
+    # from QueryGlobal; relabeling it must not be accepted.
+    ambiguous_query_global["schema"]["version"] = 1
+    del ambiguous_query_global["contract"]["encoder"]["fusion_mode"]
+    del ambiguous_query_global["checkpoint"]["training_metadata"][
+        "resolved_contract"
+    ]["fusion_mode"]
+    _reseal_manifest(ambiguous_query_global)
+    with pytest.raises(RayTimeManifestError, match="encoder.variant"):
+        validate_ray_time_deployment_manifest(
+            ambiguous_query_global,
+            require_export_artifact=False,
+        )
 
 
 def test_serialization_and_hash_are_deterministic_and_round_trip(
@@ -238,6 +381,7 @@ def test_serialization_and_hash_are_deterministic_and_round_trip(
         checkpoint_path=checkpoint,
         torchscript_path=checkpoint.with_name("model.jit.pt"),
         expected_encoder_variant="Attention",
+        expected_fusion_mode="attention",
         expected_history_length=5,
     )
     assert loaded == manifest
@@ -247,6 +391,7 @@ def test_serialization_and_hash_are_deterministic_and_round_trip(
     ("expectation", "value", "match"),
     (
         ("expected_encoder_variant", "Attention", "encoder.variant"),
+        ("expected_fusion_mode", "attention", "encoder.fusion_mode"),
         ("expected_history_length", 1, "encoder.history_length"),
         ("expected_proprio_shape", (95,), "actor_proprioception.shape"),
         (
@@ -315,6 +460,11 @@ def test_missing_or_extra_fields_fail_closed(tmp_path: Path) -> None:
     del missing["contract"]["action"]["joint_order"]
     with pytest.raises(RayTimeManifestError, match="missing=.*joint_order"):
         validate_ray_time_deployment_manifest(missing)
+
+    missing_fusion_mode = deepcopy(manifest)
+    del missing_fusion_mode["contract"]["encoder"]["fusion_mode"]
+    with pytest.raises(RayTimeManifestError, match="missing=.*fusion_mode"):
+        validate_ray_time_deployment_manifest(missing_fusion_mode)
 
     extra = deepcopy(manifest)
     extra["contract"]["encoder"]["unversioned_hint"] = "unsafe"

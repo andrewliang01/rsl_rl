@@ -113,6 +113,7 @@ class RayTimeAttentionEncoder(nn.Module):
         max_range: float = 6.0,
         vertical_fov_degrees: tuple[float, float] = (-52.0, 7.0),
         use_query_attention: bool = True,
+        fusion_mode: str | None = None,
     ) -> None:
         super().__init__()
 
@@ -159,7 +160,18 @@ class RayTimeAttentionEncoder(nn.Module):
         self.head_dim = self.token_dim // self.num_heads
         self.min_range = float(min_range)
         self.max_range = float(max_range)
-        self.use_query_attention = bool(use_query_attention)
+        resolved_fusion_mode = (
+            "attention" if use_query_attention else "global"
+        ) if fusion_mode is None else fusion_mode.lower().replace("-", "_")
+        if resolved_fusion_mode not in ("attention", "global", "query_global"):
+            raise ValueError(
+                "fusion_mode must be one of ('attention', 'global', 'query_global'), "
+                f"got '{fusion_mode}'."
+            )
+        self.fusion_mode = resolved_fusion_mode
+        # Preserve this public compatibility flag for existing callers. The
+        # QueryGlobal control deliberately does not perform spatial attention.
+        self.use_query_attention = self.fusion_mode == "attention"
         self.attention_scale = 1.0 / math.sqrt(self.head_dim)
 
         channel_1, channel_2, channel_3 = (int(value) for value in spatial_channels)
@@ -333,13 +345,13 @@ class RayTimeAttentionEncoder(nn.Module):
         global_token = (tokens * valid_float).sum(dim=1) / valid_count
         global_feature = self.global_projection(global_token)
 
-        if self.use_query_attention:
+        if self.fusion_mode == "attention":
             attended_feature, attention_weights = self._query_attention(
                 tokens,
                 token_valid,
                 proprio_features,
             )
-        else:
+        elif self.fusion_mode == "global":
             attended_feature = self.global_ablation_adapter(global_token)
             attention_weights = torch.zeros(
                 batch_size,
@@ -348,6 +360,37 @@ class RayTimeAttentionEncoder(nn.Module):
                 self.num_tokens,
                 device=tokens.device,
                 dtype=tokens.dtype,
+            )
+        else:
+            # Match Attention's fully-unknown deterministic fallback without
+            # exposing the spatial sequence: collapse the same fixed
+            # position/time tokens to one mean token.
+            query_global_token = torch.where(
+                token_valid.any(dim=1, keepdim=True),
+                global_token,
+                tokens.mean(dim=1),
+            )
+            attended_feature, query_gates = self._query_global(
+                query_global_token,
+                proprio_features,
+            )
+            # Keep the diagnostic tensor contract shared by all modes. Every
+            # valid spatial/time entry receives the same mass, making it
+            # explicit that QueryGlobal cannot select an individual token.
+            # Fully unknown input uses a uniform deterministic fallback.
+            safe_valid = torch.where(
+                token_valid.any(dim=1, keepdim=True),
+                token_valid,
+                torch.ones_like(token_valid),
+            )
+            uniform_weights = safe_valid.to(tokens.dtype)
+            uniform_weights = uniform_weights / uniform_weights.sum(
+                dim=1,
+                keepdim=True,
+            )
+            attention_weights = (
+                query_gates.unsqueeze(-1)
+                * uniform_weights[:, None, None, :]
             )
 
         terrain_embedding = self.output_norm(
@@ -430,6 +473,55 @@ class RayTimeAttentionEncoder(nn.Module):
             self.num_queries * self.token_dim,
         )
         return self.attended_projection(attended), attention_weights
+
+    def _query_global(
+        self,
+        global_token: torch.Tensor,
+        proprio_features: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gate one masked global terrain token with proprioceptive queries.
+
+        Unlike spatial cross-attention, this causal control never receives the
+        token sequence or its coordinates. Keys and values can therefore only
+        encode the masked global average computed by the caller.
+        """
+        batch_size = global_token.shape[0]
+        query = self.query_projection(proprio_features).reshape(
+            batch_size,
+            self.num_queries,
+            self.token_dim,
+        )
+        query = query + self.query_bias
+        query = query.reshape(
+            batch_size,
+            self.num_queries,
+            self.num_heads,
+            self.head_dim,
+        ).permute(0, 2, 1, 3)
+
+        key = self.key_projection(global_token).reshape(
+            batch_size,
+            self.num_heads,
+            self.head_dim,
+        )
+        value = self.value_projection(global_token).reshape(
+            batch_size,
+            self.num_heads,
+            self.head_dim,
+        )
+        # Attention's softmax produces a unit-sum value mixture for every
+        # query/head.  Center this non-spatial control at the same unit gain so
+        # its branch is not initialized at roughly half the Attention scale.
+        # These gates are gains in ``(0, 2)``, not probabilities.
+        query_gates = 2.0 * torch.sigmoid(
+            (query * key.unsqueeze(2)).sum(dim=-1) * self.attention_scale
+        )
+        attended = query_gates.unsqueeze(-1) * value.unsqueeze(2)
+        attended = attended.permute(0, 2, 1, 3).reshape(
+            batch_size,
+            self.num_queries * self.token_dim,
+        )
+        return self.attended_projection(attended), query_gates
 
     @staticmethod
     def _build_spherical_encoding(

@@ -29,11 +29,32 @@ from typing import Any, Mapping, Sequence
 
 
 RAY_TIME_MANIFEST_SCHEMA_NAME = "g1-mid360-ray-time-policy"
-RAY_TIME_MANIFEST_SCHEMA_VERSION = 1
+RAY_TIME_MANIFEST_SCHEMA_VERSION = 2
 RAY_TIME_PROVENANCE_REPOSITORIES = ("lab_pro", "rsl_rl", "IsaacLab")
 
 _SHA256_HEX_LENGTH = 64
-_ENCODER_VARIANTS = ("Global", "Attention")
+_LEGACY_MANIFEST_SCHEMA_VERSION = 1
+_FUSION_MODE_TO_VARIANT = {
+    "attention": "Attention",
+    "global": "Global",
+    "query_global": "QueryGlobal",
+}
+_FUSION_MODE_TO_LEGACY_BOOL = {
+    "attention": True,
+    "global": False,
+    # QueryGlobal was introduced with the legacy flag left enabled so that
+    # old checkpoint/module layouts remain unchanged.  The explicit mode is
+    # authoritative, but the redundant boolean must still be self-consistent.
+    "query_global": True,
+}
+_ENCODER_VARIANTS = tuple(_FUSION_MODE_TO_VARIANT.values())
+_LEGACY_ENCODER_VARIANTS = ("Global", "Attention")
+_LEGACY_UNOBSERVED_RAY_SEMANTIC = (
+    "[0.0, 0.0]; schema v1 intentionally conflates these cases"
+)
+_UNOBSERVED_RAY_SEMANTIC = (
+    "[0.0, 0.0]; the ray-time contract intentionally conflates these cases"
+)
 _PROPRIO_TERM_NAMES = (
     "base_ang_vel",
     "projected_gravity",
@@ -228,6 +249,7 @@ def collect_git_provenance(
 def build_ray_time_deployment_manifest(
     *,
     encoder_variant: str,
+    fusion_mode: str | None = None,
     history_length: int,
     proprio_terms: Sequence[Mapping[str, Any]],
     ray_shape: Sequence[int],
@@ -257,7 +279,17 @@ def build_ray_time_deployment_manifest(
     onnx_path: str | os.PathLike[str],
     provenance: Mapping[str, Mapping[str, Any]],
 ) -> dict[str, Any]:
-    """Build, seal, and validate a schema-version-1 deployment manifest."""
+    """Build, seal, and validate a deployment manifest.
+
+    Schema v2 persists the canonical fusion mode independently of parameter
+    names in the checkpoint.  ``fusion_mode=None`` remains a source-compatible
+    builder fallback for the pre-QueryGlobal ``Global``/``Attention`` variants.
+    """
+    resolved_fusion_mode = _resolve_encoder_fusion_mode(
+        encoder_variant=encoder_variant,
+        fusion_mode=fusion_mode,
+        path="encoder",
+    )
     checkpoint = Path(checkpoint_path).resolve()
     training_agent_yaml = Path(training_agent_yaml_path).resolve()
     training_env_yaml = Path(training_env_yaml_path).resolve()
@@ -272,6 +304,7 @@ def build_ray_time_deployment_manifest(
             "encoder": {
                 "type": "ray_time",
                 "variant": encoder_variant,
+                "fusion_mode": resolved_fusion_mode,
                 "history_length": history_length,
             },
             "actor_proprioception": {
@@ -368,6 +401,7 @@ def validate_ray_time_deployment_manifest(
     onnx_path: str | os.PathLike[str] | None = None,
     require_export_artifact: bool = True,
     expected_encoder_variant: str | None = None,
+    expected_fusion_mode: str | None = None,
     expected_history_length: int | None = None,
     expected_proprio_shape: Sequence[int] | None = None,
     expected_proprio_order: Sequence[str] | None = None,
@@ -406,11 +440,16 @@ def validate_ray_time_deployment_manifest(
     schema = _mapping(manifest["schema"], "$.schema")
     _require_exact_keys(schema, ("name", "version"), "$.schema")
     _expect(schema["name"], RAY_TIME_MANIFEST_SCHEMA_NAME, "$.schema.name")
-    _expect(
-        schema["version"],
+    schema_version = schema["version"]
+    if schema_version not in (
+        _LEGACY_MANIFEST_SCHEMA_VERSION,
         RAY_TIME_MANIFEST_SCHEMA_VERSION,
-        "$.schema.version",
-    )
+    ):
+        raise RayTimeManifestError(
+            "$.schema.version must be one of "
+            f"{(_LEGACY_MANIFEST_SCHEMA_VERSION, RAY_TIME_MANIFEST_SCHEMA_VERSION)}, "
+            f"got {schema_version!r}."
+        )
 
     contract = _mapping(manifest["contract"], "$.contract")
     _require_exact_keys(
@@ -424,15 +463,25 @@ def validate_ray_time_deployment_manifest(
         ),
         "$.contract",
     )
-    _validate_encoder(contract["encoder"])
+    _validate_encoder(
+        contract["encoder"],
+        schema_version=schema_version,
+    )
     _validate_proprioception(contract["actor_proprioception"])
-    _validate_ray_history(contract["ray_history"])
+    _validate_ray_history(
+        contract["ray_history"],
+        schema_version=schema_version,
+    )
     _validate_action(contract["action"])
     _validate_export_interfaces(
         contract["export_interfaces"],
         history_length=contract["encoder"]["history_length"],
     )
-    _validate_checkpoint(manifest["checkpoint"], contract=contract)
+    _validate_checkpoint(
+        manifest["checkpoint"],
+        contract=contract,
+        schema_version=schema_version,
+    )
     _validate_export_artifacts(manifest["export_artifacts"])
     _validate_provenance(manifest["provenance"])
     _validate_integrity(manifest)
@@ -454,6 +503,14 @@ def validate_ray_time_deployment_manifest(
         encoder["variant"],
         expected_encoder_variant,
         "$.contract.encoder.variant",
+    )
+    _expect_optional(
+        _effective_encoder_fusion_mode(
+            encoder,
+            schema_version=schema_version,
+        ),
+        expected_fusion_mode,
+        "$.contract.encoder.fusion_mode",
     )
     _expect_optional(
         encoder["history_length"],
@@ -634,7 +691,7 @@ def read_ray_time_deployment_manifest(
 
 
 def default_ray_time_proprio_terms() -> list[dict[str, Any]]:
-    """Return the sole schema-v1 96-value proprioceptive layout."""
+    """Return the shared schema-v1/v2 96-value proprioceptive layout."""
     result = []
     offset = 0
     for name, size, semantic, indexed_by in zip(
@@ -657,7 +714,7 @@ def default_ray_time_proprio_terms() -> list[dict[str, Any]]:
 
 
 def default_ray_time_channels() -> list[dict[str, Any]]:
-    """Return the sole schema-v1 ray channel layout."""
+    """Return the shared schema-v1/v2 ray channel layout."""
     return [
         {"index": index, "name": name, "semantic": semantic}
         for index, name, semantic in _RAY_CHANNELS
@@ -665,7 +722,7 @@ def default_ray_time_channels() -> list[dict[str, Any]]:
 
 
 def default_ray_time_mount_geometry() -> dict[str, Any]:
-    """Return the schema-v1 torso-to-RayCaster mount and alignment."""
+    """Return the shared schema-v1/v2 mount and alignment."""
     return {
         "parent_link": "torso_link",
         "translation_m": [0.0002835, 0.00003, 0.41618],
@@ -685,7 +742,7 @@ def default_ray_time_mount_geometry() -> dict[str, Any]:
 
 
 def default_ray_time_tensorization() -> dict[str, Any]:
-    """Return the schema-v1 point/ray-to-packet conversion semantics."""
+    """Return the current point/ray-to-packet conversion semantics."""
     return {
         "pattern_sensor_vertical_fov_degrees": [52.0, -7.0],
         "policy_body_row_vertical_fov_degrees": [-52.0, 7.0],
@@ -713,16 +770,27 @@ def default_ray_time_tensorization() -> dict[str, Any]:
                 "[max_range_m, 1.0] when the ray is actually observed"
             ),
             "unobserved_or_no_return": (
-                "[0.0, 0.0]; schema v1 intentionally conflates these cases"
+                _UNOBSERVED_RAY_SEMANTIC
             ),
         },
     }
 
 
+def _ray_time_tensorization_for_schema(
+    schema_version: int,
+) -> dict[str, Any]:
+    tensorization = default_ray_time_tensorization()
+    if schema_version == _LEGACY_MANIFEST_SCHEMA_VERSION:
+        tensorization["range_encoding"][
+            "unobserved_or_no_return"
+        ] = _LEGACY_UNOBSERVED_RAY_SEMANTIC
+    return tensorization
+
+
 def ray_time_action_formula(
     raw_actor_output_clip: Sequence[float] | None,
 ) -> list[str]:
-    """Return the exact two-step schema-v1 action decoding formula."""
+    """Return the shared schema-v1/v2 action decoding formula."""
     if raw_actor_output_clip is None:
         actor_to_environment = (
             "a_env[i] = a_actor[i] (raw_actor_output_clip is null)"
@@ -736,23 +804,92 @@ def ray_time_action_formula(
 
 
 def ray_time_previous_action_semantics() -> str:
-    """Return the exact schema-v1 previous-action definition."""
+    """Return the shared schema-v1/v2 previous-action definition."""
     return _PREVIOUS_ACTION_SEMANTICS
 
 
-def _validate_encoder(value: Any) -> None:
+def _resolve_encoder_fusion_mode(
+    *,
+    encoder_variant: Any,
+    fusion_mode: Any,
+    path: str,
+) -> str:
+    if fusion_mode is None:
+        for candidate, variant in _FUSION_MODE_TO_VARIANT.items():
+            if variant not in _LEGACY_ENCODER_VARIANTS:
+                continue
+            if encoder_variant == variant:
+                return candidate
+        if encoder_variant == _FUSION_MODE_TO_VARIANT["query_global"]:
+            raise RayTimeManifestError(
+                f"{path}.fusion_mode='query_global' is required when "
+                f"{path}.variant='QueryGlobal'; it cannot be inferred from "
+                "legacy metadata."
+            )
+        raise RayTimeManifestError(
+            f"{path}.variant must be one of {_ENCODER_VARIANTS}, "
+            f"got {encoder_variant!r}."
+        )
+    if not isinstance(fusion_mode, str) or fusion_mode not in (
+        _FUSION_MODE_TO_VARIANT
+    ):
+        raise RayTimeManifestError(
+            f"{path}.fusion_mode must be one of "
+            f"{tuple(_FUSION_MODE_TO_VARIANT)}, got {fusion_mode!r}."
+        )
+    expected_variant = _FUSION_MODE_TO_VARIANT[fusion_mode]
+    if encoder_variant != expected_variant:
+        raise RayTimeManifestError(
+            f"{path}.variant={encoder_variant!r} conflicts with "
+            f"{path}.fusion_mode={fusion_mode!r}; expected "
+            f"variant {expected_variant!r}."
+        )
+    return fusion_mode
+
+
+def _effective_encoder_fusion_mode(
+    encoder: Mapping[str, Any],
+    *,
+    schema_version: int,
+) -> str:
+    if schema_version == _LEGACY_MANIFEST_SCHEMA_VERSION:
+        return _resolve_encoder_fusion_mode(
+            encoder_variant=encoder["variant"],
+            fusion_mode=None,
+            path="$.contract.encoder",
+        )
+    return _resolve_encoder_fusion_mode(
+        encoder_variant=encoder["variant"],
+        fusion_mode=encoder["fusion_mode"],
+        path="$.contract.encoder",
+    )
+
+
+def _validate_encoder(value: Any, *, schema_version: int) -> None:
     encoder = _mapping(value, "$.contract.encoder")
+    expected_keys = ["type", "variant", "history_length"]
+    if schema_version == RAY_TIME_MANIFEST_SCHEMA_VERSION:
+        expected_keys.insert(2, "fusion_mode")
     _require_exact_keys(
         encoder,
-        ("type", "variant", "history_length"),
+        expected_keys,
         "$.contract.encoder",
     )
     _expect(encoder["type"], "ray_time", "$.contract.encoder.type")
-    if encoder["variant"] not in _ENCODER_VARIANTS:
+    allowed_variants = (
+        _LEGACY_ENCODER_VARIANTS
+        if schema_version == _LEGACY_MANIFEST_SCHEMA_VERSION
+        else _ENCODER_VARIANTS
+    )
+    if encoder["variant"] not in allowed_variants:
         raise RayTimeManifestError(
             "$.contract.encoder.variant must be one of "
-            f"{_ENCODER_VARIANTS}, got {encoder['variant']!r}."
+            f"{allowed_variants}, got {encoder['variant']!r}."
         )
+    _effective_encoder_fusion_mode(
+        encoder,
+        schema_version=schema_version,
+    )
     _positive_int(
         encoder["history_length"],
         "$.contract.encoder.history_length",
@@ -807,7 +944,7 @@ def _validate_proprioception(value: Any) -> None:
     _expect(offset, 96, "$.contract.actor_proprioception.shape[0]")
 
 
-def _validate_ray_history(value: Any) -> None:
+def _validate_ray_history(value: Any, *, schema_version: int) -> None:
     path = "$.contract.ray_history"
     ray = _mapping(value, path)
     _require_exact_keys(
@@ -907,7 +1044,7 @@ def _validate_ray_history(value: Any) -> None:
     tensorization = _mapping(ray["tensorization"], f"{path}.tensorization")
     _expect(
         tensorization,
-        default_ray_time_tensorization(),
+        _ray_time_tensorization_for_schema(schema_version),
         f"{path}.tensorization",
     )
 
@@ -1090,6 +1227,7 @@ def _validate_checkpoint(
     value: Any,
     *,
     contract: Mapping[str, Any],
+    schema_version: int,
 ) -> None:
     path = "$.checkpoint"
     checkpoint = _mapping(value, path)
@@ -1111,6 +1249,7 @@ def _validate_checkpoint(
     _validate_training_contract(
         metadata["resolved_contract"],
         contract=contract,
+        schema_version=schema_version,
         path=f"{metadata_path}.resolved_contract",
     )
 
@@ -1181,44 +1320,52 @@ def _validate_training_contract(
     value: Any,
     *,
     contract: Mapping[str, Any],
+    schema_version: int,
     path: str,
 ) -> None:
     training = _mapping(value, path)
+    expected_keys = [
+        "encoder_variant",
+        "history_length",
+        "use_query_attention",
+        "actor_spatial_size",
+        "actor_valid_range_m",
+        "actor_vertical_fov_degrees",
+        "env_history_length",
+        "env_image_size",
+        "env_packet_interval_control_steps",
+        "env_valid_range_m",
+        "env_scan_fraction_per_packet",
+        "raw_actor_output_clip",
+        "control_decimation",
+        "simulation_dt_s",
+        "control_period_s",
+        "action_joint_names",
+        "action_preserve_order",
+        "action_use_default_offset",
+        "action_default_joint_positions",
+        "action_per_joint_scale",
+        "action_processed_target_clip_rad",
+        "policy_observation_terms",
+    ]
+    if schema_version == RAY_TIME_MANIFEST_SCHEMA_VERSION:
+        expected_keys.insert(1, "fusion_mode")
     _require_exact_keys(
         training,
-        (
-            "encoder_variant",
-            "history_length",
-            "use_query_attention",
-            "actor_spatial_size",
-            "actor_valid_range_m",
-            "actor_vertical_fov_degrees",
-            "env_history_length",
-            "env_image_size",
-            "env_packet_interval_control_steps",
-            "env_valid_range_m",
-            "env_scan_fraction_per_packet",
-            "raw_actor_output_clip",
-            "control_decimation",
-            "simulation_dt_s",
-            "control_period_s",
-            "action_joint_names",
-            "action_preserve_order",
-            "action_use_default_offset",
-            "action_default_joint_positions",
-            "action_per_joint_scale",
-            "action_processed_target_clip_rad",
-            "policy_observation_terms",
-        ),
+        expected_keys,
         path,
     )
     encoder = _mapping(contract["encoder"], "$.contract.encoder")
     ray = _mapping(contract["ray_history"], "$.contract.ray_history")
     action = _mapping(contract["action"], "$.contract.action")
+    fusion_mode = _effective_encoder_fusion_mode(
+        encoder,
+        schema_version=schema_version,
+    )
     expected = {
         "encoder_variant": encoder["variant"],
         "history_length": encoder["history_length"],
-        "use_query_attention": encoder["variant"] == "Attention",
+        "use_query_attention": _FUSION_MODE_TO_LEGACY_BOOL[fusion_mode],
         "actor_spatial_size": [16, 96],
         "actor_valid_range_m": {"min": 0.1, "max": 6.0},
         "actor_vertical_fov_degrees": [-52.0, 7.0],
@@ -1257,6 +1404,14 @@ def _validate_training_contract(
             )
         ],
     }
+    if schema_version == RAY_TIME_MANIFEST_SCHEMA_VERSION:
+        # Preserve insertion order only for readability; canonical JSON sorts
+        # keys before hashing.
+        expected = {
+            "encoder_variant": expected.pop("encoder_variant"),
+            "fusion_mode": fusion_mode,
+            **expected,
+        }
     _expect(training, expected, path)
     _expect(
         ray["shape"],
