@@ -15,6 +15,7 @@ from rsl_rl.modules import MLP, EmpiricalNormalization, HiddenState
 from rsl_rl.modules.ame2_encoder import AME2Encoder
 from rsl_rl.modules.distribution import Distribution
 from rsl_rl.modules.elevation_2D_cnn_encoder import Elevation2DCNNEncoder
+from rsl_rl.modules.r2plus1d_elevation_encoder import R2Plus1DElevationEncoder
 from rsl_rl.modules.ray_time_attention_encoder import RayTimeAttentionEncoder
 from rsl_rl.utils import resolve_callable, unpad_trajectories
 
@@ -40,7 +41,7 @@ class PropMLPElevationFusionModel(nn.Module):
         "depthcamera": 1,
         "inverse_depth": 2,
     }
-    _ELEVATION_ENCODER_TYPES = {"cnn", "ame2", "ray_time"}
+    _ELEVATION_ENCODER_TYPES = {"cnn", "ame2", "r2plus1d", "ray_time"}
 
     def __init__(
         self,
@@ -91,6 +92,10 @@ class PropMLPElevationFusionModel(nn.Module):
         ray_time_vertical_fov_degrees: tuple[float, float] = (-52.0, 7.0),
         ray_time_use_query_attention: bool = True,
         ray_time_fusion_mode: str | None = None,
+        r2plus1d_hidden_dims: tuple[int, ...] | list[int] = (16, 24, 44),
+        r2plus1d_spatial_kernel_sizes: tuple[int, ...] | list[int] = (3, 3, 3),
+        r2plus1d_temporal_kernel_sizes: tuple[int, ...] | list[int] = (3, 3, 3),
+        r2plus1d_spatial_strides: tuple[int, ...] | list[int] = (2, 2, 2),
     ) -> None:
         """Initialize the proprio-elevation fusion model.
 
@@ -146,6 +151,15 @@ class PropMLPElevationFusionModel(nn.Module):
             ray_time_fusion_mode: Optional explicit fusion mode. ``None`` preserves
                 ``ray_time_use_query_attention``; supported values are ``"attention"``,
                 ``"global"``, and the non-spatial ``"query_global"`` causal control.
+            r2plus1d_hidden_dims: Output channels of the factorized R(2+1)D
+                blocks. The default is parameter-matched to the default
+                five-frame 2-D CNN elevation encoder.
+            r2plus1d_spatial_kernel_sizes: Spatial kernel sizes of the
+                factorized R(2+1)D blocks.
+            r2plus1d_temporal_kernel_sizes: Temporal kernel sizes of the
+                factorized R(2+1)D blocks.
+            r2plus1d_spatial_strides: Spatial strides of the factorized
+                R(2+1)D blocks; temporal stride remains one.
         """
         super().__init__()
 
@@ -255,6 +269,33 @@ class PropMLPElevationFusionModel(nn.Module):
                 out_dim=vision_feature_dim,
                 vision_spatial_size=vision_spatial_size,
             )
+        elif self.elevation_encoder_type == "r2plus1d":
+            if self.cnn_observation_type != "elevationmap":
+                raise ValueError(
+                    "The R(2+1)D encoder only supports "
+                    "cnn_observation_type='elevationmap', "
+                    f"got '{cnn_observation_type}'."
+                )
+            elevation_shape = obs[elevation_set].shape
+            expected_elevation_shape = (
+                elevation_history_length,
+                *self.vision_spatial_size,
+            )
+            if tuple(elevation_shape[1:]) != expected_elevation_shape:
+                raise ValueError(
+                    "R(2+1)D elevation observation shape mismatch: expected "
+                    f"[B,T,H,W] with [T,H,W]={expected_elevation_shape}, "
+                    f"got {tuple(elevation_shape)}."
+                )
+            self.elevation_encoder = R2Plus1DElevationEncoder(
+                history_length=elevation_history_length,
+                hidden_dims=r2plus1d_hidden_dims,
+                spatial_kernel_sizes=r2plus1d_spatial_kernel_sizes,
+                temporal_kernel_sizes=r2plus1d_temporal_kernel_sizes,
+                spatial_strides=r2plus1d_spatial_strides,
+                out_dim=vision_feature_dim,
+                vision_spatial_size=vision_spatial_size,
+            )
         elif self.elevation_encoder_type == "ame2":
             if self.cnn_observation_type != "elevationmap":
                 raise ValueError(
@@ -350,7 +391,7 @@ class PropMLPElevationFusionModel(nn.Module):
         proprio_features = self.prop_mlp(proprio_obs)
 
         elevation_obs = obs[self.elevation_set]
-        if self.elevation_encoder_type == "cnn":
+        if self.elevation_encoder_type in {"cnn", "r2plus1d"}:
             if self._cnn_use_single_frame:
                 elevation_obs = elevation_obs[:, self._cnn_history_index : self._cnn_history_index + 1]
             elevation_obs = self._normalize_cnn_observation(elevation_obs)
