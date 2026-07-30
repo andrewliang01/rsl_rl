@@ -35,6 +35,14 @@ from .ray_time_deployment_manifest import (
     validate_ray_time_deployment_manifest,
     write_ray_time_deployment_manifest,
 )
+from .ray_time_export_attestation import (
+    RAY_TIME_EXPORT_ATTESTATION_SCHEMA_NAME,
+    RAY_TIME_EXPORT_ATTESTATION_SCHEMA_VERSION,
+    RayTimeExportAttestationError,
+    build_ray_time_export_attestation,
+    capture_ray_time_checkpoint_snapshot,
+    validate_ray_time_export_attestation,
+)
 
 from .utils import (
     check_nan,
@@ -59,8 +67,13 @@ __all__ = [
     "Mid360RayTimeBuilderError",
     "Mid360RayTimeTensorBuilder",
     "RayTimeManifestError",
+    "RayTimeExportAttestationError",
+    "RAY_TIME_EXPORT_ATTESTATION_SCHEMA_NAME",
+    "RAY_TIME_EXPORT_ATTESTATION_SCHEMA_VERSION",
     "StaleMid360PacketError",
     "build_ray_time_deployment_manifest",
+    "build_ray_time_export_attestation",
+    "capture_ray_time_checkpoint_snapshot",
     "canonical_json_bytes",
     "canonical_json_sha256",
     "check_nan",
@@ -80,5 +93,6 @@ __all__ = [
     "split_and_pad_trajectories",
     "unpad_trajectories",
     "validate_ray_time_deployment_manifest",
+    "validate_ray_time_export_attestation",
     "write_ray_time_deployment_manifest",
 ]
