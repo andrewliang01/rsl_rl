@@ -5,6 +5,10 @@
 mask，H2 还缺逐回波采集时间与 rerender 三元组。把这些名称注册成可训练任务会
 产生“参数生效但数据不存在”的伪实验，因此接口采用 fail-closed 设计。
 
+H1 四个角色的唯一合法顺序为 `left_current_support`、
+`left_landing_support`、`right_current_support`、`right_landing_support`。
+旧的 near/far 标签已被不兼容地移除；二者不是同义词，不允许自动迁移。
+
 ## H1 名称
 
 - `h1_full`
@@ -26,12 +30,16 @@ unique-token 总预算；`random` 从与 role 完全相同的候选并集无放�
 时间/历史控制：
 
 - `h2_native_correct_exact_union_k1_per_return_age`
+- `h2_native_correct_raster_latest_event_prototype_per_return_age`
 - `h2_native_correct_history_packet_age`
 - `h2_native_correct_history_age_zero`
 
-`exact_union_k1` 在每个角度栅格选择全历史最近回波；距离相同时选择更早采集的
+`exact_union_k1` 是 coverage oracle，在每个角度栅格选择全历史最近回波；距离相同时选择更早采集的
 回波，range 与 return age 始终来自同一个 winner。`shuffled` 只在同一 packet 的
 有效回波内部打乱时间，并验证每帧时间多重集守恒。
+
+`raster_latest_event_prototype` 只在已按 packet 栅格化的历史上选择最新有效值，
+不得称为 PIES；两者不得混名。
 
 ## 查看冻结配置
 

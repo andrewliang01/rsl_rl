@@ -41,7 +41,13 @@ class PropMLPElevationFusionModel(nn.Module):
         "depthcamera": 1,
         "inverse_depth": 2,
     }
-    _ELEVATION_ENCODER_TYPES = {"cnn", "ame2", "r2plus1d", "ray_time"}
+    _ELEVATION_ENCODER_TYPES = {
+        "cnn",
+        "ame2",
+        "r2plus1d",
+        "ray_time",
+        "ray_event_time",
+    }
 
     def __init__(
         self,
@@ -92,6 +98,10 @@ class PropMLPElevationFusionModel(nn.Module):
         ray_time_vertical_fov_degrees: tuple[float, float] = (-52.0, 7.0),
         ray_time_use_query_attention: bool = True,
         ray_time_fusion_mode: str | None = None,
+        ray_event_time_mode: str | None = None,
+        ray_event_time_source: str = "none",
+        ray_event_time_scale_s: float = 0.5,
+        ray_event_training_ready: bool = False,
         r2plus1d_hidden_dims: tuple[int, ...] | list[int] = (16, 24, 44),
         r2plus1d_spatial_kernel_sizes: tuple[int, ...] | list[int] = (3, 3, 3),
         r2plus1d_temporal_kernel_sizes: tuple[int, ...] | list[int] = (3, 3, 3),
@@ -170,7 +180,7 @@ class PropMLPElevationFusionModel(nn.Module):
                 f"Unsupported elevation_encoder_type '{elevation_encoder_type}'. "
                 f"Expected one of {tuple(sorted(self._ELEVATION_ENCODER_TYPES))}."
             )
-        if self.elevation_encoder_type == "ray_time":
+        if self.elevation_encoder_type in {"ray_time", "ray_event_time"}:
             # These aliases let the dedicated lab-side config use modality
             # names without changing the legacy fusion model/checkpoint API.
             if ray_time_set is not None:
@@ -205,6 +215,30 @@ class PropMLPElevationFusionModel(nn.Module):
         self.prop_feature_dim = prop_feature_dim
         self.elevation_history_length = elevation_history_length
         self.use_prop_encoder = use_prop_encoder
+        self.ray_input_channels = (
+            5 if self.elevation_encoder_type == "ray_event_time" else 2
+        )
+        self.ray_event_training_ready = bool(ray_event_training_ready)
+        if (
+            self.elevation_encoder_type != "ray_event_time"
+            and (
+                ray_event_time_mode is not None
+                or ray_event_time_source != "none"
+                or ray_event_training_ready
+            )
+        ):
+            raise ValueError(
+                "Non-event encoders reject ray-event fields; use "
+                "elevation_encoder_type='ray_event_time'."
+            )
+        if self.elevation_encoder_type == "ray_event_time":
+            if ray_event_time_mode is None:
+                raise ValueError("ray_event_time requires ray_event_time_mode.")
+            if self.ray_event_training_ready:
+                raise ValueError(
+                    "ray_event_training_ready remains false until the formal "
+                    "64-environment smoke receipt is validated."
+                )
         self._cnn_use_single_frame = cnn_history_index is not None
         self._cnn_history_index = 0
         if self._cnn_use_single_frame:
@@ -232,7 +266,11 @@ class PropMLPElevationFusionModel(nn.Module):
             obs_groups,
             obs_set,
             self.elevation_set,
-            expected_perception_ndim=5 if self.elevation_encoder_type == "ray_time" else 4,
+            expected_perception_ndim=(
+                5
+                if self.elevation_encoder_type in {"ray_time", "ray_event_time"}
+                else 4
+            ),
         )
 
         # Observation normalization only applies to proprio inputs.
@@ -333,13 +371,13 @@ class PropMLPElevationFusionModel(nn.Module):
             ray_shape = obs[elevation_set].shape
             expected_ray_shape = (
                 elevation_history_length,
-                2,
+                self.ray_input_channels,
                 *self.vision_spatial_size,
             )
             if tuple(ray_shape[1:]) != expected_ray_shape:
                 raise ValueError(
-                    "Ray-time observation shape mismatch: expected [B, T, 2, H, W] "
-                    f"with [T, 2, H, W]={expected_ray_shape}, got {tuple(ray_shape)}."
+                    "Ray-time observation shape mismatch: expected [B,T,C,H,W] "
+                    f"with [T,C,H,W]={expected_ray_shape}, got {tuple(ray_shape)}."
                 )
             self.elevation_encoder = RayTimeAttentionEncoder(
                 history_length=elevation_history_length,
@@ -355,6 +393,17 @@ class PropMLPElevationFusionModel(nn.Module):
                 vertical_fov_degrees=ray_time_vertical_fov_degrees,
                 use_query_attention=ray_time_use_query_attention,
                 fusion_mode=ray_time_fusion_mode,
+                event_time_mode=(
+                    ray_event_time_mode
+                    if self.elevation_encoder_type == "ray_event_time"
+                    else None
+                ),
+                event_time_source=(
+                    ray_event_time_source
+                    if self.elevation_encoder_type == "ray_event_time"
+                    else "none"
+                ),
+                event_time_scale_s=ray_event_time_scale_s,
             )
 
         # Fusion head.
@@ -445,7 +494,7 @@ class PropMLPElevationFusionModel(nn.Module):
 
     def as_jit(self) -> nn.Module:
         """Return a version of the model compatible with Torch JIT export."""
-        if self.elevation_encoder_type == "ray_time":
+        if self.elevation_encoder_type in {"ray_time", "ray_event_time"}:
             return _TorchRayTimePropMLPElevationFusionModel(self)
         if self.elevation_encoder_type == "ame2":
             return _TorchAME2PropMLPElevationFusionModel(self)
@@ -453,7 +502,7 @@ class PropMLPElevationFusionModel(nn.Module):
 
     def as_onnx(self, verbose: bool, input_mode: str = "split") -> nn.Module:
         """Return a version of the model compatible with ONNX export."""
-        if self.elevation_encoder_type == "ray_time":
+        if self.elevation_encoder_type in {"ray_time", "ray_event_time"}:
             return _OnnxRayTimePropMLPElevationFusionModel(self, verbose, input_mode)
         if self.elevation_encoder_type == "ame2":
             return _OnnxAME2PropMLPElevationFusionModel(self, verbose, input_mode)
@@ -489,7 +538,7 @@ class PropMLPElevationFusionModel(nn.Module):
 
         if len(obs[elevation_set].shape) != expected_perception_ndim:
             expected_layout = (
-                "[B, T, 2, H, W]"
+                "[B, T, C, H, W]"
                 if expected_perception_ndim == 5
                 else "[B, T, H, W]"
             )
@@ -854,7 +903,8 @@ class _OnnxRayTimePropMLPElevationFusionModel(nn.Module):
 
     ONNX inputs are ``float32``. In ``single`` mode the exact feature layout is
     ``[proprio, ray_history.flatten()]``, where ``ray_history`` has logical
-    shape ``[K, 2, H, W]`` in row-major order.
+    shape ``[K, C, H, W]`` in row-major order. Legacy Ray-Time uses ``C=2``;
+    the explicit Ray-Event contract uses ``C=5``.
     """
 
     is_recurrent: bool = False
@@ -875,11 +925,12 @@ class _OnnxRayTimePropMLPElevationFusionModel(nn.Module):
             self.deterministic_output = nn.Identity()
         self.proprio_input_size = model.obs_dim
         self.ray_history_length = model.elevation_history_length
+        self.ray_input_channels = model.ray_input_channels
         self.vision_spatial_size = model.vision_spatial_size
         self.single_input_size = (
             self.proprio_input_size
             + self.ray_history_length
-            * 2
+            * self.ray_input_channels
             * self.vision_spatial_size[0]
             * self.vision_spatial_size[1]
         )
@@ -895,11 +946,11 @@ class _OnnxRayTimePropMLPElevationFusionModel(nn.Module):
                 raise ValueError(
                     "Single-input Ray-Time observations must have shape "
                     f"[B, {self.single_input_size}] with layout "
-                    "[proprio, flatten(K, 2, H, W)]."
+                    "[proprio, flatten(K, C, H, W)]."
                 )
             ray_size = (
                 self.ray_history_length
-                * 2
+                * self.ray_input_channels
                 * self.vision_spatial_size[0]
                 * self.vision_spatial_size[1]
             )
@@ -910,7 +961,7 @@ class _OnnxRayTimePropMLPElevationFusionModel(nn.Module):
                     1,
                     (
                         self.ray_history_length,
-                        2,
+                        self.ray_input_channels,
                         self.vision_spatial_size[0],
                         self.vision_spatial_size[1],
                     ),
@@ -919,7 +970,7 @@ class _OnnxRayTimePropMLPElevationFusionModel(nn.Module):
                 ray_history = ray_history.reshape(
                     -1,
                     self.ray_history_length,
-                    2,
+                    self.ray_input_channels,
                     self.vision_spatial_size[0],
                     self.vision_spatial_size[1],
                 )
@@ -941,7 +992,7 @@ class _OnnxRayTimePropMLPElevationFusionModel(nn.Module):
             torch.zeros(
                 1,
                 self.ray_history_length,
-                2,
+                self.ray_input_channels,
                 *self.vision_spatial_size,
             ),
         )

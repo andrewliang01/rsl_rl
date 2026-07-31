@@ -20,6 +20,7 @@ from typing import Final
 
 
 H1_BUDGETS: Final[tuple[int, ...]] = (8, 16, 32, 64)
+H1_ROLE_SEMANTICS: Final[str] = "cteq_current_landing_v2"
 H1_SELECTORS: Final[tuple[str, ...]] = (
     "full",
     "glad_top_m",
@@ -36,6 +37,7 @@ H2_TEMPORAL_BASELINES: Final[tuple[str, ...]] = (
 H2_HISTORY_REDUCTIONS: Final[tuple[str, ...]] = (
     "history",
     "exact_union_k1",
+    "raster_latest_event_prototype",
 )
 H1_METRIC_KEYS: Final[tuple[str, ...]] = (
     "h1/requested_unique_budget",
@@ -120,7 +122,7 @@ class H1AblationSpec:
         result = asdict(self)
         result["reserved_overrides"] = self.reserved_overrides
         result["blocking_inputs"] = (
-            "calibrated left/right near/far role masks",
+            "calibrated left/right current-support/landing-support role masks",
             "actor token scorer/value adapter with no full-token bypass",
         )
         return result
@@ -168,11 +170,13 @@ class H2AblationSpec:
     def reserved_overrides(self) -> tuple[str, ...]:
         """Return stable future Hydra keys; these are not active today."""
         values = (
-            "actor.ray_event_time_enabled=true",
-            f"actor.ray_event_geometry={self.geometry}",
-            f"actor.ray_event_time_association={self.time_association}",
-            f"actor.ray_event_temporal_baseline={self.temporal_baseline}",
-            f"actor.ray_event_history_reduction={self.history_reduction}",
+            "actor.elevation_encoder_type=ray_event_time",
+            "actor.ray_event_training_ready=false",
+            "actor.ray_event_time_source=livox_per_return",
+            f"actor.ray_event_time_mode={self.temporal_baseline}",
+            f"observation.ray_event_geometry={self.geometry}",
+            f"observation.ray_event_time_association={self.time_association}",
+            f"observation.ray_event_history_reduction={self.history_reduction}",
         )
         if self.shuffle_seed is not None:
             values += (f"actor.ray_event_shuffle_seed={self.shuffle_seed}",)
@@ -182,8 +186,8 @@ class H2AblationSpec:
         result = asdict(self)
         result["reserved_overrides"] = self.reserved_overrides
         blockers = [
-            "range/valid/per-return-age tensors from one winning return",
-            "actor-side RayReturnEventTimeEncoder adapter",
+            "formal 64-environment smoke receipt for this exact contract",
+            "training-ready promotion bound to the smoke SHA-256",
         ]
         if self.geometry == "rerender":
             blockers.append("externally rerendered range/valid/age tensor receipt")
@@ -236,6 +240,7 @@ def build_h2_protocol(*, shuffle_seed: int = 42) -> dict[str, H2AblationSpec]:
 
     for history_reduction, baseline in (
         ("exact_union_k1", "per_return_age"),
+        ("raster_latest_event_prototype", "per_return_age"),
         ("history", "packet_age"),
         ("history", "age_zero"),
     ):
@@ -256,7 +261,23 @@ def perception_ablation_receipt() -> dict[str, object]:
     h1 = build_h1_protocol()
     h2 = build_h2_protocol()
     return {
-        "schema": "g1_perception_ablation_protocol_v1",
+        "schema": "g1_perception_ablation_protocol_v2",
+        "h1_role_semantics": H1_ROLE_SEMANTICS,
+        "incompatible_role_migration": {
+            "rejected_legacy_order": (
+                "left_near",
+                "left_far",
+                "right_near",
+                "right_far",
+            ),
+            "required_order": (
+                "left_current_support",
+                "left_landing_support",
+                "right_current_support",
+                "right_landing_support",
+            ),
+            "automatic_aliasing": False,
+        },
         "training_task_registration": "intentionally_deferred",
         "metric_keys": {
             "h1": H1_METRIC_KEYS,
@@ -273,6 +294,7 @@ __all__ = [
     "H1_BUDGETS",
     "H1_SELECTORS",
     "H1_METRIC_KEYS",
+    "H1_ROLE_SEMANTICS",
     "H2AblationSpec",
     "H2_ASSOCIATIONS",
     "H2_GEOMETRIES",

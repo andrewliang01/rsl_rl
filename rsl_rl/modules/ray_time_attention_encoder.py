@@ -11,6 +11,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .ray_return_event_time import RayReturnEventTimeEncoder
+
 
 def _group_count(num_channels: int, maximum: int = 8) -> int:
     """Return the largest small GroupNorm group count that divides the channels."""
@@ -114,6 +116,9 @@ class RayTimeAttentionEncoder(nn.Module):
         vertical_fov_degrees: tuple[float, float] = (-52.0, 7.0),
         use_query_attention: bool = True,
         fusion_mode: str | None = None,
+        event_time_mode: str | None = None,
+        event_time_source: str = "none",
+        event_time_scale_s: float = 0.5,
     ) -> None:
         super().__init__()
 
@@ -160,6 +165,71 @@ class RayTimeAttentionEncoder(nn.Module):
         self.head_dim = self.token_dim // self.num_heads
         self.min_range = float(min_range)
         self.max_range = float(max_range)
+        self.event_time_mode = (
+            None
+            if event_time_mode is None
+            else event_time_mode.lower().replace("-", "_")
+        )
+        self.event_time_source = event_time_source.lower().replace("-", "_")
+        if self.event_time_mode not in (
+            None,
+            "packet_age",
+            "per_return_age",
+            "quantized_event_age",
+            "age_zero",
+        ):
+            raise ValueError(
+                "event_time_mode must be None, packet_age, per_return_age, "
+                "quantized_event_age, or age_zero, got "
+                f"{event_time_mode!r}."
+            )
+        if self.event_time_source not in (
+            "none",
+            "raycaster_packet",
+            "raycaster_quantized_event",
+            "livox_per_return",
+        ):
+            raise ValueError(
+                "event_time_source must be none, raycaster_packet, "
+                "raycaster_quantized_event, or livox_per_return, got "
+                f"{event_time_source!r}."
+            )
+        if self.event_time_mode is None:
+            if self.event_time_source != "none":
+                raise ValueError(
+                    "event_time_source must be 'none' when event time is disabled."
+                )
+            self.input_channels = 2
+        else:
+            if self.event_time_source == "none":
+                raise ValueError(
+                    "Enabled event time requires an explicit authenticated source."
+                )
+            if (
+                self.event_time_mode == "per_return_age"
+                and self.event_time_source != "livox_per_return"
+            ):
+                raise ValueError(
+                    "per_return_age requires source='livox_per_return'; "
+                    "RayCaster exposes packet-level acquisition only."
+                )
+            if (
+                self.event_time_mode == "quantized_event_age"
+                and self.event_time_source != "raycaster_quantized_event"
+            ):
+                raise ValueError(
+                    "quantized_event_age requires source="
+                    "'raycaster_quantized_event'."
+                )
+            if (
+                self.event_time_source == "raycaster_quantized_event"
+                and self.event_time_mode != "quantized_event_age"
+            ):
+                raise ValueError(
+                    "raycaster_quantized_event is valid only for the "
+                    "explicit quantized_event_age mode."
+                )
+            self.input_channels = 5
         resolved_fusion_mode = (
             "attention" if use_query_attention else "global"
         ) if fusion_mode is None else fusion_mode.lower().replace("-", "_")
@@ -187,6 +257,25 @@ class RayTimeAttentionEncoder(nn.Module):
         self.token_spatial_size = tuple(int(value) for value in encoded_dummy.shape[-2:])
         self.num_spatial_tokens = self.token_spatial_size[0] * self.token_spatial_size[1]
         self.num_tokens = self.history_length * self.num_spatial_tokens
+        if self.event_time_mode is None:
+            self.event_time_encoder: RayReturnEventTimeEncoder | None = None
+        else:
+            encoder_mode = (
+                "per_return_age"
+                if self.event_time_mode in (
+                    "per_return_age",
+                    "quantized_event_age",
+                )
+                else "packet_age"
+            )
+            self.event_time_encoder = RayReturnEventTimeEncoder(
+                history_length=self.history_length,
+                input_spatial_size=self.vision_spatial_size,
+                token_spatial_size=self.token_spatial_size,
+                token_dim=self.token_dim,
+                mode=encoder_mode,
+                age_time_scale_s=event_time_scale_s,
+            )
         if (
             self.vision_spatial_size[0] % self.token_spatial_size[0] == 0
             and self.vision_spatial_size[1] % self.token_spatial_size[1] == 0
@@ -273,7 +362,11 @@ class RayTimeAttentionEncoder(nn.Module):
         proprio_features: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return embedding, cross-attention weights, and valid-token mask."""
-        if not torch.jit.is_scripting() and not torch.jit.is_tracing():
+        if (
+            not torch.jit.is_scripting()
+            and not torch.jit.is_tracing()
+            and not torch.compiler.is_compiling()
+        ):
             self._validate_inputs(ray_history, proprio_features)
 
         # Rollout storage may keep the observation in fp16. Run the compact
@@ -299,6 +392,27 @@ class RayTimeAttentionEncoder(nn.Module):
         tokens = tokens + self.time_encoding.view(
             1, self.history_length, 1, self.token_dim
         )
+        if self.event_time_encoder is not None:
+            return_valid = hit_mask > 0.5
+            packet_age_s = ray_history[:, :, 3, 0, 0]
+            frame_valid = ray_history[:, :, 4, 0, 0] > 0.5
+            if self.event_time_mode == "age_zero":
+                packet_age_s = torch.zeros_like(packet_age_s)
+                return_age_s: torch.Tensor | None = None
+            elif self.event_time_mode in (
+                "per_return_age",
+                "quantized_event_age",
+            ):
+                return_age_s = ray_history[:, :, 2]
+            else:
+                return_age_s = None
+            event_time_encoding = self.event_time_encoder(
+                return_valid,
+                packet_age_s,
+                frame_valid,
+                return_age_s,
+            )
+            tokens = tokens + event_time_encoding
 
         temporal_tokens = tokens.permute(0, 2, 3, 1).reshape(
             batch_size * self.num_spatial_tokens,
@@ -583,14 +697,15 @@ class RayTimeAttentionEncoder(nn.Module):
     ) -> None:
         expected_shape = (
             self.history_length,
-            2,
+            self.input_channels,
             self.vision_spatial_size[0],
             self.vision_spatial_size[1],
         )
         if ray_history.ndim != 5 or tuple(ray_history.shape[1:]) != expected_shape:
             raise ValueError(
-                "ray_history must have shape [B, T, 2, H, W] with "
-                f"[T, 2, H, W]={expected_shape}, got {tuple(ray_history.shape)}."
+                "ray_history has the wrong event-time observation shape: "
+                f"expected [B,T,C,H,W] with [T,C,H,W]={expected_shape}, "
+                f"got {tuple(ray_history.shape)}."
             )
         if (
             proprio_features.ndim != 2
@@ -612,3 +727,38 @@ class RayTimeAttentionEncoder(nn.Module):
             )
         if not ray_history.is_floating_point() or not proprio_features.is_floating_point():
             raise ValueError("ray_history and proprio_features must be floating-point tensors.")
+        if self.input_channels == 5:
+            return_age = ray_history[:, :, 2]
+            packet_age_map = ray_history[:, :, 3]
+            frame_valid_map = ray_history[:, :, 4]
+            packet_age = packet_age_map[:, :, :1, :1]
+            frame_valid = frame_valid_map[:, :, :1, :1]
+            if not bool((packet_age_map == packet_age).all()):
+                raise ValueError("Packet-age channel must be spatially constant per frame.")
+            if not bool((frame_valid_map == frame_valid).all()):
+                raise ValueError("Frame-valid channel must be spatially constant per frame.")
+            if not bool(((frame_valid == 0.0) | (frame_valid == 1.0)).all()):
+                raise ValueError("Frame-valid channel must be exactly binary.")
+            if not bool(torch.isfinite(packet_age).all()) or bool((packet_age < 0).any()):
+                raise ValueError("Packet age must be finite and non-negative.")
+            requested_hit = ray_history[:, :, 1] > 0.5
+            if bool((~requested_hit & (return_age != 0.0)).any()):
+                raise ValueError("Invalid returns must carry exactly zero return age.")
+            if self.event_time_mode in (
+                "per_return_age",
+                "quantized_event_age",
+            ):
+                if not bool(torch.isfinite(return_age).all()):
+                    raise ValueError("Per-return age must be finite.")
+                if bool(
+                    (
+                        requested_hit
+                        & (return_age + 1.0e-7 < packet_age)
+                    ).any()
+                ):
+                    raise ValueError("Per-return age must be >= packet age.")
+            elif bool((return_age != 0.0).any()):
+                raise ValueError(
+                    "Packet-age and age-zero observations must keep the "
+                    "per-return-age channel exactly zero."
+                )

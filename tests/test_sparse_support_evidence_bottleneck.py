@@ -1433,10 +1433,10 @@ def test_delete_random_requires_exactly_one_explicit_rng_source() -> None:
 def test_construction_and_mode_contracts() -> None:
     model = _model()
     assert model.query_names == (
-        "left_near",
-        "left_far",
-        "right_near",
-        "right_far",
+        "left_current_support",
+        "left_landing_support",
+        "right_current_support",
+        "right_landing_support",
     )
     assert QUERY_NAMES == model.query_names
     assert model.per_query_quota == 2

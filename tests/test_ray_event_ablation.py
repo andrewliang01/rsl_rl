@@ -101,6 +101,39 @@ def test_exact_union_k1_keeps_range_and_age_from_same_winner():
     assert output.packet_age_s.item() == pytest.approx(0.05)
 
 
+def test_raster_latest_prototype_is_distinct_from_nearest_range_oracle():
+    range_m = torch.tensor([[[[1.0]], [[3.0]], [[2.0]]]])
+    valid = torch.ones_like(range_m, dtype=torch.bool)
+    age = torch.tensor([[[[0.30]], [[0.10]], [[0.20]]]])
+    packet_age = torch.tensor([[0.25, 0.05, 0.15]])
+    frame_valid = torch.ones(1, 3, dtype=torch.bool)
+    nearest = RayEventAblationRouter(
+        history_reduction="exact_union_k1"
+    )(range_m, valid, age, packet_age, frame_valid)
+    latest = RayEventAblationRouter(
+        history_reduction="raster_latest_event_prototype"
+    )(range_m, valid, age, packet_age, frame_valid)
+    assert nearest.range_m.item() == pytest.approx(1.0)
+    assert nearest.return_age_s.item() == pytest.approx(0.30)
+    assert latest.range_m.item() == pytest.approx(3.0)
+    assert latest.return_age_s.item() == pytest.approx(0.10)
+    assert latest.diagnostics["history_reduction_winner_frame_index"].item() == 1
+
+
+def test_raster_latest_prototype_excludes_returns_older_than_half_second():
+    range_m = torch.tensor([[[[4.0]], [[2.0]]]])
+    valid = torch.ones_like(range_m, dtype=torch.bool)
+    age = torch.tensor([[[[0.60]], [[0.50]]]])
+    packet_age = torch.tensor([[0.55, 0.45]])
+    frame_valid = torch.ones(1, 2, dtype=torch.bool)
+    latest = RayEventAblationRouter(
+        history_reduction="raster_latest_event_prototype"
+    )(range_m, valid, age, packet_age, frame_valid)
+    assert latest.return_valid.item()
+    assert latest.range_m.item() == pytest.approx(2.0)
+    assert latest.return_age_s.item() == pytest.approx(0.50)
+
+
 def test_packet_age_and_age_zero_controls():
     inputs = _batch()
     packet = RayEventAblationRouter(temporal_baseline="packet_age")(*inputs)

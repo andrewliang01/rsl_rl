@@ -61,7 +61,8 @@ class FixedBudgetSupportSelector(nn.Module):
     """Choose a full or shared-total-M support-token set.
 
     Inputs use ``Q=4`` in the fixed order
-    ``left_near, left_far, right_near, right_far``.  ``scores`` must already
+    ``left_current_support, left_landing_support, right_current_support,
+    right_landing_support``.  ``scores`` must already
     be conditioned on the policy state; the selector adds no trainable
     parameters and therefore keeps the scorer/backbone common across arms.
     """

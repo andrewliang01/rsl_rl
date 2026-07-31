@@ -26,12 +26,16 @@ def test_h1_protocol_has_full_and_all_budgeted_selected_only_arms():
 
 def test_h2_protocol_has_causal_2x2_exact_union_and_age_controls():
     specs = build_h2_protocol(shuffle_seed=23)
-    assert len(specs) == 7
+    assert len(specs) == 8
     for geometry in ("native", "rerender"):
         for association in ("correct", "shuffled"):
             name = f"h2_{geometry}_{association}_history_per_return_age"
             assert name in specs
     assert "h2_native_correct_exact_union_k1_per_return_age" in specs
+    assert (
+        "h2_native_correct_raster_latest_event_prototype_per_return_age"
+        in specs
+    )
     assert "h2_native_correct_history_packet_age" in specs
     assert "h2_native_correct_history_age_zero" in specs
 
@@ -39,7 +43,9 @@ def test_h2_protocol_has_causal_2x2_exact_union_and_age_controls():
 def test_protocol_receipt_does_not_claim_registered_training_tasks():
     receipt = perception_ablation_receipt()
     assert receipt["training_task_registration"] == "intentionally_deferred"
-    assert receipt["schema"] == "g1_perception_ablation_protocol_v1"
+    assert receipt["schema"] == "g1_perception_ablation_protocol_v2"
+    assert receipt["h1_role_semantics"] == "cteq_current_landing_v2"
+    assert receipt["incompatible_role_migration"]["automatic_aliasing"] is False
     assert "causal/action_kl_clean_vs_intervention" in receipt["metric_keys"]["paired_causal"]
     assert all(not row["training_ready"] for row in receipt["h1"].values())
     assert all(not row["training_ready"] for row in receipt["h2"].values())

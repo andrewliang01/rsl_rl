@@ -36,7 +36,9 @@ SUPPORTED_TEMPORAL_BASELINES: Final[tuple[str, ...]] = (
 SUPPORTED_HISTORY_REDUCTIONS: Final[tuple[str, ...]] = (
     "history",
     "exact_union_k1",
+    "raster_latest_event_prototype",
 )
+LATEST_EVENT_WINDOW_S: Final[float] = 0.5
 
 
 @dataclass(frozen=True)
@@ -197,7 +199,12 @@ class RayEventAblationRouter(nn.Module):
         ).sum(dim=(-2, -1))
 
         original_history_length = range_m.shape[1]
-        collision_count = (return_valid.sum(dim=1) > 1).sum(
+        collision_valid = return_valid
+        if self.history_reduction == "raster_latest_event_prototype":
+            collision_valid = collision_valid & (
+                return_age_s <= LATEST_EVENT_WINDOW_S
+            )
+        collision_count = (collision_valid.sum(dim=1) > 1).sum(
             dim=(-2, -1)
         )
         winner_frame_index = torch.full(
@@ -215,6 +222,20 @@ class RayEventAblationRouter(nn.Module):
                 frame_valid,
                 winner_frame_index,
             ) = self._exact_union_k1(
+                range_m,
+                return_valid,
+                return_age_s,
+                frame_valid,
+            )
+        elif self.history_reduction == "raster_latest_event_prototype":
+            (
+                range_m,
+                return_valid,
+                return_age_s,
+                packet_age_s,
+                frame_valid,
+                winner_frame_index,
+            ) = self._raster_latest_event_prototype(
                 range_m,
                 return_valid,
                 return_age_s,
@@ -269,6 +290,7 @@ class RayEventAblationRouter(nn.Module):
             "changed_age_association_count": changed_age_association_count,
             "exact_union_collision_cell_count": collision_count,
             "exact_union_winner_frame_index": winner_frame_index,
+            "history_reduction_winner_frame_index": winner_frame_index,
             "shuffle_seed": torch.full(
                 (range_m.shape[0],),
                 -1 if self.shuffle_seed is None else self.shuffle_seed,
@@ -283,6 +305,94 @@ class RayEventAblationRouter(nn.Module):
             packet_age_s=packet_age_s,
             frame_valid=frame_valid,
             diagnostics=diagnostics,
+        )
+
+    @staticmethod
+    def _raster_latest_event_prototype(
+        range_m: torch.Tensor,
+        return_valid: torch.Tensor,
+        return_age_s: torch.Tensor,
+        frame_valid: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Build a raster latest-event prototype from the newest cell event.
+
+        Inputs are already packet-rasterized, so this operation is invariant
+        to empty-frame padding but not yet proven invariant to arbitrary raw
+        event repartitioning when multiple returns collide in one packet cell.
+        It must not be named PIES or promoted to training.
+        """
+        return_valid = return_valid & (return_age_s <= LATEST_EVENT_WINDOW_S)
+        masked_age = torch.where(
+            return_valid,
+            return_age_s,
+            torch.full_like(return_age_s, torch.inf),
+        )
+        newest_age = masked_age.amin(dim=1)
+        union_valid = return_valid.any(dim=1)
+        age_ties = return_valid & (masked_age == newest_age[:, None])
+        tie_range = torch.where(
+            age_ties,
+            range_m,
+            torch.full_like(range_m, torch.inf),
+        )
+        nearest_tied_range = tie_range.amin(dim=1)
+        winner_candidates = age_ties & (
+            range_m == nearest_tied_range[:, None]
+        )
+        history_index = torch.arange(
+            range_m.shape[1], device=range_m.device
+        )[None, :, None, None]
+        winner_index = torch.where(
+            winner_candidates,
+            history_index,
+            torch.full_like(history_index, range_m.shape[1]),
+        ).amin(dim=1)
+        safe_index = winner_index.clamp(min=0, max=range_m.shape[1] - 1)
+        union_range = torch.gather(
+            range_m,
+            1,
+            safe_index[:, None],
+        ).squeeze(1)
+        union_range = torch.where(
+            union_valid, union_range, torch.zeros_like(union_range)
+        )
+        union_age = torch.where(
+            union_valid, newest_age, torch.zeros_like(newest_age)
+        )
+        winner_index = torch.where(
+            union_valid,
+            winner_index,
+            torch.full_like(winner_index, -1),
+        )
+        union_valid = union_valid[:, None]
+        union_age = union_age[:, None]
+        union_range = union_range[:, None]
+        flat_valid = union_valid.flatten(start_dim=2)
+        flat_age = union_age.flatten(start_dim=2)
+        packet_age_floor = torch.where(
+            flat_valid,
+            flat_age,
+            torch.full_like(flat_age, torch.inf),
+        ).amin(dim=-1)
+        packet_age_floor = torch.where(
+            flat_valid.any(dim=-1),
+            packet_age_floor,
+            torch.zeros_like(packet_age_floor),
+        )
+        return (
+            union_range,
+            union_valid,
+            union_age,
+            packet_age_floor,
+            frame_valid.any(dim=1, keepdim=True),
+            winner_index,
         )
 
     @staticmethod

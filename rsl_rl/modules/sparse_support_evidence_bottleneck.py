@@ -10,10 +10,11 @@ wired into an actor, simulator, or training configuration.
 
 The caller supplies four semantic eligibility masks in this fixed order:
 
-``left_near, left_far, right_near, right_far``.
+``left_current_support, left_landing_support, right_current_support,
+right_landing_support``.
 
 Keeping the geometry mask outside this module avoids inventing camera or LiDAR
-calibration, near/far thresholds, or body-frame conventions.  A real
+calibration, support-phase boundaries, or body-frame conventions.  A real
 integration must construct those masks from calibrated ray/token geometry.
 
 For integer total budgets ``M_total in {4, 8, 16, 32, 64}``, every query receives
@@ -61,10 +62,10 @@ import torch.nn as nn
 
 
 QUERY_NAMES: Final[tuple[str, ...]] = (
-    "left_near",
-    "left_far",
-    "right_near",
-    "right_far",
+    "left_current_support",
+    "left_landing_support",
+    "right_current_support",
+    "right_landing_support",
 )
 NUM_QUERIES: Final[int] = len(QUERY_NAMES)
 SUPPORTED_TOTAL_BUDGETS: Final[tuple[int, ...]] = (4, 8, 16, 32, 64)
