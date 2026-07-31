@@ -348,6 +348,12 @@ class MultimodalRayEvidenceEncoder(nn.Module):
     a claim that learned token content is spatially independent, because the
     convolutional stems currently use frame-level GroupNorm.
 
+    A missing modality contributes exactly zero evidence and zero gate mass.
+    If every modality admitted by the selected mode is missing, the encoder
+    returns an exact zero terrain embedding plus ``terrain_available=False`` in
+    diagnostics.  The enclosing policy is expected to retain a separate
+    proprioceptive stability path.
+
     Args:
         proprio_dim: Width of the deployable proprioceptive input.
         lidar_max_range: Finite positive LiDAR range represented by normalized
@@ -632,24 +638,6 @@ class MultimodalRayEvidenceEncoder(nn.Module):
         lidar_available = lidar_encoded["token_observed"].any(dim=1)
         depth_available = depth_encoded["token_observed"].any(dim=1)
         both_missing = ~lidar_available & ~depth_available
-        if bool(both_missing.any()):
-            indices = both_missing.nonzero(as_tuple=False).flatten().tolist()
-            raise ValueError(
-                "Every batch element must contain observed evidence from at least "
-                f"one modality; both modalities are empty for batch indices {indices}."
-            )
-        if resolved_mode == "lidar_only" and bool((~lidar_available).any()):
-            indices = (~lidar_available).nonzero(as_tuple=False).flatten().tolist()
-            raise ValueError(
-                "lidar_only mode requires LiDAR evidence for every batch element; "
-                f"missing at indices {indices}."
-            )
-        if resolved_mode == "depth_only" and bool((~depth_available).any()):
-            indices = (~depth_available).nonzero(as_tuple=False).flatten().tolist()
-            raise ValueError(
-                "depth_only mode requires depth evidence for every batch element; "
-                f"missing at indices {indices}."
-            )
 
         queries = self.state_query_projection(proprio).reshape(
             proprio.shape[0],
@@ -730,7 +718,7 @@ class MultimodalRayEvidenceEncoder(nn.Module):
                 dtype=queries.dtype,
                 device=queries.device,
             )
-            gates[..., 0] = 1.0
+            gates[..., 0] = lidar_available.to(queries.dtype).unsqueeze(-1)
             fused_queries = lidar_evidence
         else:
             gates = torch.zeros(
@@ -740,12 +728,23 @@ class MultimodalRayEvidenceEncoder(nn.Module):
                 dtype=queries.dtype,
                 device=queries.device,
             )
-            gates[..., 1] = 1.0
+            gates[..., 1] = depth_available.to(queries.dtype).unsqueeze(-1)
             fused_queries = depth_evidence
 
+        if resolved_mode == "lidar_only":
+            terrain_available = lidar_available
+        elif resolved_mode == "depth_only":
+            terrain_available = depth_available
+        else:
+            terrain_available = lidar_available | depth_available
         embedding = self.output_norm(
             self.output_projection(fused_queries.flatten(start_dim=1))
         )
+        # Sensor blackout is an expected deployment state, not an exception.
+        # Return an exact zero terrain feature so the enclosing actor can fall
+        # back to its separate proprioceptive stability branch without
+        # hallucinating evidence from projection biases.
+        embedding = embedding * terrain_available.to(embedding.dtype).unsqueeze(-1)
         diagnostics = {
             "query_gates": gates,
             "lidar_attention": lidar_attention,
@@ -776,6 +775,8 @@ class MultimodalRayEvidenceEncoder(nn.Module):
             "depth_query_quality": depth_query_quality,
             "lidar_available": lidar_available,
             "depth_available": depth_available,
+            "both_modalities_missing": both_missing,
+            "terrain_available": terrain_available,
         }
         return embedding, diagnostics
 
@@ -1078,7 +1079,7 @@ class MultimodalRayEvidenceEncoder(nn.Module):
 
     def _fixed_availability_gates(self, availability: torch.Tensor) -> torch.Tensor:
         weights = availability.to(self.query_bias.dtype)
-        weights = weights / weights.sum(dim=-1, keepdim=True)
+        weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1.0)
         return weights[:, None, :].expand(-1, self.num_queries, -1)
 
     @staticmethod

@@ -128,6 +128,8 @@ def test_modes_return_fixed_embedding_and_complete_diagnostics(mode: str) -> Non
     assert diagnostics["depth_token_quality"].shape[-1] == 4
     assert diagnostics["lidar_available"].dtype == torch.bool
     assert diagnostics["depth_available"].dtype == torch.bool
+    assert diagnostics["terrain_available"].all()
+    assert not diagnostics["both_modalities_missing"].any()
     assert torch.isfinite(diagnostics["lidar_attention"]).all()
     assert torch.isfinite(diagnostics["depth_attention"]).all()
 
@@ -595,12 +597,16 @@ def test_observed_no_return_is_not_treated_as_modality_blackout() -> None:
     assert diagnostics["lidar_token_observed"].all()
 
 
-def test_both_modalities_empty_fails_closed() -> None:
-    encoder = _encoder()
+@pytest.mark.parametrize(
+    "mode",
+    ("reliability", "concat", "lidar_only", "depth_only", "no_reliability"),
+)
+def test_both_modalities_empty_returns_explicit_zero_terrain(mode: str) -> None:
+    encoder = _encoder(mode).eval()
     lidar, depth, lidar_ages, depth_ages, proprio = _inputs()
 
-    with pytest.raises(ValueError, match="both modalities are empty"):
-        encoder(
+    with torch.inference_mode():
+        output, diagnostics = encoder.forward_with_diagnostics(
             _blackout(lidar),
             _blackout(depth),
             lidar_ages,
@@ -608,28 +614,45 @@ def test_both_modalities_empty_fails_closed() -> None:
             proprio,
         )
 
+    assert torch.count_nonzero(output) == 0
+    assert torch.count_nonzero(diagnostics["query_gates"]) == 0
+    assert torch.count_nonzero(diagnostics["lidar_attention"]) == 0
+    assert torch.count_nonzero(diagnostics["depth_attention"]) == 0
+    assert diagnostics["both_modalities_missing"].all()
+    assert not diagnostics["terrain_available"].any()
+
 
 @pytest.mark.parametrize(
-    ("mode", "missing_sensor", "match"),
+    ("mode", "missing_sensor"),
     (
-        ("lidar_only", "lidar", "requires LiDAR evidence"),
-        ("depth_only", "depth", "requires depth evidence"),
+        ("lidar_only", "lidar"),
+        ("depth_only", "depth"),
     ),
 )
-def test_single_sensor_modes_reject_missing_required_evidence(
+def test_single_sensor_modes_return_zero_when_selected_sensor_is_missing(
     mode: str,
     missing_sensor: str,
-    match: str,
 ) -> None:
-    encoder = _encoder(mode)
+    encoder = _encoder(mode).eval()
     lidar, depth, lidar_ages, depth_ages, proprio = _inputs()
     if missing_sensor == "lidar":
         lidar = _blackout(lidar)
     else:
         depth = _blackout(depth)
 
-    with pytest.raises(ValueError, match=match):
-        encoder(lidar, depth, lidar_ages, depth_ages, proprio)
+    with torch.inference_mode():
+        output, diagnostics = encoder.forward_with_diagnostics(
+            lidar,
+            depth,
+            lidar_ages,
+            depth_ages,
+            proprio,
+        )
+
+    assert torch.count_nonzero(output) == 0
+    assert torch.count_nonzero(diagnostics["query_gates"]) == 0
+    assert not diagnostics["terrain_available"].any()
+    assert not diagnostics["both_modalities_missing"].any()
 
 
 SemanticMutator = Callable[
