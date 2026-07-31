@@ -15,6 +15,13 @@ Ray-time schemas v1/v2 preserve only successful returns.  A zero hit mask means
 ``unknown``: it intentionally does not distinguish an unscanned direction, a
 no-return, a filtered point, or a lost packet.  In particular, the synthetic
 20-percent phase mask used during simulation is never applied to real points.
+
+The legacy ``[range, hit]`` interface remains available.  H2 event-time users
+must opt into an explicit monotonic-clock domain and consume
+:class:`Mid360AlignedRayTimeHistory`.  That stricter interface keeps each
+range, validity bit, and acquisition timestamp attached to one deterministic
+winning point return through spherical binning, width flip/roll, and history
+shifts.  It never invents timestamps for no-return or capture-window-only data.
 """
 
 from __future__ import annotations
@@ -47,6 +54,12 @@ MID360_TIMESTAMP_ADAPTER_ABSOLUTE_POINTS = (
 MID360_TIMESTAMP_CAPTURE_WINDOW_ONLY = (
     "adapter_declared_capture_window_without_verified_point_times"
 )
+MID360_CAPTURE_END_ACQUISITION_WINDOW = (
+    "adapter_declared_policy_acquisition_window_end"
+)
+MID360_CAPTURE_END_LATEST_RETURN_LEGACY = (
+    "legacy_helper_inferred_latest_successful_return_time"
+)
 _MID360_TIMESTAMP_SEMANTICS = (
     MID360_TIMESTAMP_LIVOX_CUSTOM_MSG,
     MID360_TIMESTAMP_ADAPTER_ABSOLUTE_POINTS,
@@ -74,7 +87,11 @@ class Mid360PointPacket:
     ``window_index`` is a deployment-owned, monotonically increasing policy
     packet index, not an assumed Livox sequence field.  It lets the builder
     represent lost acquisition windows exactly without guessing from timestamp
-    jitter.
+    jitter.  Strict event-time mode additionally requires
+    ``monotonic_clock_domain`` to identify the shared capture/action clock and
+    ``capture_end_semantics`` to declare the policy acquisition-window end.
+    The domain covers capture bounds, point timestamps, and received time; it
+    must also identify the clock used for the later policy action time.
     """
 
     xyz_m: np.ndarray
@@ -86,6 +103,8 @@ class Mid360PointPacket:
     received_time_s: float | None = None
     point_timestamps_s: np.ndarray | None = None
     emitted_sensor_mask: np.ndarray | None = None
+    monotonic_clock_domain: str | None = None
+    capture_end_semantics: str | None = None
 
 
 @runtime_checkable
@@ -122,6 +141,35 @@ class Mid360PacketStats:
     max_packet_age_s: float
     packet_cadence_tolerance_s: float
     timestamp_tolerance_s: float
+    timed_return_bins: int = 0
+    event_time_frame_valid: bool = False
+    monotonic_clock_domain: str | None = None
+    capture_end_semantics: str | None = None
+
+
+@dataclass(frozen=True)
+class Mid360AlignedRayTimeHistory:
+    """One unbatched, oldest-to-newest range/event-time history snapshot.
+
+    Shapes are ``ray_history=[K,2,H,W]``, ``return_valid/return_age_s=
+    [K,H,W]``, and ``packet_age_s/frame_valid=[K]``.  ``return_valid`` is
+    bitwise identical to the range-history hit channel.  Invalid returns have
+    exactly zero age.  Empty, dropped, and never-filled frames have
+    ``frame_valid=False`` and exactly zero packet age.
+
+    The snapshot can only be produced by a builder configured with an explicit
+    ``monotonic_clock_domain``.  The caller must present the same domain for
+    ``now_s`` so clock identity is checked rather than inferred from floats.
+    """
+
+    ray_history: np.ndarray
+    return_valid: np.ndarray
+    return_age_s: np.ndarray
+    packet_age_s: np.ndarray
+    frame_valid: np.ndarray
+    window_indices: np.ndarray
+    capture_end_times_s: np.ndarray
+    monotonic_clock_domain: str
 
 
 def point_packet_from_livox_custom_msg_arrays(
@@ -131,8 +179,10 @@ def point_packet_from_livox_custom_msg_arrays(
     offset_time_ns: np.ndarray,
     coordinate_frame: str,
     window_index: int,
+    capture_end_s: float | None = None,
     received_time_s: float | None = None,
     emitted_sensor_mask: np.ndarray | None = None,
+    monotonic_clock_domain: str | None = None,
 ) -> Mid360PointPacket:
     """Normalize verified ``CustomMsg timebase + offset_time`` arrays.
 
@@ -145,7 +195,10 @@ def point_packet_from_livox_custom_msg_arrays(
     A caller may append the result directly only when that CustomMsg is the
     deployment's complete policy-rate acquisition window.  If several native
     messages form one 0.1-second window, the driver adapter must aggregate them
-    first and return one :class:`Mid360PointPacket`.
+    first and return one :class:`Mid360PointPacket`.  ``capture_end_s`` must be
+    supplied for strict H2 use; omitting it preserves the legacy latest-return
+    inference, which the strict builder rejects because it changes when late
+    returns are absent.
     """
     points = _floating_matrix(xyz_m, "xyz_m")
     if not np.isfinite(points).all():
@@ -169,19 +222,31 @@ def point_packet_from_livox_custom_msg_arrays(
 
     base_s = base_ns * 1.0e-9
     point_times = base_s + offset_time_ns.astype(np.float64) * 1.0e-9
-    capture_end_s = (
+    latest_return_s = (
         base_s if point_times.size == 0 else float(point_times.max())
     )
+    if capture_end_s is None:
+        resolved_capture_end_s = latest_return_s
+        capture_end_semantics = MID360_CAPTURE_END_LATEST_RETURN_LEGACY
+    else:
+        resolved_capture_end_s = _finite_float(capture_end_s, "capture_end_s")
+        if resolved_capture_end_s < latest_return_s:
+            raise Mid360RayTimeBuilderError(
+                "capture_end_s cannot precede the latest point timestamp."
+            )
+        capture_end_semantics = MID360_CAPTURE_END_ACQUISITION_WINDOW
     return Mid360PointPacket(
         xyz_m=points,
         coordinate_frame=coordinate_frame,
         timestamp_semantics=MID360_TIMESTAMP_LIVOX_CUSTOM_MSG,
         window_index=_nonnegative_int(window_index, "window_index"),
         capture_start_s=base_s,
-        capture_end_s=capture_end_s,
+        capture_end_s=resolved_capture_end_s,
         received_time_s=received_time_s,
         point_timestamps_s=point_times,
         emitted_sensor_mask=emitted_sensor_mask,
+        monotonic_clock_domain=monotonic_clock_domain,
+        capture_end_semantics=capture_end_semantics,
     )
 
 
@@ -193,7 +258,10 @@ class Mid360RayTimeTensorBuilder:
     :meth:`policy_tensor` for the batched ``[1, K, 2, H, W]`` policy input.
     Freshness is measured from the declared acquisition-window end, not from
     the timestamp of the latest successful return. Every packet statistic
-    records the runtime safety tolerances alongside the manifest hash.
+    records the runtime safety tolerances alongside the manifest hash.  Passing
+    ``monotonic_clock_domain`` enables the stricter aligned event-time contract;
+    it is intentionally opt-in so existing two-channel deployments are not
+    silently reinterpreted.
     """
 
     def __init__(
@@ -203,6 +271,7 @@ class Mid360RayTimeTensorBuilder:
         max_packet_age_s: float,
         timestamp_tolerance_s: float = 1.0e-6,
         packet_cadence_tolerance_s: float = 0.02,
+        monotonic_clock_domain: str | None = None,
     ) -> None:
         if isinstance(manifest, (str, os.PathLike)):
             parsed = read_ray_time_deployment_manifest(
@@ -231,6 +300,10 @@ class Mid360RayTimeTensorBuilder:
         self.packet_cadence_tolerance_s = _nonnegative_finite_float(
             packet_cadence_tolerance_s,
             "packet_cadence_tolerance_s",
+        )
+        self._monotonic_clock_domain = _optional_clock_domain(
+            monotonic_clock_domain,
+            "monotonic_clock_domain",
         )
 
         contract = parsed["contract"]
@@ -270,6 +343,14 @@ class Mid360RayTimeTensorBuilder:
         self.packet_interval_s = float(
             ray["packet_interval_control_steps"] * ray["control_period_s"]
         )
+        if (
+            self.monotonic_clock_domain is not None
+            and self.timestamp_tolerance_s >= self.packet_interval_s
+        ):
+            raise Mid360RayTimeBuilderError(
+                "Strict event-time timestamp_tolerance_s must be smaller than "
+                f"the manifest packet interval {self.packet_interval_s:.6f}s."
+            )
         if self.packet_cadence_tolerance_s >= self.packet_interval_s:
             raise Mid360RayTimeBuilderError(
                 "packet_cadence_tolerance_s must be smaller than the "
@@ -313,6 +394,26 @@ class Mid360RayTimeTensorBuilder:
             np.nan,
             dtype=np.float64,
         )
+        self._return_timestamps_s = np.zeros(
+            (
+                self.history_length,
+                self.image_height,
+                self.image_width,
+            ),
+            dtype=np.float64,
+        )
+        self._return_timestamp_valid = np.zeros(
+            (
+                self.history_length,
+                self.image_height,
+                self.image_width,
+            ),
+            dtype=np.bool_,
+        )
+        self._frame_valid = np.zeros(
+            self.history_length,
+            dtype=np.bool_,
+        )
         self._last_window_index: int | None = None
         self._last_window_capture_end_s: float | None = None
         self._last_acquisition_capture_end_s: float | None = None
@@ -324,6 +425,11 @@ class Mid360RayTimeTensorBuilder:
     def last_stats(self) -> Mid360PacketStats | None:
         """Return diagnostics for the last ingested or explicitly lost packet."""
         return self._last_stats
+
+    @property
+    def monotonic_clock_domain(self) -> str | None:
+        """Return the immutable clock identity configured for strict H2 use."""
+        return self._monotonic_clock_domain
 
     @property
     def implicit_missing_packets_total(self) -> int:
@@ -368,12 +474,17 @@ class Mid360RayTimeTensorBuilder:
         validated = self._validate_point_packet(packet)
         (
             xyz,
+            point_timestamps_s,
             emitted_sensor_mask,
             received_time_s,
             transport_latency_s,
         ) = validated
 
         ranges = np.linalg.norm(xyz.astype(np.float64, copy=False), axis=1)
+        if not np.isfinite(ranges).all():
+            raise Mid360RayTimeBuilderError(
+                "packet.xyz_m produces a non-finite range."
+            )
         above_min = ranges >= self.min_range_m
         safe_ranges = np.where(above_min, ranges, 1.0)
         elevation_deg = np.rad2deg(
@@ -404,6 +515,14 @@ class Mid360RayTimeTensorBuilder:
             (self.image_height, self.image_width),
             dtype=np.bool_,
         )
+        sensor_return_timestamps_s = np.zeros(
+            (self.image_height, self.image_width),
+            dtype=np.float64,
+        )
+        sensor_return_timestamp_valid = np.zeros(
+            (self.image_height, self.image_width),
+            dtype=np.bool_,
+        )
         accepted_count = int(np.count_nonzero(accepted))
         clipped_count = 0
         if accepted_count:
@@ -419,15 +538,40 @@ class Mid360RayTimeTensorBuilder:
             )
             sensor_columns = self._sensor_columns_from_azimuth(azimuth_deg)
             flat_ids = sensor_rows * self.image_width + sensor_columns
-            nearest = np.full(
-                self.image_height * self.image_width,
-                np.inf,
-                dtype=np.float64,
+            if point_timestamps_s is None:
+                accepted_timestamps_s = np.zeros(
+                    accepted_count,
+                    dtype=np.float64,
+                )
+            else:
+                accepted_timestamps_s = point_timestamps_s[accepted]
+
+            # Deterministic winner contract: nearest physical range wins;
+            # exact range ties use the earliest acquisition timestamp.  Any
+            # remaining ties have identical exported range/time values, so
+            # input point ordering cannot alter the aligned tensor.
+            order = np.lexsort(
+                (accepted_timestamps_s, accepted_ranges, flat_ids)
             )
-            np.minimum.at(nearest, flat_ids, accepted_ranges)
-            finite = np.isfinite(nearest)
-            sensor_hits.reshape(-1)[finite] = True
-            sensor_ranges.reshape(-1)[finite] = nearest[finite]
+            ordered_flat_ids = flat_ids[order]
+            first_for_bin = np.empty(order.shape, dtype=np.bool_)
+            first_for_bin[0] = True
+            first_for_bin[1:] = (
+                ordered_flat_ids[1:] != ordered_flat_ids[:-1]
+            )
+            winners = order[first_for_bin]
+            winning_flat_ids = flat_ids[winners]
+            sensor_hits.reshape(-1)[winning_flat_ids] = True
+            sensor_ranges.reshape(-1)[winning_flat_ids] = accepted_ranges[
+                winners
+            ]
+            if point_timestamps_s is not None:
+                sensor_return_timestamp_valid.reshape(-1)[
+                    winning_flat_ids
+                ] = True
+                sensor_return_timestamps_s.reshape(-1)[
+                    winning_flat_ids
+                ] = accepted_timestamps_s[winners]
             clipped_count = int(
                 np.count_nonzero(accepted_ranges > self.max_range_m)
             )
@@ -447,7 +591,16 @@ class Mid360RayTimeTensorBuilder:
             sensor_ranges,
             sensor_hits,
         )
+        (
+            policy_return_timestamps_s,
+            policy_return_timestamp_valid,
+        ) = self._sensor_timing_to_policy(
+            sensor_return_timestamps_s,
+            sensor_return_timestamp_valid,
+        )
         hit_bins = int(np.count_nonzero(policy_packet[1]))
+        timed_bins = int(np.count_nonzero(policy_return_timestamp_valid))
+        event_time_frame_valid = timed_bins > 0
         stats = Mid360PacketStats(
             window_index=packet.window_index,
             capture_start_s=float(packet.capture_start_s),
@@ -472,11 +625,18 @@ class Mid360RayTimeTensorBuilder:
             capture_interval_error_s=None,
             explicit_drop=False,
             manifest_payload_sha256=self.manifest_payload_sha256,
+            timed_return_bins=timed_bins,
+            event_time_frame_valid=event_time_frame_valid,
+            monotonic_clock_domain=packet.monotonic_clock_domain,
+            capture_end_semantics=packet.capture_end_semantics,
             **self._safety_stats_fields(),
         )
         return self._append_packet(
             policy_packet,
             stats,
+            policy_return_timestamps_s=policy_return_timestamps_s,
+            policy_return_timestamp_valid=policy_return_timestamp_valid,
+            frame_valid=event_time_frame_valid,
         )
 
     def ingest_sensor_grid(
@@ -489,6 +649,8 @@ class Mid360RayTimeTensorBuilder:
         capture_end_s: float,
         received_time_s: float | None = None,
         emitted_sensor_mask: np.ndarray | None = None,
+        sensor_return_timestamps_s: np.ndarray | None = None,
+        monotonic_clock_domain: str | None = None,
     ) -> Mid360PacketStats:
         """Append a pre-binned physical-sensor grid.
 
@@ -496,6 +658,9 @@ class Mid360RayTimeTensorBuilder:
         degrees and columns must be ascending sensor-frame azimuth on
         ``[-180, 180)``.  This method exists for verified upstream binners and
         simulation golden tests; it does not infer a native driver layout.
+        In strict event-time mode, every ``True`` hit requires an aligned
+        ``sensor_return_timestamps_s`` entry, while every non-hit timestamp
+        must be exactly zero.
         """
         ranges = _floating_array(
             sensor_ranges_m,
@@ -530,9 +695,43 @@ class Mid360RayTimeTensorBuilder:
             capture_end_s,
             received_time_s,
         )
+        clock_domain = self._validate_clock_domain(
+            monotonic_clock_domain,
+            context="ingest_sensor_grid",
+        )
+        if sensor_return_timestamps_s is None:
+            if self.monotonic_clock_domain is not None and np.any(hits):
+                raise Mid360RayTimeBuilderError(
+                    "Strict event-time mode requires one timestamp for every "
+                    "successful sensor-grid return."
+                )
+            sensor_timestamps = np.zeros_like(ranges, dtype=np.float64)
+            sensor_timestamp_valid = np.zeros_like(hits)
+        else:
+            sensor_timestamps = self._validate_sensor_return_timestamps(
+                sensor_return_timestamps_s,
+                hits,
+                capture_start_s,
+                capture_end_s,
+            )
+            sensor_timestamp_valid = valid_hits.copy()
+            sensor_timestamps = np.where(
+                sensor_timestamp_valid,
+                sensor_timestamps,
+                0.0,
+            )
 
         policy_packet = self.sensor_grid_to_policy_packet(ranges, hits)
+        (
+            policy_return_timestamps_s,
+            policy_return_timestamp_valid,
+        ) = self._sensor_timing_to_policy(
+            sensor_timestamps,
+            sensor_timestamp_valid,
+        )
         hit_bins = int(np.count_nonzero(policy_packet[1]))
+        timed_bins = int(np.count_nonzero(policy_return_timestamp_valid))
+        event_time_frame_valid = timed_bins > 0
         stats = Mid360PacketStats(
             window_index=window_index,
             capture_start_s=capture_start_s,
@@ -563,9 +762,19 @@ class Mid360RayTimeTensorBuilder:
             capture_interval_error_s=None,
             explicit_drop=False,
             manifest_payload_sha256=self.manifest_payload_sha256,
+            timed_return_bins=timed_bins,
+            event_time_frame_valid=event_time_frame_valid,
+            monotonic_clock_domain=clock_domain,
+            capture_end_semantics=MID360_CAPTURE_END_ACQUISITION_WINDOW,
             **self._safety_stats_fields(),
         )
-        return self._append_packet(policy_packet, stats)
+        return self._append_packet(
+            policy_packet,
+            stats,
+            policy_return_timestamps_s=policy_return_timestamps_s,
+            policy_return_timestamp_valid=policy_return_timestamp_valid,
+            frame_valid=event_time_frame_valid,
+        )
 
     def record_dropped_packet(
         self,
@@ -574,6 +783,7 @@ class Mid360RayTimeTensorBuilder:
         capture_start_s: float,
         capture_end_s: float,
         received_time_s: float | None = None,
+        monotonic_clock_domain: str | None = None,
     ) -> Mid360PacketStats:
         """Append a known lost window as all-unknown rather than repeating data."""
         window_index = _nonnegative_int(window_index, "window_index")
@@ -587,6 +797,10 @@ class Mid360RayTimeTensorBuilder:
         received, transport_latency = self._validate_received_time(
             capture_end_s,
             received_time_s,
+        )
+        clock_domain = self._validate_clock_domain(
+            monotonic_clock_domain,
+            context="record_dropped_packet",
         )
         stats = Mid360PacketStats(
             window_index=window_index,
@@ -608,6 +822,8 @@ class Mid360RayTimeTensorBuilder:
             capture_interval_error_s=None,
             explicit_drop=True,
             manifest_payload_sha256=self.manifest_payload_sha256,
+            monotonic_clock_domain=clock_domain,
+            capture_end_semantics=MID360_CAPTURE_END_ACQUISITION_WINDOW,
             **self._safety_stats_fields(),
         )
         result = self._append_packet(np.zeros_like(self._history[0]), stats)
@@ -642,16 +858,8 @@ class Mid360RayTimeTensorBuilder:
         )
         encoded_hits = valid_hits.astype(np.float64)
 
-        encoded_ranges = np.roll(
-            np.flip(encoded_ranges, axis=-1),
-            shift=self.width_roll_bins,
-            axis=-1,
-        )
-        encoded_hits = np.roll(
-            np.flip(encoded_hits, axis=-1),
-            shift=self.width_roll_bins,
-            axis=-1,
-        )
+        encoded_ranges = self._sensor_grid_to_policy_order(encoded_ranges)
+        encoded_hits = self._sensor_grid_to_policy_order(encoded_hits)
         packet = np.stack((encoded_ranges, encoded_hits), axis=0).astype(
             np.float16,
             copy=False,
@@ -669,11 +877,84 @@ class Mid360RayTimeTensorBuilder:
         """Return a batched ``[1, K, 2, H, W]`` copy for inference."""
         return self.history_tensor(now_s=now_s)[None, ...]
 
+    def aligned_event_time_history(
+        self,
+        *,
+        now_s: float,
+        monotonic_clock_domain: str,
+    ) -> Mid360AlignedRayTimeHistory:
+        """Return the strict H2 range/time snapshot without a batch axis.
+
+        This is deliberately separate from :meth:`history_tensor` so legacy
+        two-channel deployments remain byte-for-byte compatible.  Enabling it
+        requires ``monotonic_clock_domain`` at builder construction, matching
+        domain declarations at ingestion, and the same declaration here for
+        action time.  Successful returns without verified per-return times are
+        rejected during ingestion in that mode.
+        """
+        if self.monotonic_clock_domain is None:
+            raise Mid360RayTimeBuilderError(
+                "aligned_event_time_history requires a builder configured "
+                "with an explicit monotonic_clock_domain."
+            )
+        self._validate_clock_domain(
+            monotonic_clock_domain,
+            context="aligned_event_time_history",
+        )
+        now = self._validate_freshness(now_s)
+        self._validate_history()
+
+        frame_valid = self._frame_valid.copy()
+        return_valid = self._return_timestamp_valid.copy()
+        packet_age_s = np.zeros(self.history_length, dtype=np.float32)
+        return_age_s = np.zeros(
+            (
+                self.history_length,
+                self.image_height,
+                self.image_width,
+            ),
+            dtype=np.float32,
+        )
+        if np.any(frame_valid):
+            capture_end = self._capture_end_times_s[frame_valid]
+            if not np.isfinite(capture_end).all():
+                raise Mid360RayTimeBuilderError(
+                    "Valid event-time frames require finite capture_end_s."
+                )
+            packet_ages = now - capture_end
+            if np.any(packet_ages < 0.0) or not np.isfinite(packet_ages).all():
+                raise Mid360RayTimeBuilderError(
+                    "Computed packet ages must be finite and non-negative."
+                )
+            packet_age_s[frame_valid] = packet_ages.astype(np.float32)
+
+        if np.any(return_valid):
+            return_ages = now - self._return_timestamps_s[return_valid]
+            if np.any(return_ages < 0.0) or not np.isfinite(return_ages).all():
+                raise Mid360RayTimeBuilderError(
+                    "Computed return ages must be finite and non-negative."
+                )
+            return_age_s[return_valid] = return_ages.astype(np.float32)
+
+        return Mid360AlignedRayTimeHistory(
+            ray_history=self._history.copy(),
+            return_valid=return_valid,
+            return_age_s=return_age_s,
+            packet_age_s=packet_age_s,
+            frame_valid=frame_valid,
+            window_indices=self._window_indices.copy(),
+            capture_end_times_s=self._capture_end_times_s.copy(),
+            monotonic_clock_domain=self.monotonic_clock_domain,
+        )
+
     def reset(self) -> None:
         """Clear all history, timing, and loss counters."""
         self._history.fill(0)
         self._window_indices.fill(-1)
         self._capture_end_times_s.fill(np.nan)
+        self._return_timestamps_s.fill(0)
+        self._return_timestamp_valid.fill(False)
+        self._frame_valid.fill(False)
         self._last_window_index = None
         self._last_window_capture_end_s = None
         self._last_acquisition_capture_end_s = None
@@ -684,7 +965,13 @@ class Mid360RayTimeTensorBuilder:
     def _validate_point_packet(
         self,
         packet: Mid360PointPacket,
-    ) -> tuple[np.ndarray, np.ndarray | None, float | None, float | None]:
+    ) -> tuple[
+        np.ndarray,
+        np.ndarray | None,
+        np.ndarray | None,
+        float | None,
+        float | None,
+    ]:
         if not isinstance(packet, Mid360PointPacket):
             raise TypeError("packet must be Mid360PointPacket.")
         if packet.coordinate_frame != MID360_NORMALIZED_SENSOR_FRAME:
@@ -716,6 +1003,7 @@ class Mid360RayTimeTensorBuilder:
             raise Mid360RayTimeBuilderError(
                 "packet.xyz_m must contain only finite values."
             )
+        point_times: np.ndarray | None = None
         if packet.point_timestamps_s is not None:
             point_times = _floating_array(
                 packet.point_timestamps_s,
@@ -733,6 +1021,11 @@ class Mid360RayTimeTensorBuilder:
                     "Every point timestamp must lie inside its declared "
                     "capture window."
                 )
+            # The tolerance absorbs only timestamp quantization/jitter at the
+            # declared acquisition boundary.  Clipping here guarantees that a
+            # later action-time subtraction cannot produce a negative age or a
+            # return younger than its packet.
+            point_times = np.clip(point_times, start, end)
         if packet.timestamp_semantics in (
             MID360_TIMESTAMP_LIVOX_CUSTOM_MSG,
             MID360_TIMESTAMP_ADAPTER_ABSOLUTE_POINTS,
@@ -750,13 +1043,50 @@ class Mid360RayTimeTensorBuilder:
                 "Capture-window-only timestamp semantics cannot carry "
                 "unverified per-point timestamps."
             )
+        clock_domain = self._validate_clock_domain(
+            packet.monotonic_clock_domain,
+            context="ingest_point_packet",
+        )
+        if packet.capture_end_semantics not in (
+            None,
+            MID360_CAPTURE_END_ACQUISITION_WINDOW,
+            MID360_CAPTURE_END_LATEST_RETURN_LEGACY,
+        ):
+            raise Mid360RayTimeBuilderError(
+                "packet.capture_end_semantics is not recognized."
+            )
+        if (
+            self.monotonic_clock_domain is not None
+            and packet.capture_end_semantics
+            != MID360_CAPTURE_END_ACQUISITION_WINDOW
+        ):
+            raise Mid360RayTimeBuilderError(
+                "Strict event-time mode requires capture_end_s to be the "
+                "explicit policy acquisition-window boundary, not the latest "
+                "successful return."
+            )
+        if (
+            self.monotonic_clock_domain is not None
+            and xyz.shape[0] > 0
+            and point_times is None
+        ):
+            raise Mid360RayTimeBuilderError(
+                "Strict event-time mode requires one verified timestamp for "
+                "every successful point return."
+            )
 
         emitted = self._validate_emitted_mask(packet.emitted_sensor_mask)
         received, latency = self._validate_received_time(
             end,
             packet.received_time_s,
         )
-        return xyz, emitted, received, latency
+        # Exact equality is intentional: this field records the checked
+        # identity, not merely a descriptive packet label.
+        if clock_domain != packet.monotonic_clock_domain:
+            raise Mid360RayTimeBuilderError(
+                "Normalized monotonic clock identity changed unexpectedly."
+            )
+        return xyz, point_times, emitted, received, latency
 
     def _validate_emitted_mask(
         self,
@@ -785,6 +1115,103 @@ class Mid360RayTimeTensorBuilder:
                 "one monotonic clock domain."
             )
         return received, max(0.0, latency)
+
+    def _validate_clock_domain(
+        self,
+        value: str | None,
+        *,
+        context: str,
+    ) -> str | None:
+        clock_domain = _optional_clock_domain(
+            value,
+            f"{context}.monotonic_clock_domain",
+        )
+        if self.monotonic_clock_domain is None:
+            return clock_domain
+        if clock_domain != self.monotonic_clock_domain:
+            raise Mid360RayTimeBuilderError(
+                f"{context} must use monotonic clock domain "
+                f"{self.monotonic_clock_domain!r}; got {clock_domain!r}."
+            )
+        return clock_domain
+
+    def _validate_sensor_return_timestamps(
+        self,
+        value: np.ndarray,
+        requested_hits: np.ndarray,
+        capture_start_s: float,
+        capture_end_s: float,
+    ) -> np.ndarray:
+        timestamps = _floating_array(
+            value,
+            (self.image_height, self.image_width),
+            "sensor_return_timestamps_s",
+        )
+        if not np.isfinite(timestamps).all():
+            raise Mid360RayTimeBuilderError(
+                "sensor_return_timestamps_s must contain only finite values."
+            )
+        if np.any(timestamps[~requested_hits] != 0.0):
+            raise Mid360RayTimeBuilderError(
+                "Bins without a successful return must have exactly zero "
+                "sensor_return_timestamps_s; no-return is unknown, not "
+                "observed free space."
+            )
+        hit_timestamps = timestamps[requested_hits]
+        if np.any(
+            hit_timestamps < capture_start_s - self.timestamp_tolerance_s
+        ) or np.any(
+            hit_timestamps > capture_end_s + self.timestamp_tolerance_s
+        ):
+            raise Mid360RayTimeBuilderError(
+                "Every sensor-grid return timestamp must lie inside its "
+                "declared capture window."
+            )
+        normalized = np.zeros_like(timestamps, dtype=np.float64)
+        normalized[requested_hits] = np.clip(
+            hit_timestamps,
+            capture_start_s,
+            capture_end_s,
+        )
+        return normalized
+
+    def _sensor_grid_to_policy_order(self, value: np.ndarray) -> np.ndarray:
+        """Apply the one manifest-bound flip/roll to any aligned sensor grid."""
+        return np.roll(
+            np.flip(value, axis=-1),
+            shift=self.width_roll_bins,
+            axis=-1,
+        )
+
+    def _sensor_timing_to_policy(
+        self,
+        sensor_return_timestamps_s: np.ndarray,
+        sensor_return_timestamp_valid: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        timestamps = _floating_array(
+            sensor_return_timestamps_s,
+            (self.image_height, self.image_width),
+            "sensor_return_timestamps_s",
+        )
+        valid = _bool_array(
+            sensor_return_timestamp_valid,
+            (self.image_height, self.image_width),
+            "sensor_return_timestamp_valid",
+        )
+        if not np.isfinite(timestamps).all():
+            raise Mid360RayTimeBuilderError(
+                "sensor return timestamps must contain only finite values."
+            )
+        if np.any(timestamps[~valid] != 0.0):
+            raise Mid360RayTimeBuilderError(
+                "Invalid sensor return timestamps must be exactly zero."
+            )
+        policy_timestamps = self._sensor_grid_to_policy_order(timestamps)
+        policy_valid = self._sensor_grid_to_policy_order(valid)
+        return (
+            policy_timestamps.astype(np.float64, copy=False),
+            policy_valid.astype(np.bool_, copy=False),
+        )
 
     def _sensor_rows_from_elevation(
         self,
@@ -817,8 +1244,37 @@ class Mid360RayTimeTensorBuilder:
         self,
         policy_packet: np.ndarray,
         stats: Mid360PacketStats,
+        *,
+        policy_return_timestamps_s: np.ndarray | None = None,
+        policy_return_timestamp_valid: np.ndarray | None = None,
+        frame_valid: bool = False,
     ) -> Mid360PacketStats:
         self._validate_policy_packet(policy_packet)
+        if policy_return_timestamps_s is None:
+            policy_return_timestamps_s = np.zeros(
+                (self.image_height, self.image_width),
+                dtype=np.float64,
+            )
+        if policy_return_timestamp_valid is None:
+            policy_return_timestamp_valid = np.zeros(
+                (self.image_height, self.image_width),
+                dtype=np.bool_,
+            )
+        self._validate_timing_packet(
+            policy_packet,
+            policy_return_timestamps_s,
+            policy_return_timestamp_valid,
+            frame_valid,
+        )
+        timed_bins = int(np.count_nonzero(policy_return_timestamp_valid))
+        if stats.timed_return_bins != timed_bins:
+            raise Mid360RayTimeBuilderError(
+                "Packet statistics do not match aligned timed-return bins."
+            )
+        if bool(stats.event_time_frame_valid) != bool(frame_valid):
+            raise Mid360RayTimeBuilderError(
+                "Packet statistics do not match event-time frame validity."
+            )
         index = stats.window_index
         capture_end_s = stats.capture_end_s
         interval_error_s: float | None = None
@@ -858,7 +1314,14 @@ class Mid360RayTimeTensorBuilder:
             missing = index_delta - 1
             self._insert_implicit_missing(index, missing)
 
-        self._shift_append(policy_packet, index, capture_end_s)
+        self._shift_append(
+            policy_packet,
+            index,
+            capture_end_s,
+            policy_return_timestamps_s,
+            policy_return_timestamp_valid,
+            frame_valid,
+        )
         self._last_window_index = index
         self._last_window_capture_end_s = capture_end_s
         if not stats.explicit_drop:
@@ -877,6 +1340,10 @@ class Mid360RayTimeTensorBuilder:
         if count <= 0:
             return
         unknown = np.zeros_like(self._history[0])
+        unknown_timestamps = np.zeros_like(self._return_timestamps_s[0])
+        unknown_timestamp_valid = np.zeros_like(
+            self._return_timestamp_valid[0]
+        )
         # Only the K-1 missing windows immediately preceding the new packet can
         # survive after that packet is appended.  Avoid work proportional to an
         # arbitrarily large driver outage.
@@ -885,25 +1352,46 @@ class Mid360RayTimeTensorBuilder:
             self._history.fill(0)
             self._window_indices.fill(-1)
             self._capture_end_times_s.fill(np.nan)
+            self._return_timestamps_s.fill(0)
+            self._return_timestamp_valid.fill(False)
+            self._frame_valid.fill(False)
         first = current_index - retained
         for missing_index in range(first, current_index):
-            self._shift_append(unknown, missing_index, np.nan)
+            self._shift_append(
+                unknown,
+                missing_index,
+                np.nan,
+                unknown_timestamps,
+                unknown_timestamp_valid,
+                False,
+            )
 
     def _shift_append(
         self,
         packet: np.ndarray,
         window_index: int,
         capture_end_s: float,
+        return_timestamps_s: np.ndarray,
+        return_timestamp_valid: np.ndarray,
+        frame_valid: bool,
     ) -> None:
         if self.history_length > 1:
             self._history[:-1] = self._history[1:]
             self._window_indices[:-1] = self._window_indices[1:]
             self._capture_end_times_s[:-1] = self._capture_end_times_s[1:]
+            self._return_timestamps_s[:-1] = self._return_timestamps_s[1:]
+            self._return_timestamp_valid[:-1] = (
+                self._return_timestamp_valid[1:]
+            )
+            self._frame_valid[:-1] = self._frame_valid[1:]
         self._history[-1] = packet
         self._window_indices[-1] = window_index
         self._capture_end_times_s[-1] = capture_end_s
+        self._return_timestamps_s[-1] = return_timestamps_s
+        self._return_timestamp_valid[-1] = return_timestamp_valid
+        self._frame_valid[-1] = frame_valid
 
-    def _validate_freshness(self, now_s: float) -> None:
+    def _validate_freshness(self, now_s: float) -> float:
         now = _finite_float(now_s, "now_s")
         if self._last_acquisition_capture_end_s is None:
             raise StaleMid360PacketError(
@@ -921,6 +1409,9 @@ class Mid360RayTimeTensorBuilder:
                 f"Newest MID-360 packet is stale by {age:.6f}s; maximum "
                 f"allowed age is {self.max_packet_age_s:.6f}s."
             )
+        # Values inside tolerance describe the same acquisition boundary.  A
+        # single normalization point prevents negative packet/return ages.
+        return max(now, self._last_acquisition_capture_end_s)
 
     def _validate_capture_duration(
         self,
@@ -974,6 +1465,52 @@ class Mid360RayTimeTensorBuilder:
                 "Observed policy ranges violate the manifest valid range."
             )
 
+    def _validate_timing_packet(
+        self,
+        policy_packet: np.ndarray,
+        return_timestamps_s: np.ndarray,
+        return_timestamp_valid: np.ndarray,
+        frame_valid: bool,
+    ) -> None:
+        timestamps = _floating_array(
+            return_timestamps_s,
+            (self.image_height, self.image_width),
+            "policy_return_timestamps_s",
+        )
+        valid = _bool_array(
+            return_timestamp_valid,
+            (self.image_height, self.image_width),
+            "policy_return_timestamp_valid",
+        )
+        if not isinstance(frame_valid, (bool, np.bool_)):
+            raise TypeError("frame_valid must be boolean.")
+        if not np.isfinite(timestamps).all():
+            raise Mid360RayTimeBuilderError(
+                "Policy return timestamps must contain only finite values."
+            )
+        if np.any(timestamps[~valid] != 0.0):
+            raise Mid360RayTimeBuilderError(
+                "Invalid policy return timestamps must be exactly zero."
+            )
+        hits = policy_packet[1].astype(np.bool_)
+        if np.any(valid & ~hits):
+            raise Mid360RayTimeBuilderError(
+                "A timed return must be the winning observed range in its bin."
+            )
+        if self.monotonic_clock_domain is not None and not np.array_equal(
+            valid,
+            hits,
+        ):
+            raise Mid360RayTimeBuilderError(
+                "Strict event-time mode requires range and timestamp validity "
+                "to be bitwise identical."
+            )
+        if bool(frame_valid) != bool(np.any(valid)):
+            raise Mid360RayTimeBuilderError(
+                "frame_valid must be true exactly when at least one timed "
+                "winning return exists."
+            )
+
     def _validate_history(self) -> None:
         expected = (
             self.history_length,
@@ -997,6 +1534,52 @@ class Mid360RayTimeTensorBuilder:
         if not np.all(self._history[:, 0][hits == 0] == 0):
             raise Mid360RayTimeBuilderError(
                 "Internal unknown rays do not have exactly zero range."
+            )
+        timing_shape = (
+            self.history_length,
+            self.image_height,
+            self.image_width,
+        )
+        if (
+            self._return_timestamps_s.shape != timing_shape
+            or self._return_timestamps_s.dtype != np.float64
+            or self._return_timestamp_valid.shape != timing_shape
+            or self._return_timestamp_valid.dtype != np.bool_
+            or self._frame_valid.shape != (self.history_length,)
+            or self._frame_valid.dtype != np.bool_
+        ):
+            raise Mid360RayTimeBuilderError(
+                "Internal event-time history has an invalid shape or dtype."
+            )
+        if not np.isfinite(self._return_timestamps_s).all():
+            raise Mid360RayTimeBuilderError(
+                "Internal event-time history contains a non-finite timestamp."
+            )
+        if np.any(
+            self._return_timestamps_s[~self._return_timestamp_valid] != 0.0
+        ):
+            raise Mid360RayTimeBuilderError(
+                "Internal invalid return timestamps are not exactly zero."
+            )
+        hit_bool = hits.astype(np.bool_)
+        if np.any(self._return_timestamp_valid & ~hit_bool):
+            raise Mid360RayTimeBuilderError(
+                "Internal timed-return validity exceeds observed range support."
+            )
+        if self.monotonic_clock_domain is not None and not np.array_equal(
+            self._return_timestamp_valid,
+            hit_bool,
+        ):
+            raise Mid360RayTimeBuilderError(
+                "Strict event-time history lost range/timestamp alignment."
+            )
+        expected_frame_valid = np.any(
+            self._return_timestamp_valid,
+            axis=(1, 2),
+        )
+        if not np.array_equal(self._frame_valid, expected_frame_valid):
+            raise Mid360RayTimeBuilderError(
+                "Internal frame validity disagrees with timed return support."
             )
 
 
@@ -1036,6 +1619,19 @@ def _nonnegative_int(value: Any, name: str) -> int:
     if result < 0:
         raise Mid360RayTimeBuilderError(f"{name} must be non-negative.")
     return result
+
+
+def _optional_clock_domain(value: Any, name: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be a string or None.")
+    if not value or value != value.strip() or not value.isprintable():
+        raise Mid360RayTimeBuilderError(
+            f"{name} must be a non-empty printable identifier without "
+            "leading or trailing whitespace."
+        )
+    return value
 
 
 def _floating_matrix(value: Any, name: str) -> np.ndarray:
