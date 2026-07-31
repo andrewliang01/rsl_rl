@@ -14,7 +14,7 @@ import os
 import re
 import secrets
 import stat
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +41,10 @@ FORMAL_ANCESTOR_CHAIN_PROOF_CONTRACT = (
 )
 FORMAL_ANCESTOR_CHAIN_PROOF_SCHEMA_VERSION = 1
 FORMAL_LAUNCH_RECEIPT_NAME = "launch_receipt.json"
+FORMAL_CHECKPOINT_RUN_INSPECTION_CONTRACT = (
+    "rsl_rl_formal_checkpoint_run_inspection_v1"
+)
+FORMAL_CHECKPOINT_RUN_INSPECTION_SCHEMA_VERSION = 1
 
 _CHECKPOINT_NAME_RE = re.compile(r"^model_(0|[1-9][0-9]*)\.pt$")
 _CHECKPOINT_LIKE_RE = re.compile(r"^model_.*\.pt$")
@@ -361,11 +365,18 @@ def _publish_new_torch_checkpoint(
         temporary.unlink(missing_ok=True)
 
 
-def _read_canonical_json(path: Path) -> tuple[dict[str, Any], bytes]:
-    payload, _record = retain_regular_file(path)
+def _read_canonical_json_retained(
+    path: Path,
+) -> tuple[dict[str, Any], bytes, dict[str, Any]]:
+    payload, record = retain_regular_file(path)
     value = parse_canonical_training_receipt_json(payload)
     if type(value) is not dict:
         _fail(f"Formal JSON root must be an object: {path}")
+    return value, payload, record
+
+
+def _read_canonical_json(path: Path) -> tuple[dict[str, Any], bytes]:
+    value, payload, _record = _read_canonical_json_retained(path)
     return value, payload
 
 
@@ -935,6 +946,8 @@ class FormalTrainingIO:
         if not head_paths:
             return None
         entries: list[dict[str, Any]] = []
+        local_file_bindings: list[dict[str, Any]] = []
+        heads: list[dict[str, Any]] = []
         previous_head_hash: str | None = None
         latest_head: dict[str, Any] | None = None
         unset_ancestor_record = object()
@@ -942,7 +955,11 @@ class FormalTrainingIO:
             dict[str, Any] | None | object
         ) = unset_ancestor_record
         for head_path in head_paths:
-            head_document, _head_payload = _read_canonical_json(head_path)
+            (
+                head_document,
+                _head_payload,
+                head_file_record,
+            ) = _read_canonical_json_retained(head_path)
             head = _validate_head(
                 head_document,
                 expected_name=head_path.name,
@@ -970,7 +987,7 @@ class FormalTrainingIO:
             ):
                 _fail("Formal head sidecar filename differs from checkpoint.")
             checkpoint_path = self.run_dir / checkpoint_name
-            checkpoint_payload, _checkpoint_record = retain_regular_file(
+            checkpoint_payload, checkpoint_file_record = retain_regular_file(
                 checkpoint_path
             )
             _safe_loaded, embedded = _safe_checkpoint_receipt(
@@ -986,7 +1003,11 @@ class FormalTrainingIO:
                     "launch artifact."
                 )
             sidecar_path = self.receipts_dir / head["sidecar"]["file_name"]
-            sidecar, sidecar_payload = _read_canonical_json(sidecar_path)
+            (
+                sidecar,
+                sidecar_payload,
+                sidecar_file_record,
+            ) = _read_canonical_json_retained(sidecar_path)
             if (
                 len(sidecar_payload) != head["sidecar"]["bytes"]
                 or hashlib.sha256(sidecar_payload).hexdigest()
@@ -996,8 +1017,16 @@ class FormalTrainingIO:
             validated_sidecar = validate_checkpoint_sidecar(
                 sidecar,
                 embedded_receipt=embedded,
-                checkpoint_path=checkpoint_path,
             )
+            sidecar_checkpoint = validated_sidecar["checkpoint"]
+            if (
+                sidecar_checkpoint["file_name"] != checkpoint_name
+                or sidecar_checkpoint["sha256"]
+                != checkpoint_file_record["sha256"]
+                or sidecar_checkpoint["bytes"]
+                != checkpoint_file_record["bytes"]
+            ):
+                _fail("Checkpoint live bytes differ from the formal sidecar.")
             actual_parent = checkpoint_parent_record(
                 embedded_receipt=embedded,
                 sidecar=validated_sidecar,
@@ -1008,6 +1037,14 @@ class FormalTrainingIO:
                 {
                     "embedded_receipt": embedded,
                     "sidecar": validated_sidecar,
+                }
+            )
+            heads.append(head)
+            local_file_bindings.append(
+                {
+                    "checkpoint": checkpoint_file_record,
+                    "sidecar": sidecar_file_record,
+                    "head": head_file_record,
                 }
             )
             previous_head_hash = head["head_payload_sha256"]
@@ -1051,8 +1088,11 @@ class FormalTrainingIO:
         return {
             "head": latest_head,
             "head_path": head_paths[-1],
+            "heads": heads,
+            "head_paths": head_paths,
             "chain": chain,
             "entries": entries,
+            "local_file_bindings": local_file_bindings,
             "ancestor_entries": ancestor_entries,
             "full_entries": chain["entries"],
             "ancestor_chain_proof": ancestor_proof,
@@ -1768,7 +1808,402 @@ def inspect_formal_resume_parent(
         parent_io.close()
 
 
+def _required_checkpoint_names(
+    value: Sequence[str],
+) -> list[str]:
+    if type(value) not in {list, tuple} or not value:
+        _fail(
+            "required_checkpoint_names must be a non-empty exact list or tuple."
+        )
+    names: list[str] = []
+    iterations: list[int] = []
+    for index, name in enumerate(value):
+        if (
+            type(name) is not str
+            or _CHECKPOINT_NAME_RE.fullmatch(name) is None
+        ):
+            _fail(
+                "required_checkpoint_names contains an invalid checkpoint "
+                f"name at index {index}."
+            )
+        names.append(name)
+        match = _CHECKPOINT_NAME_RE.fullmatch(name)
+        assert match is not None
+        iterations.append(int(match.group(1)))
+    if len(set(names)) != len(names):
+        _fail("required_checkpoint_names contains a duplicate checkpoint.")
+    if iterations != sorted(iterations):
+        _fail(
+            "required_checkpoint_names must be sorted by numeric iteration."
+        )
+    return names
+
+
+def _location_bound_file_record(
+    retained: Mapping[str, Any],
+    *,
+    location: str,
+) -> dict[str, Any]:
+    record = _exact_mapping(
+        dict(retained),
+        {"path", "sha256", "bytes", "identity"},
+        location=location,
+    )
+    path = _canonical_absolute(record["path"], location=f"{location}.path")
+    digest = _hash(record["sha256"], location=f"{location}.sha256")
+    byte_count = _exact_int(
+        record["bytes"],
+        location=f"{location}.bytes",
+        minimum=1,
+    )
+    identity = record["identity"]
+    if (
+        type(identity) is not dict
+        or type(identity.get("size")) is not int
+        or identity["size"] != byte_count
+    ):
+        _fail(f"{location}.identity size differs from retained bytes.")
+    return {
+        "path": str(path),
+        "sha256": digest,
+        "bytes": byte_count,
+    }
+
+
+def _assert_retained_file_unchanged(
+    path: Path,
+    expected_record: Mapping[str, Any],
+    *,
+    location: str,
+) -> dict[str, Any]:
+    _payload, current = retain_regular_file(path)
+    if not _strict_equal(current, dict(expected_record)):
+        _fail(f"{location} path, identity, or bytes changed during inspection.")
+    return _location_bound_file_record(current, location=location)
+
+
+def inspect_formal_checkpoint_run(
+    run_dir: str | os.PathLike[str],
+    required_checkpoint_names: Sequence[str],
+) -> dict[str, Any]:
+    """Validate one complete formal run and admit exact local checkpoints.
+
+    The existing committed-chain validator remains authoritative.  This
+    read-only projection additionally rejects every orphan local checkpoint
+    or sidecar, requires the current generation to have reached its configured
+    terminal update, and retains every bound file identity across admission
+    construction.  Requested checkpoints may come only from the run's local
+    committed segment, never from an imported ancestor proof.
+
+    Checkpoint receipts are decoded one file at a time with
+    ``weights_only=True`` on CPU.  This preserves compatibility with every
+    checkpoint accepted by the formal writer, including tensor layouts that
+    do not implement Meta kernels, while never materializing model state on
+    CUDA.
+
+    The returned canonical document is intentionally location-bound: absolute
+    artifact paths participate in its payload hash.  Copying an otherwise
+    identical run to another directory therefore requires a new live
+    inspection rather than reusing the old admission document.
+    """
+    candidate_run_dir = _canonical_absolute(
+        run_dir,
+        location="formal checkpoint run_dir",
+    )
+    required_names = _required_checkpoint_names(
+        required_checkpoint_names
+    )
+    run_io = FormalTrainingIO._read_only_view(candidate_run_dir)
+    run_io._lock_descriptor = _acquire_existing_run_lock(run_io.run_dir)
+    try:
+        lock_descriptor = run_io._lock_descriptor
+        if lock_descriptor is None:
+            _fail("Formal checkpoint inspection failed to retain its lock.")
+        lock_metadata = os.fstat(lock_descriptor)
+        _assert_lock_identity(
+            run_io.run_dir / ".formal_training.lock",
+            lock_metadata,
+            location="formal checkpoint inspection lock",
+        )
+        committed = run_io._load_committed_chain()
+        if committed is None:
+            _fail("Formal checkpoint run has no committed checkpoint head.")
+
+        local_entries = committed["entries"]
+        local_bindings = committed["local_file_bindings"]
+        head_paths = committed["head_paths"]
+        if (
+            not local_entries
+            or len(local_entries) != len(local_bindings)
+            or len(local_entries) != len(head_paths)
+        ):
+            _fail("Formal local checkpoint admission cardinality differs.")
+
+        local_names = [
+            entry["embedded_receipt"]["checkpoint_progress"]["filename"]
+            for entry in local_entries
+        ]
+        if (
+            len(set(local_names)) != len(local_names)
+            or local_names
+            != sorted(
+                local_names,
+                key=lambda name: int(
+                    _CHECKPOINT_NAME_RE.fullmatch(name).group(1)  # type: ignore[union-attr]
+                ),
+            )
+        ):
+            _fail("Formal local committed checkpoint names are not unique and sorted.")
+
+        checkpoint_files = run_io._checkpoint_files()
+        sidecar_files = run_io._sidecar_files()
+        expected_checkpoint_names = set(local_names)
+        expected_sidecar_names = {
+            _sidecar_name(name) for name in local_names
+        }
+        if set(checkpoint_files) != expected_checkpoint_names:
+            _fail(
+                "Formal checkpoint file set differs from the committed local "
+                "chain; a checkpoint is missing or orphaned."
+            )
+        if set(sidecar_files) != expected_sidecar_names:
+            _fail(
+                "Formal sidecar file set differs from the committed local "
+                "chain; a sidecar is missing or orphaned."
+            )
+
+        local_by_name = {
+            name: (entry, binding)
+            for name, entry, binding in zip(
+                local_names,
+                local_entries,
+                local_bindings,
+            )
+        }
+        missing_required = [
+            name for name in required_names if name not in local_by_name
+        ]
+        if missing_required:
+            _fail(
+                "Required checkpoint is not a committed local checkpoint: "
+                f"{missing_required}."
+            )
+
+        latest_entry = local_entries[-1]
+        latest_progress = latest_entry["embedded_receipt"][
+            "checkpoint_progress"
+        ]
+        schedule = run_io.launch_receipt["payload"]["schedule"]
+        target_updates = schedule["max_iterations"]
+        if (
+            latest_progress["configured_target_updates"] != target_updates
+            or latest_progress["updates_completed"] != target_updates
+            or latest_progress["iter"] != target_updates - 1
+            or latest_progress["filename"]
+            != committed["chain"]["latest_head"][
+                "checkpoint_file_name"
+            ]
+        ):
+            _fail(
+                "Formal checkpoint run latest committed head is not its "
+                "configured terminal checkpoint."
+            )
+
+        launch_path = run_io.run_dir / FORMAL_LAUNCH_RECEIPT_NAME
+        (
+            launch_document,
+            launch_payload,
+            launch_file_record,
+        ) = _read_canonical_json_retained(launch_path)
+        validated_launch = validate_training_launch_receipt(
+            launch_document
+        )
+        if (
+            launch_payload
+            != canonical_training_receipt_json_bytes(validated_launch)
+            or not _strict_equal(validated_launch, run_io.launch_receipt)
+        ):
+            _fail("Formal launch receipt changed during run inspection.")
+
+        ancestor_file_record: dict[str, Any] | None = None
+        retained_ancestor_record: dict[str, Any] | None = None
+        ancestor_record = committed["ancestor_chain_proof_record"]
+        if ancestor_record is not None:
+            ancestor_path = (
+                run_io.receipts_dir / _ANCESTOR_CHAIN_PROOF_NAME
+            )
+            (
+                ancestor_document,
+                ancestor_payload,
+                retained_ancestor_record,
+            ) = _read_canonical_json_retained(ancestor_path)
+            validated_ancestor = _validate_ancestor_chain_proof(
+                ancestor_document
+            )
+            if (
+                not _strict_equal(
+                    validated_ancestor,
+                    committed["ancestor_chain_proof"],
+                )
+                or ancestor_record["sha256"]
+                != hashlib.sha256(ancestor_payload).hexdigest()
+                or ancestor_record["bytes"] != len(ancestor_payload)
+            ):
+                _fail(
+                    "Formal ancestor proof differs during run inspection."
+                )
+            ancestor_file_record = _location_bound_file_record(
+                retained_ancestor_record,
+                location="formal ancestor chain proof",
+            )
+
+        selected_checkpoints: list[dict[str, Any]] = []
+        for name in required_names:
+            entry, binding = local_by_name[name]
+            progress = entry["embedded_receipt"]["checkpoint_progress"]
+            parent_record = checkpoint_parent_record(
+                embedded_receipt=entry["embedded_receipt"],
+                sidecar=entry["sidecar"],
+            )
+            checkpoint_record = _location_bound_file_record(
+                binding["checkpoint"],
+                location=f"formal checkpoint {name}",
+            )
+            sidecar_record = _location_bound_file_record(
+                binding["sidecar"],
+                location=f"formal sidecar {_sidecar_name(name)}",
+            )
+            if (
+                checkpoint_record["path"]
+                != str(run_io.run_dir / name)
+                or checkpoint_record["sha256"]
+                != parent_record["checkpoint_sha256"]
+                or checkpoint_record["bytes"]
+                != parent_record["checkpoint_bytes"]
+                or sidecar_record["path"]
+                != str(run_io.receipts_dir / _sidecar_name(name))
+            ):
+                _fail(
+                    f"Formal selected checkpoint file binding differs for {name}."
+                )
+            selected_checkpoints.append(
+                {
+                    "iteration": progress["iter"],
+                    "checkpoint": checkpoint_record,
+                    "sidecar": sidecar_record,
+                    "parent_record": parent_record,
+                }
+            )
+
+        # Re-read every file after constructing the projection.  Full retained
+        # identities, not merely content hashes, must remain unchanged.
+        _assert_retained_file_unchanged(
+            launch_path,
+            launch_file_record,
+            location="formal launch receipt",
+        )
+        for name, binding, head_path in zip(
+            local_names,
+            local_bindings,
+            head_paths,
+        ):
+            _assert_retained_file_unchanged(
+                checkpoint_files[name],
+                binding["checkpoint"],
+                location=f"formal checkpoint {name}",
+            )
+            _assert_retained_file_unchanged(
+                sidecar_files[_sidecar_name(name)],
+                binding["sidecar"],
+                location=f"formal sidecar {_sidecar_name(name)}",
+            )
+            _assert_retained_file_unchanged(
+                head_path,
+                binding["head"],
+                location=f"formal checkpoint head {head_path.name}",
+            )
+        if retained_ancestor_record is not None:
+            _assert_retained_file_unchanged(
+                run_io.receipts_dir / _ANCESTOR_CHAIN_PROOF_NAME,
+                retained_ancestor_record,
+                location="formal ancestor chain proof",
+            )
+        elif run_io._read_ancestor_chain_proof() is not None:
+            _fail(
+                "Formal ancestor chain proof appeared during run inspection."
+            )
+        if run_io._head_paths() != head_paths:
+            _fail("Formal checkpoint head set changed during run inspection.")
+        if set(run_io._checkpoint_files()) != expected_checkpoint_names:
+            _fail(
+                "Formal checkpoint file set changed during run inspection."
+            )
+        if set(run_io._sidecar_files()) != expected_sidecar_names:
+            _fail("Formal sidecar file set changed during run inspection.")
+
+        chain = committed["chain"]
+        payload = {
+            "run_dir": str(run_io.run_dir),
+            "required_checkpoint_names": required_names,
+            "launch_receipt": {
+                "file": _location_bound_file_record(
+                    launch_file_record,
+                    location="formal launch receipt",
+                ),
+                "document": validated_launch,
+            },
+            "chain": {
+                "schema_version": chain["schema_version"],
+                "contract": chain["contract"],
+                "entry_count": chain["entry_count"],
+                "local_entry_count": len(local_entries),
+                "ancestor_entry_count": len(
+                    committed["ancestor_entries"]
+                ),
+                "entries_sha256": canonical_training_receipt_sha256(
+                    chain["entries"]
+                ),
+                "local_entries_sha256": (
+                    canonical_training_receipt_sha256(local_entries)
+                ),
+                "head_files": [
+                    _location_bound_file_record(
+                        binding["head"],
+                        location=f"formal checkpoint head {path.name}",
+                    )
+                    for binding, path in zip(
+                        local_bindings,
+                        head_paths,
+                    )
+                ],
+                "ancestor_chain_proof_file": ancestor_file_record,
+                "latest_parent_record": chain["latest_head"],
+            },
+            "selected_checkpoints": selected_checkpoints,
+        }
+        document = {
+            "schema_version": (
+                FORMAL_CHECKPOINT_RUN_INSPECTION_SCHEMA_VERSION
+            ),
+            "contract": FORMAL_CHECKPOINT_RUN_INSPECTION_CONTRACT,
+            "payload": payload,
+            "payload_sha256": canonical_training_receipt_sha256(payload),
+        }
+        _assert_lock_identity(
+            run_io.run_dir / ".formal_training.lock",
+            lock_metadata,
+            location="formal checkpoint inspection lock",
+        )
+        return parse_canonical_training_receipt_json(
+            canonical_training_receipt_json_bytes(document)
+        )
+    finally:
+        run_io.close()
+
+
 __all__ = [
+    "FORMAL_CHECKPOINT_RUN_INSPECTION_CONTRACT",
+    "FORMAL_CHECKPOINT_RUN_INSPECTION_SCHEMA_VERSION",
     "FORMAL_CHECKPOINT_HEAD_CONTRACT",
     "FORMAL_CHECKPOINT_HEAD_SCHEMA_VERSION",
     "FORMAL_ANCESTOR_CHAIN_PROOF_CONTRACT",
@@ -1776,5 +2211,6 @@ __all__ = [
     "FORMAL_LAUNCH_RECEIPT_NAME",
     "FormalTrainingIO",
     "FormalTrainingIOError",
+    "inspect_formal_checkpoint_run",
     "inspect_formal_resume_parent",
 ]

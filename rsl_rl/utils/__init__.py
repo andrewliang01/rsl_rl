@@ -5,8 +5,11 @@
 
 """Helper functions."""
 
-from .motion_loader import AMPLoader
-from .motion_loader_for_display import AMPLoaderDisplay
+from .formal_training_io import (
+    FORMAL_CHECKPOINT_RUN_INSPECTION_CONTRACT,
+    FORMAL_CHECKPOINT_RUN_INSPECTION_SCHEMA_VERSION,
+    inspect_formal_checkpoint_run,
+)
 from .mid360_ray_time_builder import (
     MID360_NORMALIZED_SENSOR_FRAME,
     MID360_TIMESTAMP_ADAPTER_ABSOLUTE_POINTS,
@@ -20,6 +23,8 @@ from .mid360_ray_time_builder import (
     StaleMid360PacketError,
     point_packet_from_livox_custom_msg_arrays,
 )
+from .motion_loader import AMPLoader
+from .motion_loader_for_display import AMPLoaderDisplay
 from .ray_time_deployment_manifest import (
     RayTimeManifestError,
     build_ray_time_deployment_manifest,
@@ -81,6 +86,8 @@ __all__ = [
     "AMPLoader",
     "CHECKPOINT_EMBEDDED_RECEIPT_CONTRACT",
     "CHECKPOINT_SIDECAR_CONTRACT",
+    "FORMAL_CHECKPOINT_RUN_INSPECTION_CONTRACT",
+    "FORMAL_CHECKPOINT_RUN_INSPECTION_SCHEMA_VERSION",
     "MID360_NORMALIZED_SENSOR_FRAME",
     "MID360_TIMESTAMP_ADAPTER_ABSOLUTE_POINTS",
     "MID360_TIMESTAMP_CAPTURE_WINDOW_ONLY",
@@ -116,6 +123,7 @@ __all__ = [
     "default_ray_time_proprio_terms",
     "default_ray_time_tensorization",
     "get_param",
+    "inspect_formal_checkpoint_run",
     "point_packet_from_livox_custom_msg_arrays",
     "derive_checkpoint_progress",
     "parse_canonical_training_receipt_json",
