@@ -5,11 +5,14 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 
+from rsl_rl.modules.ray_return_event_time import RayReturnEventTimeEncoder
 from rsl_rl.utils.mid360_ray_time_builder import (
     MID360_CAPTURE_END_ACQUISITION_WINDOW,
     MID360_CAPTURE_END_LATEST_RETURN_LEGACY,
     MID360_NORMALIZED_SENSOR_FRAME,
+    MID360_STRICT_MAX_TIMESTAMP_TOLERANCE_S,
     MID360_TIMESTAMP_ADAPTER_ABSOLUTE_POINTS,
     MID360_TIMESTAMP_CAPTURE_WINDOW_ONLY,
     Mid360PointPacket,
@@ -117,6 +120,26 @@ def _xyz_from_spherical(
             range_m * np.sin(elevation),
         ],
         dtype=np.float64,
+    )
+
+
+def _builder_state_bytes(builder: Mid360RayTimeTensorBuilder) -> tuple[object, ...]:
+    arrays = (
+        builder._history,
+        builder._window_indices,
+        builder._capture_end_times_s,
+        builder._return_timestamps_s,
+        builder._return_timestamp_valid,
+        builder._frame_valid,
+    )
+    return (
+        *((array.shape, array.dtype.str, array.tobytes()) for array in arrays),
+        builder._last_window_index,
+        builder._last_window_capture_end_s,
+        builder._last_acquisition_capture_end_s,
+        builder._last_stats,
+        builder._implicit_missing_packets_total,
+        builder._explicit_dropped_packets_total,
     )
 
 
@@ -640,6 +663,58 @@ def test_randomized_collision_oracle_is_order_invariant(tmp_path: Path) -> None:
         )
 
 
+def test_twenty_thousand_point_collision_path_remains_deterministic(
+    tmp_path: Path,
+) -> None:
+    rng = np.random.default_rng(20260801)
+    point_count = 20_000
+    ranges = rng.uniform(0.2, 8.0, size=point_count)
+    elevation = np.deg2rad(rng.uniform(-7.0, 52.0, size=point_count))
+    azimuth = np.deg2rad(rng.uniform(-180.0, 180.0, size=point_count))
+    points = np.stack(
+        (
+            ranges * np.cos(elevation) * np.cos(azimuth),
+            ranges * np.cos(elevation) * np.sin(azimuth),
+            ranges * np.sin(elevation),
+        ),
+        axis=1,
+    ).astype(np.float64)
+    timestamps = np.linspace(
+        40.0,
+        40.1,
+        point_count,
+        dtype=np.float64,
+    )
+
+    outputs = []
+    for suffix, permutation in (
+        ("native", np.arange(point_count)),
+        ("reversed", np.arange(point_count - 1, -1, -1)),
+    ):
+        builder = _event_time_builder(tmp_path / suffix, history_length=1)
+        stats = builder.ingest_point_packet(
+            _timed_packet(
+                points=points[permutation],
+                point_timestamps_s=timestamps[permutation],
+                window_index=0,
+                capture_start_s=40.0,
+                capture_end_s=40.1,
+            )
+        )
+        assert stats.input_return_points == point_count
+        assert stats.collided_return_points > 0
+        outputs.append(
+            builder.aligned_event_time_history(
+                now_s=40.1,
+                monotonic_clock_domain="CLOCK_MONOTONIC_RAW:boot-7",
+            )
+        )
+
+    np.testing.assert_array_equal(outputs[0].ray_history, outputs[1].ray_history)
+    np.testing.assert_array_equal(outputs[0].return_valid, outputs[1].return_valid)
+    np.testing.assert_allclose(outputs[0].return_age_s, outputs[1].return_age_s)
+
+
 def test_range_time_flip_roll_and_history_shifts_are_identical(
     tmp_path: Path,
 ) -> None:
@@ -696,7 +771,7 @@ def test_range_time_flip_roll_and_history_shifts_are_identical(
         )
 
 
-def test_empty_unfilled_and_dropped_frames_have_zero_age_and_false_validity(
+def test_empty_acquisition_is_valid_but_unfilled_and_drop_are_not(
     tmp_path: Path,
 ) -> None:
     builder = _event_time_builder(tmp_path, history_length=3)
@@ -725,8 +800,8 @@ def test_empty_unfilled_and_dropped_frames_have_zero_age_and_false_validity(
     )
 
     assert aligned.window_indices.tolist() == [-1, 0, 1]
-    assert aligned.frame_valid.tolist() == [False, False, False]
-    assert np.count_nonzero(aligned.packet_age_s) == 0
+    assert aligned.frame_valid.tolist() == [False, True, False]
+    assert aligned.packet_age_s.tolist() == pytest.approx([0.0, 0.1, 0.0])
     assert not aligned.return_valid.any()
     assert np.count_nonzero(aligned.return_age_s) == 0
     assert np.count_nonzero(aligned.ray_history) == 0
@@ -755,7 +830,8 @@ def test_emitted_no_return_is_not_converted_to_observed_free_space(
 
     assert stats.emitted_bin_fraction == 1.0
     assert stats.observed_hit_bins == 0
-    assert not aligned.frame_valid[0]
+    assert aligned.frame_valid[0]
+    assert aligned.packet_age_s.tolist() == pytest.approx([0.0])
     assert np.count_nonzero(aligned.ray_history) == 0
     assert not aligned.return_valid.any()
 
@@ -837,6 +913,308 @@ def test_strict_event_time_requires_verified_returns_and_common_clock(
         )
 
 
+def test_failed_ingests_are_byte_atomic_and_next_packet_needs_no_reset(
+    tmp_path: Path,
+) -> None:
+    builder = _event_time_builder(tmp_path, history_length=3)
+    point = _xyz_from_spherical(2.0, 0.0, 0.0)[None, :]
+    builder.ingest_point_packet(
+        _timed_packet(
+            points=point,
+            point_timestamps_s=np.asarray((1.05,), dtype=np.float64),
+            window_index=0,
+            capture_start_s=1.0,
+            capture_end_s=1.1,
+        )
+    )
+    before = _builder_state_bytes(builder)
+    huge_index = int(np.iinfo(np.int64).max) + 1
+
+    bad_calls = (
+        lambda: builder.ingest_point_packet(
+            _timed_packet(
+                points=point,
+                point_timestamps_s=np.asarray((1.15,), dtype=np.float64),
+                window_index=huge_index,
+                capture_start_s=1.1,
+                capture_end_s=1.2,
+            )
+        ),
+        lambda: builder.ingest_sensor_grid(
+            np.zeros((16, 96), dtype=np.float32),
+            np.zeros((16, 96), dtype=np.bool_),
+            window_index=np.uint64(huge_index),
+            capture_start_s=1.1,
+            capture_end_s=1.2,
+            monotonic_clock_domain="CLOCK_MONOTONIC_RAW:boot-7",
+        ),
+        lambda: builder.record_dropped_packet(
+            window_index=huge_index,
+            capture_start_s=1.1,
+            capture_end_s=1.2,
+            monotonic_clock_domain="CLOCK_MONOTONIC_RAW:boot-7",
+        ),
+        lambda: builder.ingest_point_packet(
+            _timed_packet(
+                points=point,
+                point_timestamps_s=np.asarray((9.95,), dtype=np.float64),
+                window_index=1,
+                capture_start_s=9.9,
+                capture_end_s=10.0,
+            )
+        ),
+        lambda: builder.ingest_point_packet(
+            _timed_packet(
+                points=point,
+                point_timestamps_s=np.asarray((float("nan"),), dtype=np.float64),
+                window_index=1,
+                capture_start_s=1.1,
+                capture_end_s=1.2,
+            )
+        ),
+    )
+    for bad_call in bad_calls:
+        with pytest.raises((Mid360RayTimeBuilderError, TypeError)):
+            bad_call()
+        assert _builder_state_bytes(builder) == before
+
+    stats = builder.ingest_point_packet(
+        _timed_packet(
+            points=point,
+            point_timestamps_s=np.asarray((1.15,), dtype=np.float64),
+            window_index=1,
+            capture_start_s=1.1,
+            capture_end_s=1.2,
+        )
+    )
+    assert stats.window_index == 1
+    assert builder.window_indices.tolist() == [-1, 0, 1]
+
+
+def test_window_index_accepts_int64_max_without_storage_overflow(
+    tmp_path: Path,
+) -> None:
+    builder = _event_time_builder(tmp_path, history_length=1)
+    max_index = int(np.iinfo(np.int64).max)
+    stats = builder.ingest_sensor_grid(
+        np.zeros((16, 96), dtype=np.float32),
+        np.zeros((16, 96), dtype=np.bool_),
+        window_index=max_index,
+        capture_start_s=1.0,
+        capture_end_s=1.1,
+        monotonic_clock_domain="CLOCK_MONOTONIC_RAW:boot-7",
+    )
+    assert stats.window_index == max_index
+    assert builder.window_indices.tolist() == [max_index]
+
+
+def test_explicit_drop_guards_future_but_does_not_refresh_staleness(
+    tmp_path: Path,
+) -> None:
+    builder = _event_time_builder(
+        tmp_path,
+        history_length=2,
+        max_packet_age_s=0.15,
+    )
+    point = _xyz_from_spherical(2.0, 0.0, 0.0)[None, :]
+    builder.ingest_point_packet(
+        _timed_packet(
+            points=point,
+            point_timestamps_s=np.asarray((1.05,), dtype=np.float64),
+            window_index=0,
+            capture_start_s=1.0,
+            capture_end_s=1.1,
+        )
+    )
+    builder.record_dropped_packet(
+        window_index=1,
+        capture_start_s=1.1,
+        capture_end_s=1.2,
+        monotonic_clock_domain="CLOCK_MONOTONIC_RAW:boot-7",
+    )
+
+    with pytest.raises(StaleMid360PacketError, match="last declared"):
+        builder.aligned_event_time_history(
+            now_s=1.15,
+            monotonic_clock_domain="CLOCK_MONOTONIC_RAW:boot-7",
+        )
+
+    aligned = builder.aligned_event_time_history(
+        now_s=1.2,
+        monotonic_clock_domain="CLOCK_MONOTONIC_RAW:boot-7",
+    )
+    assert aligned.frame_valid.tolist() == [True, False]
+    assert aligned.packet_age_s.tolist() == pytest.approx([0.1, 0.0])
+
+    with pytest.raises(StaleMid360PacketError, match="stale"):
+        builder.aligned_event_time_history(
+            now_s=1.26,
+            monotonic_clock_domain="CLOCK_MONOTONIC_RAW:boot-7",
+        )
+
+
+def test_strict_absolute_times_are_float64_and_precise_at_long_uptime(
+    tmp_path: Path,
+) -> None:
+    uptime = 10_000_000.0
+    point = _xyz_from_spherical(2.0, 0.0, 0.0)[None, :]
+    builder = _event_time_builder(tmp_path / "uptime", history_length=1)
+    builder.ingest_point_packet(
+        _timed_packet(
+            points=point,
+            point_timestamps_s=np.asarray((uptime + 0.025,), dtype=np.float64),
+            window_index=0,
+            capture_start_s=uptime,
+            capture_end_s=uptime + 0.1,
+        )
+    )
+    aligned = builder.aligned_event_time_history(
+        now_s=uptime + 0.115,
+        monotonic_clock_domain="CLOCK_MONOTONIC_RAW:boot-7",
+    )
+    assert aligned.packet_age_s.tolist() == pytest.approx([0.015], abs=2e-7)
+    assert aligned.return_age_s[aligned.return_valid].tolist() == pytest.approx(
+        [0.09],
+        abs=2e-7,
+    )
+
+    bad_point_builder = _event_time_builder(
+        tmp_path / "point_float32",
+        history_length=1,
+    )
+    with pytest.raises(Mid360RayTimeBuilderError, match="must use float64"):
+        bad_point_builder.ingest_point_packet(
+            _timed_packet(
+                points=point,
+                point_timestamps_s=np.asarray((uptime,), dtype=np.float32),
+                window_index=0,
+                capture_start_s=uptime,
+                capture_end_s=uptime + 0.1,
+            )
+        )
+
+    bad_grid_builder = _event_time_builder(
+        tmp_path / "grid_float32",
+        history_length=1,
+    )
+    ranges = np.zeros((16, 96), dtype=np.float32)
+    hits = np.zeros((16, 96), dtype=np.bool_)
+    timestamps = np.zeros((16, 96), dtype=np.float32)
+    ranges[0, 0] = 2.0
+    hits[0, 0] = True
+    timestamps[0, 0] = np.float32(uptime)
+    with pytest.raises(Mid360RayTimeBuilderError, match="must use float64"):
+        bad_grid_builder.ingest_sensor_grid(
+            ranges,
+            hits,
+            window_index=0,
+            capture_start_s=uptime,
+            capture_end_s=uptime + 0.1,
+            sensor_return_timestamps_s=timestamps,
+            monotonic_clock_domain="CLOCK_MONOTONIC_RAW:boot-7",
+        )
+    timestamps64 = np.zeros((16, 96), dtype=np.float64)
+    timestamps64[0, 0] = uptime + 0.025
+    bad_grid_builder.ingest_sensor_grid(
+        ranges,
+        hits,
+        window_index=0,
+        capture_start_s=uptime,
+        capture_end_s=uptime + 0.1,
+        sensor_return_timestamps_s=timestamps64,
+        monotonic_clock_domain="CLOCK_MONOTONIC_RAW:boot-7",
+    )
+    grid_aligned = bad_grid_builder.aligned_event_time_history(
+        now_s=uptime + 0.115,
+        monotonic_clock_domain="CLOCK_MONOTONIC_RAW:boot-7",
+    )
+    assert grid_aligned.return_age_s[
+        grid_aligned.return_valid
+    ].tolist() == pytest.approx([0.09], abs=2e-7)
+
+    bad_capture_builder = _event_time_builder(
+        tmp_path / "capture_float32",
+        history_length=1,
+    )
+    with pytest.raises(Mid360RayTimeBuilderError, match="must use float64"):
+        bad_capture_builder.ingest_sensor_grid(
+            np.zeros((16, 96), dtype=np.float32),
+            np.zeros((16, 96), dtype=np.bool_),
+            window_index=0,
+            capture_start_s=np.float32(1.0),
+            capture_end_s=1.1,
+            monotonic_clock_domain="CLOCK_MONOTONIC_RAW:boot-7",
+        )
+
+    with pytest.raises(Mid360RayTimeBuilderError, match="must use float64"):
+        builder.aligned_event_time_history(
+            now_s=np.float32(uptime + 0.115),
+            monotonic_clock_domain="CLOCK_MONOTONIC_RAW:boot-7",
+        )
+
+
+def test_builder_output_matches_event_time_encoder_contract(tmp_path: Path) -> None:
+    builder = _event_time_builder(tmp_path, history_length=4)
+    point_a = _xyz_from_spherical(2.0, 0.0, 0.0)[None, :]
+    point_b = _xyz_from_spherical(3.0, 10.0, 90.0)[None, :]
+    builder.ingest_point_packet(
+        _timed_packet(
+            points=point_a,
+            point_timestamps_s=np.asarray((1.05,), dtype=np.float64),
+            window_index=0,
+            capture_start_s=1.0,
+            capture_end_s=1.1,
+        )
+    )
+    builder.ingest_sensor_grid(
+        np.zeros((16, 96), dtype=np.float32),
+        np.zeros((16, 96), dtype=np.bool_),
+        window_index=1,
+        capture_start_s=1.1,
+        capture_end_s=1.2,
+        monotonic_clock_domain="CLOCK_MONOTONIC_RAW:boot-7",
+    )
+    builder.ingest_point_packet(
+        _timed_packet(
+            points=point_b,
+            point_timestamps_s=np.asarray((1.38,), dtype=np.float64),
+            window_index=3,
+            capture_start_s=1.3,
+            capture_end_s=1.4,
+        )
+    )
+    aligned = builder.aligned_event_time_history(
+        now_s=1.4,
+        monotonic_clock_domain="CLOCK_MONOTONIC_RAW:boot-7",
+    )
+    assert aligned.frame_valid.tolist() == [True, True, False, True]
+    assert aligned.packet_age_s.tolist() == pytest.approx([0.3, 0.2, 0.0, 0.0])
+
+    encoder = RayReturnEventTimeEncoder(
+        history_length=4,
+        input_spatial_size=(16, 96),
+        token_spatial_size=(4, 12),
+        token_dim=16,
+        mode="per_return_age",
+    ).eval()
+    with torch.no_grad():
+        output, diagnostics = encoder.forward_with_diagnostics(
+            torch.from_numpy(aligned.return_valid)[None, ...],
+            torch.from_numpy(aligned.packet_age_s)[None, ...],
+            torch.from_numpy(aligned.frame_valid)[None, ...],
+            torch.from_numpy(aligned.return_age_s)[None, ...],
+        )
+
+    assert output.shape == (1, 4, 48, 16)
+    assert torch.isfinite(output).all()
+    assert not diagnostics["token_valid"][0, 1].any()
+    assert not diagnostics["token_valid"][0, 2].any()
+    assert torch.equal(output[0, 1], torch.zeros_like(output[0, 1]))
+    assert torch.equal(output[0, 2], torch.zeros_like(output[0, 2]))
+    assert diagnostics["token_valid"][0, 0].any()
+    assert diagnostics["token_valid"][0, 3].any()
+
+
 def test_timestamp_tolerance_clamps_boundary_but_rejects_negative_age(
     tmp_path: Path,
 ) -> None:
@@ -844,19 +1222,19 @@ def test_timestamp_tolerance_clamps_boundary_but_rejects_negative_age(
     builder = _event_time_builder(
         tmp_path / "within",
         history_length=1,
-        timestamp_tolerance_s=1.0e-3,
+        timestamp_tolerance_s=1.0e-5,
     )
     builder.ingest_point_packet(
         _timed_packet(
             points=point,
-            point_timestamps_s=np.asarray((5.1005,)),
+            point_timestamps_s=np.asarray((5.100005,)),
             window_index=0,
             capture_start_s=5.0,
             capture_end_s=5.1,
         )
     )
     aligned = builder.aligned_event_time_history(
-        now_s=5.0995,
+        now_s=5.099995,
         monotonic_clock_domain="CLOCK_MONOTONIC_RAW:boot-7",
     )
     assert aligned.packet_age_s.tolist() == pytest.approx([0.0])
@@ -866,18 +1244,18 @@ def test_timestamp_tolerance_clamps_boundary_but_rejects_negative_age(
 
     with pytest.raises(StaleMid360PacketError, match="future"):
         builder.aligned_event_time_history(
-            now_s=5.0989,
+            now_s=5.099989,
             monotonic_clock_domain="CLOCK_MONOTONIC_RAW:boot-7",
         )
 
     for suffix, bad_timestamp in (
-        ("outside", 5.1011),
+        ("outside", 5.100011),
         ("nan", float("nan")),
     ):
         bad_builder = _event_time_builder(
             tmp_path / suffix,
             history_length=1,
-            timestamp_tolerance_s=1.0e-3,
+            timestamp_tolerance_s=1.0e-5,
         )
         with pytest.raises(
             Mid360RayTimeBuilderError,
@@ -895,10 +1273,12 @@ def test_timestamp_tolerance_clamps_boundary_but_rejects_negative_age(
 
     with pytest.raises(
         Mid360RayTimeBuilderError,
-        match="timestamp_tolerance_s must be smaller",
+        match="timestamp_tolerance_s cannot exceed",
     ):
         _event_time_builder(
             tmp_path / "oversized_tolerance",
             history_length=1,
-            timestamp_tolerance_s=0.1,
+            timestamp_tolerance_s=(
+                MID360_STRICT_MAX_TIMESTAMP_TOLERANCE_S + 1.0e-9
+            ),
         )
