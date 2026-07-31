@@ -666,6 +666,113 @@ def test_formal_resume_uses_absolute_target_without_repeating_update(
     ] == 3
 
 
+def test_formal_external_parent_requirement_needs_live_configuration(
+    tmp_path: Path,
+) -> None:
+    runner = _runner(tmp_path, target=1, save_interval=1)
+    with pytest.raises(FormalTrainingIOError, match="configured runner"):
+        _ = runner.formal_external_parent_load_required
+
+    _configure(
+        runner,
+        _launch_receipt(target=1, save_interval=1),
+        tmp_path,
+    )
+    assert runner.formal_external_parent_load_required is False
+    with pytest.raises(AttributeError):
+        runner.formal_external_parent_load_required = True
+
+    runner.close_formal_training()
+    with pytest.raises(FormalTrainingIOError, match="held run lock"):
+        _ = runner.formal_external_parent_load_required
+
+
+def test_formal_resumed_launch_requires_parent_until_exact_load(
+    tmp_path: Path,
+) -> None:
+    parent_dir = tmp_path / "parent"
+    parent_dir.mkdir()
+    _save_partial_parent(parent_dir)
+    parent_checkpoint = parent_dir / "model_0.pt"
+    inspected = inspect_formal_resume_parent(parent_checkpoint)
+
+    child_dir = tmp_path / "child"
+    child = _runner(child_dir, target=3, save_interval=1)
+    child_launch = _launch_receipt(
+        target=3,
+        save_interval=1,
+        resume=_resume_record(inspected["parent_record"]),
+        started_at="2026-07-31T04:00:30+00:00",
+    )
+    _configure(child, child_launch, child_dir)
+
+    child._formal_updates_completed = 1
+    with pytest.raises(FormalTrainingIOError, match="state is inconsistent"):
+        _ = child.formal_external_parent_load_required
+    child._formal_updates_completed = 0
+    child._formal_resume_loaded = True
+    with pytest.raises(FormalTrainingIOError, match="state is inconsistent"):
+        _ = child.formal_external_parent_load_required
+    child._formal_resume_loaded = False
+    assert child.formal_external_parent_load_required is True
+    child.load(str(parent_checkpoint))
+    assert child.formal_external_parent_load_required is False
+    child.close_formal_training()
+
+
+def test_formal_local_recovery_satisfies_external_parent_requirement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent_dir = tmp_path / "parent"
+    parent_dir.mkdir()
+    _save_partial_parent(parent_dir)
+    parent_checkpoint = parent_dir / "model_0.pt"
+    inspected = inspect_formal_resume_parent(parent_checkpoint)
+
+    child_dir = tmp_path / "child"
+    child_launch = _launch_receipt(
+        target=3,
+        save_interval=1,
+        resume=_resume_record(inspected["parent_record"]),
+        started_at="2026-07-31T04:00:40+00:00",
+    )
+    first = _runner(child_dir, target=3, save_interval=1)
+    _configure(first, child_launch, child_dir)
+    assert first.formal_external_parent_load_required is True
+    first.load(str(parent_checkpoint))
+    assert first.formal_external_parent_load_required is False
+    first._formal_updates_completed = 2
+    first.current_learning_iteration = 1
+
+    original_publish = formal_io_module._publish_new_bytes
+
+    def fail_before_head(path: Path, payload: bytes) -> None:
+        if path.parent.name == "heads":
+            raise RuntimeError("simulated resumed orphan before head")
+        original_publish(path, payload)
+
+    monkeypatch.setattr(
+        formal_io_module,
+        "_publish_new_bytes",
+        fail_before_head,
+    )
+    with pytest.raises(RuntimeError, match="resumed orphan before head"):
+        first.save(str(child_dir / "model_1.pt"))
+    monkeypatch.setattr(
+        formal_io_module,
+        "_publish_new_bytes",
+        original_publish,
+    )
+
+    recovery = _runner(child_dir, target=3, save_interval=1)
+    _configure(recovery, child_launch, child_dir)
+    assert recovery.alg.load_calls == 1
+    assert recovery._formal_updates_completed == 2
+    assert recovery.formal_external_parent_load_required is False
+    recovery.close_formal_training()
+
+
 @pytest.mark.parametrize("iteration", [0, 2000, 19999])
 def test_formal_checkpoint_filename_matches_zero_index_iteration(
     tmp_path: Path,

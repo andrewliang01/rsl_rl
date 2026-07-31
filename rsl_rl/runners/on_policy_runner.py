@@ -513,6 +513,58 @@ class OnPolicyRunner:
             self.current_learning_iteration = progress["iter"]
             self._formal_resume_loaded = True
 
+    @property
+    def formal_external_parent_load_required(self) -> bool:
+        """Return whether the bound external parent must still be loaded.
+
+        Formal configuration attempts same-run local recovery before this
+        property can return.  A resumed launch therefore returns ``True`` only
+        when no local checkpoint was recovered and the algorithm is still in
+        its unmodified, pre-parent state.
+        """
+        formal_io = self._formal_training_io
+        launch = self._formal_launch_receipt
+        if formal_io is None or launch is None:
+            raise FormalTrainingIOError(
+                "Formal external-parent requirement needs a configured runner."
+            )
+        if not formal_io.lock_held:
+            raise FormalTrainingIOError(
+                "Formal external-parent requirement needs a held run lock."
+            )
+        if type(self._formal_resume_loaded) is not bool:
+            raise FormalTrainingIOError(
+                "Formal external-parent requirement state is inconsistent."
+            )
+        resume = launch["payload"]["resume"]
+        if self._formal_resume_loaded:
+            if (
+                resume["is_resume"] is True
+                and (
+                    self._formal_parent_checkpoint is None
+                    or type(self._formal_updates_completed) is not int
+                    or self._formal_updates_completed
+                    < resume["parent_updates_completed"]
+                )
+            ):
+                raise FormalTrainingIOError(
+                    "Formal external-parent requirement state is inconsistent."
+                )
+            return False
+        if (
+            resume["is_resume"] is not True
+            or type(self._formal_updates_completed) is not int
+            or self._formal_updates_completed != 0
+            or type(self.current_learning_iteration) is not int
+            or self.current_learning_iteration != 0
+            or self._formal_parent_checkpoint is not None
+            or self._formal_last_local_embedded_receipt is not None
+        ):
+            raise FormalTrainingIOError(
+                "Formal external-parent requirement state is inconsistent."
+            )
+        return True
+
     def close_formal_training(self) -> None:
         """Release the formal run lock, if configured."""
         formal_io = self._formal_training_io
