@@ -262,3 +262,14 @@ def test_incomplete_horizon_and_non_boolean_trace_are_rejected():
     trace = _trace(_constant_contact(30))
     with pytest.raises(CteqContractError, match="complete horizon"):
         build_independent_event_labels(trace, anchor_indices=[5])
+
+
+def test_initial_contact_glitch_requires_stable_preroll():
+    raw = _constant_contact(12)
+    raw[0, 0] = True
+    with pytest.raises(CteqContractError, match="stable pre-roll"):
+        _trace(raw, stable_steps=3)
+
+    too_short = _constant_contact(2)
+    with pytest.raises(CteqContractError, match="initial pre-roll"):
+        _trace(too_short, stable_steps=3)

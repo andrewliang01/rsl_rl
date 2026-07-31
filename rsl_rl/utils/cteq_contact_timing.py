@@ -111,6 +111,16 @@ def debounce_contact_trace(
         raise CteqContractError("sample_period_s must be positive and finite.")
     if type(min_stable_steps) is not int or min_stable_steps < 1:
         raise CteqContractError("min_stable_steps must be a positive integer.")
+    if raw.shape[0] < min_stable_steps:
+        raise CteqContractError(
+            "Contact trace must include at least min_stable_steps of initial pre-roll."
+        )
+    initial_window = raw[:min_stable_steps]
+    if np.any(initial_window != initial_window[:1]):
+        raise CteqContractError(
+            "Initial contact state requires min_stable_steps of stable pre-roll; "
+            "do not turn an episode-boundary glitch into TD/LO truth."
+        )
 
     stable = np.empty_like(raw)
     for foot in range(2):
@@ -674,6 +684,7 @@ def cteq_pr01_status() -> Mapping[str, Any]:
         "gpu_required": False,
         "future_truth_allowed_consumers": CTEQ_ALLOWED_TRUTH_CONSUMERS,
         "blocked_next_steps": (
+            "administrative_censor_contract_for_early_termination",
             "torch_hazard_head_and_gradient_smoke",
             "actor_query_integration",
             "ppo_training",
