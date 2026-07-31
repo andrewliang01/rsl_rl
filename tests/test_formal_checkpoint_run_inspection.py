@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import shutil
 from pathlib import Path
@@ -17,6 +18,7 @@ import rsl_rl.utils.formal_training_io as formal_io_module
 from rsl_rl.utils import (
     FORMAL_CHECKPOINT_RUN_INSPECTION_CONTRACT,
     inspect_formal_checkpoint_run as exported_inspector,
+    validate_formal_checkpoint_run_inspection_document as exported_validator,
 )
 from rsl_rl.utils.formal_training_io import (
     FORMAL_CHECKPOINT_RUN_INSPECTION_SCHEMA_VERSION,
@@ -24,6 +26,7 @@ from rsl_rl.utils.formal_training_io import (
     FormalTrainingIOError,
     inspect_formal_checkpoint_run,
     inspect_formal_resume_parent,
+    validate_formal_checkpoint_run_inspection_document,
 )
 from rsl_rl.utils.training_receipt import (
     TrainingReceiptError,
@@ -281,6 +284,13 @@ def _tree_snapshot(root: Path) -> dict[str, bytes]:
     }
 
 
+def _rehash_inspection(document: dict[str, Any]) -> dict[str, Any]:
+    document["payload_sha256"] = canonical_training_receipt_sha256(
+        document["payload"]
+    )
+    return document
+
+
 def test_inspection_is_canonical_deterministic_read_only_and_exported(
     tmp_path: Path,
 ) -> None:
@@ -347,6 +357,248 @@ def test_inspection_is_canonical_deterministic_read_only_and_exported(
         assert selected["sidecar"]["sha256"] == hashlib.sha256(
             sidecar.read_bytes()
         ).hexdigest()
+
+
+def test_inspection_document_validator_roundtrips_without_live_files(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    _fresh_run(run_dir)
+    inspected = inspect_formal_checkpoint_run(
+        run_dir,
+        ["model_0.pt", "model_2.pt"],
+    )
+    shutil.rmtree(run_dir)
+
+    assert (
+        validate_formal_checkpoint_run_inspection_document(inspected)
+        == inspected
+    )
+    assert exported_validator(inspected) == inspected
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("schema_version", True),
+        ("schema_version", 2),
+        ("contract", "rsl_rl_formal_checkpoint_run_inspection_v0"),
+        ("payload_sha256", "f" * 64),
+    ],
+)
+def test_inspection_document_rejects_envelope_substitution(
+    tmp_path: Path,
+    field: str,
+    value: Any,
+) -> None:
+    run_dir = tmp_path / "run"
+    _fresh_run(run_dir, target=1)
+    tampered = inspect_formal_checkpoint_run(
+        run_dir,
+        ["model_0.pt"],
+    )
+    tampered[field] = value
+
+    with pytest.raises(FORMAL_FAILURES):
+        validate_formal_checkpoint_run_inspection_document(tampered)
+
+
+@pytest.mark.parametrize(
+    ("location", "extra_key"),
+    [
+        ("root", "unexpected_root"),
+        ("payload", "unexpected_payload"),
+        ("launch", "unexpected_launch"),
+        ("chain", "unexpected_chain"),
+        ("selected", "unexpected_selected"),
+        ("file", "unexpected_file"),
+    ],
+)
+def test_inspection_document_rejects_non_exact_keysets(
+    tmp_path: Path,
+    location: str,
+    extra_key: str,
+) -> None:
+    run_dir = tmp_path / "run"
+    _fresh_run(run_dir, target=1)
+    tampered = inspect_formal_checkpoint_run(
+        run_dir,
+        ["model_0.pt"],
+    )
+    if location == "root":
+        tampered[extra_key] = True
+    elif location == "payload":
+        tampered["payload"][extra_key] = True
+    elif location == "launch":
+        tampered["payload"]["launch_receipt"][extra_key] = True
+    elif location == "chain":
+        tampered["payload"]["chain"][extra_key] = True
+    elif location == "selected":
+        tampered["payload"]["selected_checkpoints"][0][extra_key] = True
+    else:
+        tampered["payload"]["selected_checkpoints"][0]["checkpoint"][
+            extra_key
+        ] = True
+    _rehash_inspection(tampered)
+
+    with pytest.raises(FORMAL_FAILURES):
+        validate_formal_checkpoint_run_inspection_document(tampered)
+
+
+@pytest.mark.parametrize(
+    "attack",
+    [
+        "selected_iteration",
+        "selected_checkpoint_sha",
+        "latest_progress",
+        "launch_file_bytes",
+        "chain_counts",
+        "fresh_chain_hash_split",
+    ],
+)
+def test_inspection_document_rejects_rehashed_internal_mismatches(
+    tmp_path: Path,
+    attack: str,
+) -> None:
+    run_dir = tmp_path / "run"
+    _fresh_run(run_dir)
+    tampered = inspect_formal_checkpoint_run(
+        run_dir,
+        ["model_0.pt", "model_2.pt"],
+    )
+    payload = tampered["payload"]
+    if attack == "selected_iteration":
+        payload["selected_checkpoints"][0]["iteration"] = 1
+    elif attack == "selected_checkpoint_sha":
+        payload["selected_checkpoints"][0]["checkpoint"]["sha256"] = "f" * 64
+    elif attack == "latest_progress":
+        payload["chain"]["latest_parent_record"]["consumed_transitions"] -= 2
+    elif attack == "launch_file_bytes":
+        payload["launch_receipt"]["file"]["bytes"] += 1
+    elif attack == "chain_counts":
+        payload["chain"]["entry_count"] += 1
+    else:
+        payload["chain"]["local_entries_sha256"] = "f" * 64
+    _rehash_inspection(tampered)
+
+    with pytest.raises(FORMAL_FAILURES):
+        validate_formal_checkpoint_run_inspection_document(tampered)
+
+
+@pytest.mark.parametrize(
+    "attack",
+    [
+        "run_dir_only",
+        "selected_checkpoint_only",
+        "ancestor_file_only",
+        "noncanonical_run_dir",
+    ],
+)
+def test_inspection_document_rejects_location_migration(
+    tmp_path: Path,
+    attack: str,
+) -> None:
+    run_dir = (
+        _resumed_terminal_run(tmp_path)
+        if attack == "ancestor_file_only"
+        else tmp_path / "run"
+    )
+    if attack != "ancestor_file_only":
+        _fresh_run(run_dir, target=1)
+    required = (
+        ["model_1.pt", "model_3.pt"]
+        if attack == "ancestor_file_only"
+        else ["model_0.pt"]
+    )
+    tampered = inspect_formal_checkpoint_run(run_dir, required)
+    payload = tampered["payload"]
+    migrated = tmp_path / "migrated"
+    if attack == "run_dir_only":
+        payload["run_dir"] = str(migrated)
+    elif attack == "selected_checkpoint_only":
+        payload["selected_checkpoints"][0]["checkpoint"]["path"] = str(
+            migrated / required[0]
+        )
+    elif attack == "ancestor_file_only":
+        payload["chain"]["ancestor_chain_proof_file"]["path"] = str(
+            migrated / "checkpoint_receipts/ancestor_chain.json"
+        )
+    else:
+        payload["run_dir"] = f"{run_dir}/../{run_dir.name}"
+    _rehash_inspection(tampered)
+
+    with pytest.raises(FORMAL_FAILURES):
+        validate_formal_checkpoint_run_inspection_document(tampered)
+
+
+@pytest.mark.parametrize(
+    "attack",
+    ["required_reordered", "required_duplicate", "head_reordered", "head_duplicate"],
+)
+def test_inspection_document_rejects_reordering_and_duplicates(
+    tmp_path: Path,
+    attack: str,
+) -> None:
+    run_dir = tmp_path / "run"
+    _fresh_run(run_dir)
+    tampered = inspect_formal_checkpoint_run(
+        run_dir,
+        ["model_0.pt", "model_2.pt"],
+    )
+    payload = tampered["payload"]
+    if attack == "required_reordered":
+        payload["required_checkpoint_names"].reverse()
+        payload["selected_checkpoints"].reverse()
+    elif attack == "required_duplicate":
+        payload["required_checkpoint_names"][1] = "model_0.pt"
+        payload["selected_checkpoints"][1] = copy.deepcopy(
+            payload["selected_checkpoints"][0]
+        )
+    elif attack == "head_reordered":
+        payload["chain"]["head_files"].reverse()
+    else:
+        payload["chain"]["head_files"].append(
+            copy.deepcopy(payload["chain"]["head_files"][-1])
+        )
+        payload["chain"]["local_entry_count"] += 1
+        payload["chain"]["entry_count"] += 1
+    _rehash_inspection(tampered)
+
+    with pytest.raises(FORMAL_FAILURES):
+        validate_formal_checkpoint_run_inspection_document(tampered)
+
+
+def test_inspection_document_rejects_cross_run_selected_splice(
+    tmp_path: Path,
+) -> None:
+    first_dir = tmp_path / "first"
+    _fresh_run(first_dir, target=1)
+    first = inspect_formal_checkpoint_run(first_dir, ["model_0.pt"])
+
+    second_dir = tmp_path / "second"
+    second_launch = _launch_receipt(
+        target=1,
+        started_at="2026-07-31T05:00:00+00:00",
+    )
+    with FormalTrainingIO(
+        run_dir=second_dir,
+        launch_receipt=second_launch,
+    ) as second_io:
+        _publish_iterations(second_io, second_launch, [0])
+    second = inspect_formal_checkpoint_run(second_dir, ["model_0.pt"])
+
+    foreign = copy.deepcopy(
+        second["payload"]["selected_checkpoints"][0]
+    )
+    foreign["checkpoint"]["path"] = str(first_dir / "model_0.pt")
+    foreign["sidecar"]["path"] = str(
+        first_dir / "checkpoint_receipts/model_0.json"
+    )
+    first["payload"]["selected_checkpoints"][0] = foreign
+    _rehash_inspection(first)
+
+    with pytest.raises(FORMAL_FAILURES):
+        validate_formal_checkpoint_run_inspection_document(first)
 
 
 def test_inspection_snapshot_is_explicitly_location_bound(

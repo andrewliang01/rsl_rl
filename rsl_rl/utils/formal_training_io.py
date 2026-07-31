@@ -21,6 +21,7 @@ from typing import Any
 import torch
 
 from .training_receipt import (
+    TRAINING_RECEIPT_SCHEMA_VERSION,
     build_checkpoint_sidecar,
     canonical_training_receipt_json_bytes,
     canonical_training_receipt_sha256,
@@ -74,6 +75,53 @@ _ANCESTOR_CHAIN_PROOF_KEYS = {
     "latest_parent",
     "proof_payload_sha256",
 }
+_RUN_INSPECTION_KEYS = {
+    "schema_version",
+    "contract",
+    "payload",
+    "payload_sha256",
+}
+_RUN_INSPECTION_PAYLOAD_KEYS = {
+    "run_dir",
+    "required_checkpoint_names",
+    "launch_receipt",
+    "chain",
+    "selected_checkpoints",
+}
+_RUN_INSPECTION_LAUNCH_KEYS = {"file", "document"}
+_RUN_INSPECTION_CHAIN_KEYS = {
+    "schema_version",
+    "contract",
+    "entry_count",
+    "local_entry_count",
+    "ancestor_entry_count",
+    "entries_sha256",
+    "local_entries_sha256",
+    "head_files",
+    "ancestor_chain_proof_file",
+    "latest_parent_record",
+}
+_RUN_INSPECTION_SELECTED_KEYS = {
+    "iteration",
+    "checkpoint",
+    "sidecar",
+    "parent_record",
+}
+_RUN_INSPECTION_FILE_KEYS = {"path", "sha256", "bytes"}
+_RUN_INSPECTION_PARENT_KEYS = {
+    "checkpoint_file_name",
+    "checkpoint_sha256",
+    "checkpoint_bytes",
+    "embedded_receipt_sha256",
+    "sidecar_payload_sha256",
+    "launch_payload_sha256",
+    "updates_completed",
+    "transitions_per_update",
+    "consumed_transitions",
+}
+_CHECKPOINT_CHAIN_VALIDATION_CONTRACT = (
+    "rsl_rl_formal_checkpoint_chain_validation_v1"
+)
 
 
 class FormalTrainingIOError(RuntimeError):
@@ -1882,6 +1930,448 @@ def _assert_retained_file_unchanged(
     return _location_bound_file_record(current, location=location)
 
 
+def _inspection_absolute_path(value: Any, *, location: str) -> Path:
+    """Validate one canonical absolute document path without touching it."""
+    if type(value) is not str or not value or "\x00" in value:
+        _fail(f"{location} must be a non-empty absolute path string.")
+    if (
+        not os.path.isabs(value)
+        or value != os.path.abspath(value)
+        or value != os.path.normpath(value)
+        or (value.startswith("//") and value != "/")
+    ):
+        _fail(f"{location} must be a lexically canonical absolute path.")
+    return Path(value)
+
+
+def _validate_inspection_file_record(
+    value: Any,
+    *,
+    location: str,
+    expected_path: Path,
+) -> dict[str, Any]:
+    record = _exact_mapping(
+        value,
+        _RUN_INSPECTION_FILE_KEYS,
+        location=location,
+    )
+    path = _inspection_absolute_path(
+        record["path"],
+        location=f"{location}.path",
+    )
+    canonical_expected = _inspection_absolute_path(
+        str(expected_path),
+        location=f"{location}.expected_path",
+    )
+    if path != canonical_expected:
+        _fail(f"{location}.path differs from its location-bound path.")
+    _hash(record["sha256"], location=f"{location}.sha256")
+    _exact_int(
+        record["bytes"],
+        location=f"{location}.bytes",
+        minimum=1,
+    )
+    return record
+
+
+def _validate_inspection_parent_record(
+    value: Any,
+    *,
+    location: str,
+) -> dict[str, Any]:
+    parent = _exact_mapping(
+        value,
+        _RUN_INSPECTION_PARENT_KEYS,
+        location=location,
+    )
+    name = parent["checkpoint_file_name"]
+    if type(name) is not str or _CHECKPOINT_NAME_RE.fullmatch(name) is None:
+        _fail(f"{location}.checkpoint_file_name is invalid.")
+    for key in (
+        "checkpoint_sha256",
+        "embedded_receipt_sha256",
+        "sidecar_payload_sha256",
+        "launch_payload_sha256",
+    ):
+        _hash(parent[key], location=f"{location}.{key}")
+    _exact_int(
+        parent["checkpoint_bytes"],
+        location=f"{location}.checkpoint_bytes",
+        minimum=1,
+    )
+    updates = _exact_int(
+        parent["updates_completed"],
+        location=f"{location}.updates_completed",
+        minimum=1,
+    )
+    per_update = _exact_int(
+        parent["transitions_per_update"],
+        location=f"{location}.transitions_per_update",
+        minimum=1,
+    )
+    consumed = _exact_int(
+        parent["consumed_transitions"],
+        location=f"{location}.consumed_transitions",
+        minimum=1,
+    )
+    match = _CHECKPOINT_NAME_RE.fullmatch(name)
+    assert match is not None
+    if int(match.group(1)) + 1 != updates:
+        _fail(f"{location} filename and updates_completed differ.")
+    if consumed != updates * per_update:
+        _fail(
+            f"{location}.consumed_transitions differs from "
+            "updates_completed*transitions_per_update."
+        )
+    return parent
+
+
+def validate_formal_checkpoint_run_inspection_document(
+    value: Any,
+) -> dict[str, Any]:
+    """Validate a frozen formal-run inspection document without live I/O.
+
+    This validator authenticates the document's canonical envelope and checks
+    every relationship that is represented inside the projection.  It is
+    intentionally a pure document validator: accepting it never asserts that
+    any bound path still exists or still has the recorded bytes.  The live
+    producer, :func:`inspect_formal_checkpoint_run`, is the authority for that
+    filesystem admission step.
+    """
+    document = _exact_mapping(
+        value,
+        _RUN_INSPECTION_KEYS,
+        location="formal_checkpoint_run_inspection",
+    )
+    if (
+        type(document["schema_version"]) is not int
+        or document["schema_version"]
+        != FORMAL_CHECKPOINT_RUN_INSPECTION_SCHEMA_VERSION
+        or document["contract"]
+        != FORMAL_CHECKPOINT_RUN_INSPECTION_CONTRACT
+    ):
+        _fail("Unsupported formal checkpoint run inspection schema or contract.")
+    payload = _exact_mapping(
+        document["payload"],
+        _RUN_INSPECTION_PAYLOAD_KEYS,
+        location="formal_checkpoint_run_inspection.payload",
+    )
+    if (
+        _hash(
+            document["payload_sha256"],
+            location="formal_checkpoint_run_inspection.payload_sha256",
+        )
+        != canonical_training_receipt_sha256(payload)
+    ):
+        _fail("Formal checkpoint run inspection payload SHA-256 is stale or forged.")
+
+    run_dir = _inspection_absolute_path(
+        payload["run_dir"],
+        location="formal_checkpoint_run_inspection.payload.run_dir",
+    )
+    if type(payload["required_checkpoint_names"]) is not list:
+        _fail(
+            "formal_checkpoint_run_inspection.payload."
+            "required_checkpoint_names must be an exact list."
+        )
+    required_names = _required_checkpoint_names(
+        payload["required_checkpoint_names"]
+    )
+
+    launch_wrapper = _exact_mapping(
+        payload["launch_receipt"],
+        _RUN_INSPECTION_LAUNCH_KEYS,
+        location="formal_checkpoint_run_inspection.payload.launch_receipt",
+    )
+    launch = validate_training_launch_receipt(
+        launch_wrapper["document"]
+    )
+    launch_bytes = canonical_training_receipt_json_bytes(launch)
+    launch_file = _validate_inspection_file_record(
+        launch_wrapper["file"],
+        location=(
+            "formal_checkpoint_run_inspection.payload.launch_receipt.file"
+        ),
+        expected_path=run_dir / FORMAL_LAUNCH_RECEIPT_NAME,
+    )
+    if (
+        launch_file["sha256"] != hashlib.sha256(launch_bytes).hexdigest()
+        or launch_file["bytes"] != len(launch_bytes)
+    ):
+        _fail(
+            "Formal checkpoint run inspection launch file differs from "
+            "its embedded launch document."
+        )
+
+    chain = _exact_mapping(
+        payload["chain"],
+        _RUN_INSPECTION_CHAIN_KEYS,
+        location="formal_checkpoint_run_inspection.payload.chain",
+    )
+    if (
+        type(chain["schema_version"]) is not int
+        or chain["schema_version"] != TRAINING_RECEIPT_SCHEMA_VERSION
+        or chain["contract"] != _CHECKPOINT_CHAIN_VALIDATION_CONTRACT
+    ):
+        _fail("Unsupported formal checkpoint receipt chain schema or contract.")
+    entry_count = _exact_int(
+        chain["entry_count"],
+        location="formal_checkpoint_run_inspection.payload.chain.entry_count",
+        minimum=1,
+    )
+    local_count = _exact_int(
+        chain["local_entry_count"],
+        location=(
+            "formal_checkpoint_run_inspection.payload.chain.local_entry_count"
+        ),
+        minimum=1,
+    )
+    ancestor_count = _exact_int(
+        chain["ancestor_entry_count"],
+        location=(
+            "formal_checkpoint_run_inspection.payload.chain."
+            "ancestor_entry_count"
+        ),
+    )
+    if entry_count != local_count + ancestor_count:
+        _fail(
+            "Formal checkpoint run inspection chain counts do not add up."
+        )
+    entries_sha256 = _hash(
+        chain["entries_sha256"],
+        location=(
+            "formal_checkpoint_run_inspection.payload.chain.entries_sha256"
+        ),
+    )
+    local_entries_sha256 = _hash(
+        chain["local_entries_sha256"],
+        location=(
+            "formal_checkpoint_run_inspection.payload.chain."
+            "local_entries_sha256"
+        ),
+    )
+    if ancestor_count == 0 and entries_sha256 != local_entries_sha256:
+        _fail(
+            "Fresh formal inspection full/local chain hashes must be equal."
+        )
+    if ancestor_count > 0 and entries_sha256 == local_entries_sha256:
+        _fail(
+            "Resumed formal inspection full/local chain hashes must differ."
+        )
+
+    head_files = chain["head_files"]
+    if type(head_files) is not list or len(head_files) != local_count:
+        _fail(
+            "Formal checkpoint run inspection head file count differs from "
+            "local_entry_count."
+        )
+    head_updates: list[int] = []
+    for index, record in enumerate(head_files):
+        record_mapping = _exact_mapping(
+            record,
+            _RUN_INSPECTION_FILE_KEYS,
+            location=(
+                "formal_checkpoint_run_inspection.payload.chain."
+                f"head_files[{index}]"
+            ),
+        )
+        raw_path = _inspection_absolute_path(
+            record_mapping["path"],
+            location=(
+                "formal_checkpoint_run_inspection.payload.chain."
+                f"head_files[{index}].path"
+            ),
+        )
+        match = _HEAD_NAME_RE.fullmatch(raw_path.name)
+        if match is None:
+            _fail(
+                "Formal checkpoint run inspection head filename is invalid."
+            )
+        updates = int(match.group(1))
+        if updates < 1:
+            _fail(
+                "Formal checkpoint run inspection head update must be positive."
+            )
+        _validate_inspection_file_record(
+            record_mapping,
+            location=(
+                "formal_checkpoint_run_inspection.payload.chain."
+                f"head_files[{index}]"
+            ),
+            expected_path=(
+                run_dir
+                / "checkpoint_receipts"
+                / "heads"
+                / _head_name(updates)
+            ),
+        )
+        head_updates.append(updates)
+    if (
+        len(set(head_updates)) != len(head_updates)
+        or head_updates != sorted(head_updates)
+    ):
+        _fail(
+            "Formal checkpoint run inspection heads must be unique and "
+            "strictly update-sorted."
+        )
+
+    schedule = launch["payload"]["schedule"]
+    target_updates = schedule["max_iterations"]
+    transitions_per_update = schedule["transitions_per_update"]
+    if head_updates[-1] != target_updates:
+        _fail(
+            "Formal checkpoint run inspection terminal head differs from "
+            "the launch schedule."
+        )
+    if any(update > target_updates for update in head_updates):
+        _fail(
+            "Formal checkpoint run inspection head exceeds the launch schedule."
+        )
+
+    resume = launch["payload"]["resume"]
+    ancestor_file = chain["ancestor_chain_proof_file"]
+    if resume["is_resume"]:
+        if ancestor_count < 1 or ancestor_file is None:
+            _fail(
+                "Resumed formal inspection requires a non-empty ancestor "
+                "segment and its proof file."
+            )
+        _validate_inspection_file_record(
+            ancestor_file,
+            location=(
+                "formal_checkpoint_run_inspection.payload.chain."
+                "ancestor_chain_proof_file"
+            ),
+            expected_path=(
+                run_dir
+                / "checkpoint_receipts"
+                / _ANCESTOR_CHAIN_PROOF_NAME
+            ),
+        )
+        if resume["parent_updates_completed"] >= head_updates[0]:
+            _fail(
+                "Formal inspection local heads do not advance the resume parent."
+            )
+    elif ancestor_count != 0 or ancestor_file is not None:
+        _fail(
+            "Fresh formal inspection must not contain an ancestor segment "
+            "or proof file."
+        )
+
+    latest_parent = _validate_inspection_parent_record(
+        chain["latest_parent_record"],
+        location=(
+            "formal_checkpoint_run_inspection.payload.chain."
+            "latest_parent_record"
+        ),
+    )
+    expected_latest_name = f"model_{target_updates - 1}.pt"
+    if (
+        latest_parent["checkpoint_file_name"] != expected_latest_name
+        or latest_parent["updates_completed"] != target_updates
+        or latest_parent["transitions_per_update"]
+        != transitions_per_update
+        or latest_parent["consumed_transitions"]
+        != schedule["transition_budget"]
+        or latest_parent["launch_payload_sha256"]
+        != launch["payload_sha256"]
+        or head_updates[-1] != latest_parent["updates_completed"]
+    ):
+        _fail(
+            "Formal checkpoint run inspection latest parent differs from "
+            "the terminal launch/head binding."
+        )
+
+    selected = payload["selected_checkpoints"]
+    if type(selected) is not list or len(selected) != len(required_names):
+        _fail(
+            "Formal checkpoint run inspection selected checkpoint count "
+            "differs from required_checkpoint_names."
+        )
+    head_update_set = set(head_updates)
+    for index, (name, selected_value) in enumerate(
+        zip(required_names, selected)
+    ):
+        item = _exact_mapping(
+            selected_value,
+            _RUN_INSPECTION_SELECTED_KEYS,
+            location=(
+                "formal_checkpoint_run_inspection.payload."
+                f"selected_checkpoints[{index}]"
+            ),
+        )
+        iteration = _exact_int(
+            item["iteration"],
+            location=(
+                "formal_checkpoint_run_inspection.payload."
+                f"selected_checkpoints[{index}].iteration"
+            ),
+        )
+        match = _CHECKPOINT_NAME_RE.fullmatch(name)
+        assert match is not None
+        expected_iteration = int(match.group(1))
+        if iteration != expected_iteration:
+            _fail(
+                "Formal selected checkpoint iteration differs from its "
+                "required filename."
+            )
+        updates = iteration + 1
+        if updates not in head_update_set:
+            _fail(
+                "Formal selected checkpoint has no committed local head."
+            )
+        checkpoint = _validate_inspection_file_record(
+            item["checkpoint"],
+            location=(
+                "formal_checkpoint_run_inspection.payload."
+                f"selected_checkpoints[{index}].checkpoint"
+            ),
+            expected_path=run_dir / name,
+        )
+        sidecar_name = _sidecar_name(name)
+        _validate_inspection_file_record(
+            item["sidecar"],
+            location=(
+                "formal_checkpoint_run_inspection.payload."
+                f"selected_checkpoints[{index}].sidecar"
+            ),
+            expected_path=run_dir / "checkpoint_receipts" / sidecar_name,
+        )
+        parent = _validate_inspection_parent_record(
+            item["parent_record"],
+            location=(
+                "formal_checkpoint_run_inspection.payload."
+                f"selected_checkpoints[{index}].parent_record"
+            ),
+        )
+        if (
+            parent["checkpoint_file_name"] != name
+            or parent["checkpoint_sha256"] != checkpoint["sha256"]
+            or parent["checkpoint_bytes"] != checkpoint["bytes"]
+            or parent["updates_completed"] != updates
+            or parent["transitions_per_update"]
+            != transitions_per_update
+            or parent["consumed_transitions"]
+            != updates * transitions_per_update
+            or parent["launch_payload_sha256"]
+            != launch["payload_sha256"]
+        ):
+            _fail(
+                "Formal selected checkpoint file/parent/progress binding differs."
+            )
+        if updates == target_updates and not _strict_equal(
+            parent,
+            latest_parent,
+        ):
+            _fail(
+                "Formal selected terminal checkpoint differs from latest parent."
+            )
+
+    return parse_canonical_training_receipt_json(
+        canonical_training_receipt_json_bytes(document)
+    )
+
+
 def inspect_formal_checkpoint_run(
     run_dir: str | os.PathLike[str],
     required_checkpoint_names: Sequence[str],
@@ -2194,9 +2684,7 @@ def inspect_formal_checkpoint_run(
             lock_metadata,
             location="formal checkpoint inspection lock",
         )
-        return parse_canonical_training_receipt_json(
-            canonical_training_receipt_json_bytes(document)
-        )
+        return validate_formal_checkpoint_run_inspection_document(document)
     finally:
         run_io.close()
 
@@ -2213,4 +2701,5 @@ __all__ = [
     "FormalTrainingIOError",
     "inspect_formal_checkpoint_run",
     "inspect_formal_resume_parent",
+    "validate_formal_checkpoint_run_inspection_document",
 ]

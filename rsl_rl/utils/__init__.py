@@ -9,6 +9,7 @@ from .formal_training_io import (
     FORMAL_CHECKPOINT_RUN_INSPECTION_CONTRACT,
     FORMAL_CHECKPOINT_RUN_INSPECTION_SCHEMA_VERSION,
     inspect_formal_checkpoint_run,
+    validate_formal_checkpoint_run_inspection_document,
 )
 from .mid360_ray_time_builder import (
     MID360_NORMALIZED_SENSOR_FRAME,
@@ -143,6 +144,7 @@ __all__ = [
     "validate_checkpoint_receipt_chain",
     "validate_checkpoint_sidecar",
     "validate_embedded_checkpoint_receipt",
+    "validate_formal_checkpoint_run_inspection_document",
     "validate_training_launch_receipt",
     "write_ray_time_deployment_manifest",
 ]
