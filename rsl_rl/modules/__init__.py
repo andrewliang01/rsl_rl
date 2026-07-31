@@ -14,6 +14,7 @@ from .r2plus1d_elevation_encoder import R2Plus1DBlock, R2Plus1DElevationEncoder
 from .ray_time_attention_encoder import RayTimeAttentionEncoder
 from .ray_return_event_time import RayReturnEventTimeEncoder
 from .rnn import RNN, HiddenState
+from .sparse_support_evidence_bottleneck import SparseSupportEvidenceBottleneck
 
 __all__ = [
     "CNN",
@@ -24,6 +25,7 @@ __all__ = [
     "RayTimeAttentionEncoder",
     "RayReturnEventTimeEncoder",
     "RNN",
+    "SparseSupportEvidenceBottleneck",
     "Distribution",
     "EmpiricalDiscountedVariationNormalization",
     "EmpiricalNormalization",
