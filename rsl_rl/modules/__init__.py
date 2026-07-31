@@ -12,6 +12,7 @@ from .normalization import EmpiricalDiscountedVariationNormalization, EmpiricalN
 from .r2plus1d_elevation_encoder import R2Plus1DBlock, R2Plus1DElevationEncoder
 from .ray_time_attention_encoder import RayTimeAttentionEncoder
 from .rnn import RNN, HiddenState
+from .sparse_support_evidence_bottleneck import SparseSupportEvidenceBottleneck
 
 __all__ = [
     "CNN",
@@ -20,6 +21,7 @@ __all__ = [
     "R2Plus1DElevationEncoder",
     "RayTimeAttentionEncoder",
     "RNN",
+    "SparseSupportEvidenceBottleneck",
     "Distribution",
     "EmpiricalDiscountedVariationNormalization",
     "EmpiricalNormalization",
