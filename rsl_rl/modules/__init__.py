@@ -8,6 +8,7 @@
 from .cnn import CNN
 from .distribution import Distribution, GaussianDistribution, HeteroscedasticGaussianDistribution
 from .mlp import MLP
+from .multimodal_ray_evidence_encoder import MultimodalRayEvidenceEncoder
 from .normalization import EmpiricalDiscountedVariationNormalization, EmpiricalNormalization
 from .r2plus1d_elevation_encoder import R2Plus1DBlock, R2Plus1DElevationEncoder
 from .ray_time_attention_encoder import RayTimeAttentionEncoder
@@ -16,6 +17,7 @@ from .rnn import RNN, HiddenState
 __all__ = [
     "CNN",
     "MLP",
+    "MultimodalRayEvidenceEncoder",
     "R2Plus1DBlock",
     "R2Plus1DElevationEncoder",
     "RayTimeAttentionEncoder",
