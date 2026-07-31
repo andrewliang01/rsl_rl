@@ -165,6 +165,69 @@ def aligned_history_to_ray_event_observation(
     return packed.squeeze(0).numpy()
 
 
+def pack_acquisition_delta_proprio_observation(
+    acquisition_delta_proprio: torch.Tensor,
+    return_valid: torch.Tensor,
+    range_age_winner_id: torch.Tensor,
+    delta_winner_id: torch.Tensor,
+) -> torch.Tensor:
+    """Pack a strict same-winner ``[B,K,D,H,W]`` acquisition-state tensor.
+
+    Stable winner ids are proof inputs and are not exposed to the actor. Their
+    equality closes the builder boundary that the actor cannot infer from
+    range/age/delta values alone.
+    """
+    if acquisition_delta_proprio.ndim != 5:
+        raise ValueError(
+            "acquisition_delta_proprio must have shape [B,K,D,H,W]."
+        )
+    if acquisition_delta_proprio.shape[2] <= 0:
+        raise ValueError("Acquisition delta-proprio dimension must be positive.")
+    expected_cell_shape = (
+        acquisition_delta_proprio.shape[0],
+        acquisition_delta_proprio.shape[1],
+        acquisition_delta_proprio.shape[3],
+        acquisition_delta_proprio.shape[4],
+    )
+    if tuple(return_valid.shape) != expected_cell_shape or return_valid.dtype != torch.bool:
+        raise ValueError("return_valid must be boolean with shape [B,K,H,W].")
+    for name, winner_id in (
+        ("range_age_winner_id", range_age_winner_id),
+        ("delta_winner_id", delta_winner_id),
+    ):
+        if tuple(winner_id.shape) != expected_cell_shape or winner_id.dtype != torch.long:
+            raise ValueError(f"{name} must be torch.long with shape [B,K,H,W].")
+    tensors = (
+        return_valid,
+        range_age_winner_id,
+        delta_winner_id,
+    )
+    if any(tensor.device != acquisition_delta_proprio.device for tensor in tensors):
+        raise ValueError("Delta-proprio and winner tensors must share one device.")
+    if not acquisition_delta_proprio.is_floating_point():
+        raise ValueError("acquisition_delta_proprio must be floating point.")
+    if not bool(torch.isfinite(acquisition_delta_proprio).all()):
+        raise ValueError("acquisition_delta_proprio must be finite.")
+    if not bool((range_age_winner_id == delta_winner_id).all()):
+        raise ValueError(
+            "Range/age and acquisition delta-proprio must use the same winner id."
+        )
+    if bool((return_valid & (range_age_winner_id < 0)).any()):
+        raise ValueError("Valid returns require a non-negative stable winner id.")
+    if bool((~return_valid & (range_age_winner_id != -1)).any()):
+        raise ValueError("Invalid returns require winner id -1.")
+    if bool(
+        (
+            ~return_valid[:, :, None]
+            & (acquisition_delta_proprio != 0.0)
+        ).any()
+    ):
+        raise ValueError(
+            "Invalid returns must carry exactly zero acquisition delta-proprio."
+        )
+    return acquisition_delta_proprio.to(torch.float32)
+
+
 def _choice(name: str, value: str, choices: tuple[str, ...]) -> str:
     if not isinstance(value, str):
         raise ValueError(f"{name} must be a string.")
@@ -179,5 +242,6 @@ __all__ = [
     "RAY_EVENT_SOURCES",
     "RAY_EVENT_TEMPORAL_BASELINES",
     "aligned_history_to_ray_event_observation",
+    "pack_acquisition_delta_proprio_observation",
     "pack_ray_event_observation",
 ]

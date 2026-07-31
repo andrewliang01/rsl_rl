@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import math
 from typing import Any, Final
 
@@ -15,7 +17,7 @@ from .ray_event_observation import RAY_EVENT_CHANNELS
 from .raw_event_pies import PIES_EVENT_WINDOW_S
 
 
-RAY_EVENT_DEPLOYMENT_CONTRACT: Final[str] = "g1_ray_event_actor_v2"
+RAY_EVENT_DEPLOYMENT_CONTRACT: Final[str] = "g1_ray_event_actor_v3"
 RAY_EVENT_CHANNEL_SEMANTICS: Final[dict[str, str]] = {
     "range_m": "same_winner_metric_range_or_zero_when_invalid",
     "return_valid": "binary_observed_return_mask",
@@ -50,6 +52,12 @@ def build_ray_event_deployment_receipt(
     packetization_invariance_proof_sha256: str | None = None,
     real_tensor_manifest_sha256: str | None = None,
     clock_alignment_receipt_sha256: str | None = None,
+    delta_proprio_observation_group: str | None = None,
+    delta_proprio_dim: int = 0,
+    delta_proprio_semantics: tuple[str, ...] | list[str] = (),
+    delta_proprio_manifest_sha256: str | None = None,
+    delta_actor_interface_closed: bool = False,
+    delta_export_interface_closed: bool = False,
 ) -> dict[str, Any]:
     deployment_scope = (
         "deployment_candidate"
@@ -72,6 +80,38 @@ def build_ray_event_deployment_receipt(
         source == "livox_per_return"
         and _is_sha256(real_tensor_manifest_sha256)
         and _is_sha256(clock_alignment_receipt_sha256)
+    )
+    resolved_delta_semantics = list(delta_proprio_semantics)
+    delta_semantics_sha256 = (
+        _delta_semantics_sha256(delta_proprio_dim, resolved_delta_semantics)
+        if delta_proprio_dim > 0
+        else None
+    )
+    delta_source_authenticated = (
+        real_source_authenticated
+        and _is_sha256(delta_proprio_manifest_sha256)
+        and delta_proprio_dim > 0
+    )
+    delta_export_contract = (
+        {
+            "observation_group": delta_proprio_observation_group,
+            "logical_layout": "B,K,D,H,W",
+            "torchscript_input": "acquisition_delta_proprio",
+            "onnx_input": "acquisition_delta_proprio",
+            "dynamic_batch": True,
+        }
+        if delta_proprio_dim > 0
+        else None
+    )
+    pies_full_ready = (
+        history_reduction == "pies_latest_event_k1"
+        and invariance_proven
+        and delta_source_authenticated
+        and delta_actor_interface_closed
+        and delta_export_interface_closed
+        and deployment_scope == "deployment_candidate"
+        and _is_sha256(smoke_receipt_sha256)
+        and training_ready
     )
     receipt = {
         "contract": RAY_EVENT_DEPLOYMENT_CONTRACT,
@@ -99,10 +139,32 @@ def build_ray_event_deployment_receipt(
         ),
         "real_tensor_manifest_sha256": real_tensor_manifest_sha256,
         "clock_alignment_receipt_sha256": clock_alignment_receipt_sha256,
-        "acquisition_delta_proprio_contract": (
-            "raw_conformance_same_winner_actor_not_wired"
+        "delta_proprio_observation_group": delta_proprio_observation_group,
+        "delta_proprio_input_shape": (
+            [history_length, delta_proprio_dim, *spatial_size]
+            if delta_proprio_dim > 0
+            else None
         ),
-        "pies_full_contract_ready": False,
+        "delta_proprio_dim": delta_proprio_dim,
+        "delta_proprio_semantics": resolved_delta_semantics,
+        "delta_proprio_semantics_sha256": delta_semantics_sha256,
+        "delta_proprio_manifest_sha256": delta_proprio_manifest_sha256,
+        "delta_proprio_source_authenticated": delta_source_authenticated,
+        "delta_actor_interface_closed": delta_actor_interface_closed,
+        "delta_export_interface_closed": delta_export_interface_closed,
+        "delta_actor_export_contract": delta_export_contract,
+        "acquisition_delta_proprio_contract": (
+            "actor_export_wired_source_receipted"
+            if delta_source_authenticated
+            and delta_actor_interface_closed
+            and delta_export_interface_closed
+            else (
+                "actor_export_wired_source_unreceipted"
+                if delta_actor_interface_closed and delta_export_interface_closed
+                else "raw_conformance_same_winner_actor_not_wired"
+            )
+        ),
+        "pies_full_contract_ready": pies_full_ready,
         "geometry": geometry,
         "simulator_time_capability": "packet_capture_only",
         "packet_time_quantization_upper_bound_s": (
@@ -142,6 +204,16 @@ def validate_ray_event_deployment_receipt(receipt: dict[str, Any]) -> None:
         "packetization_invariance_proof_sha256",
         "real_tensor_manifest_sha256",
         "clock_alignment_receipt_sha256",
+        "delta_proprio_observation_group",
+        "delta_proprio_input_shape",
+        "delta_proprio_dim",
+        "delta_proprio_semantics",
+        "delta_proprio_semantics_sha256",
+        "delta_proprio_manifest_sha256",
+        "delta_proprio_source_authenticated",
+        "delta_actor_interface_closed",
+        "delta_export_interface_closed",
+        "delta_actor_export_contract",
         "acquisition_delta_proprio_contract",
         "pies_full_contract_ready",
         "geometry",
@@ -290,14 +362,94 @@ def validate_ray_event_deployment_receipt(receipt: dict[str, Any]) -> None:
             raise ValueError("Packetization proof requires a SHA-256 evidence hash.")
     elif proof_sha is not None:
         raise ValueError("Unproven packetization invariance rejects a proof hash.")
-    if receipt["acquisition_delta_proprio_contract"] != (
-        "raw_conformance_same_winner_actor_not_wired"
+    delta_dim = receipt["delta_proprio_dim"]
+    if (
+        isinstance(delta_dim, bool)
+        or not isinstance(delta_dim, int)
+        or delta_dim < 0
     ):
-        raise ValueError("Acquisition delta-proprio contract changed.")
-    if receipt["pies_full_contract_ready"] is not False:
-        raise ValueError(
-            "The five-channel actor does not yet consume acquisition delta-proprio."
+        raise ValueError("delta_proprio_dim must be a non-negative integer.")
+    delta_semantics = receipt["delta_proprio_semantics"]
+    delta_group = receipt["delta_proprio_observation_group"]
+    delta_manifest = receipt["delta_proprio_manifest_sha256"]
+    delta_actor_closed = receipt["delta_actor_interface_closed"]
+    delta_export_closed = receipt["delta_export_interface_closed"]
+    if not isinstance(delta_actor_closed, bool) or not isinstance(
+        delta_export_closed, bool
+    ):
+        raise ValueError("Delta actor/export closure flags must be boolean.")
+    if delta_dim == 0:
+        if any(
+            value not in (None, [], False)
+            for value in (
+                delta_group,
+                receipt["delta_proprio_input_shape"],
+                delta_semantics,
+                receipt["delta_proprio_semantics_sha256"],
+                delta_manifest,
+                receipt["delta_proprio_source_authenticated"],
+                delta_actor_closed,
+                delta_export_closed,
+                receipt["delta_actor_export_contract"],
+            )
+        ):
+            raise ValueError("Disabled delta-proprio rejects interface evidence.")
+    else:
+        if not isinstance(delta_group, str) or not delta_group:
+            raise ValueError("Enabled delta-proprio requires an observation group.")
+        if (
+            not isinstance(delta_semantics, list)
+            or len(delta_semantics) != delta_dim
+            or any(
+                not isinstance(item, str) or not item
+                for item in delta_semantics
+            )
+            or len(set(delta_semantics)) != delta_dim
+        ):
+            raise ValueError(
+                "Delta-proprio semantics must contain D unique non-empty names."
+            )
+        expected_delta_shape = [history_length, delta_dim, *spatial_size]
+        if receipt["delta_proprio_input_shape"] != expected_delta_shape:
+            raise ValueError("Delta-proprio input shape changed.")
+        expected_semantic_sha = _delta_semantics_sha256(
+            delta_dim, delta_semantics
         )
+        if receipt["delta_proprio_semantics_sha256"] != expected_semantic_sha:
+            raise ValueError("Delta-proprio semantic hash changed.")
+        if delta_manifest is not None and not _is_sha256(delta_manifest):
+            raise ValueError("Delta-proprio manifest must be lowercase SHA-256.")
+        if source != "livox_per_return":
+            raise ValueError("Delta-proprio is accepted only for real Livox events.")
+        expected_delta_contract = {
+            "observation_group": delta_group,
+            "logical_layout": "B,K,D,H,W",
+            "torchscript_input": "acquisition_delta_proprio",
+            "onnx_input": "acquisition_delta_proprio",
+            "dynamic_batch": True,
+        }
+        if receipt["delta_actor_export_contract"] != expected_delta_contract:
+            raise ValueError("Delta-proprio actor/export interface changed.")
+    expected_delta_source = (
+        expected_per_return_claim
+        and delta_dim > 0
+        and _is_sha256(delta_manifest)
+    )
+    if receipt["delta_proprio_source_authenticated"] is not expected_delta_source:
+        raise ValueError("Delta-proprio source provenance is inconsistent.")
+    expected_acquisition_contract = (
+        "actor_export_wired_source_receipted"
+        if expected_delta_source and delta_actor_closed and delta_export_closed
+        else (
+            "actor_export_wired_source_unreceipted"
+            if delta_actor_closed and delta_export_closed
+            else "raw_conformance_same_winner_actor_not_wired"
+        )
+    )
+    if receipt["acquisition_delta_proprio_contract"] != expected_acquisition_contract:
+        raise ValueError("Acquisition delta-proprio contract changed.")
+    if not isinstance(receipt["pies_full_contract_ready"], bool):
+        raise ValueError("pies_full_contract_ready must be boolean.")
     if receipt["geometry"] not in ("native", "rerender"):
         raise ValueError("Unsupported geometry.")
     if receipt["simulator_time_capability"] != "packet_capture_only":
@@ -345,6 +497,18 @@ def validate_ray_event_deployment_receipt(receipt: dict[str, Any]) -> None:
     smoke_sha = receipt["smoke_receipt_sha256"]
     if not isinstance(training_ready, bool):
         raise ValueError("training_ready must be boolean.")
+    expected_full_ready = (
+        reduction == "pies_latest_event_k1"
+        and receipt["packetization_invariance_proven"]
+        and expected_delta_source
+        and delta_actor_closed
+        and delta_export_closed
+        and expected_scope == "deployment_candidate"
+        and _is_sha256(smoke_sha)
+        and training_ready
+    )
+    if receipt["pies_full_contract_ready"] is not expected_full_ready:
+        raise ValueError("PIES full-ready state conflicts with required evidence.")
     if training_ready:
         if receipt["deployment_scope"] != "deployment_candidate":
             raise ValueError(
@@ -364,17 +528,30 @@ def validate_ray_event_deployment_receipt(receipt: dict[str, Any]) -> None:
                 "Latest-event training requires a raw-event packetization "
                 "invariance proof."
             )
-        if receipt["history_reduction"] == "pies_latest_event_k1":
+        if (
+            receipt["history_reduction"] == "pies_latest_event_k1"
+            and not receipt["pies_full_contract_ready"]
+        ):
             raise ValueError(
-                "PIES training remains blocked until acquisition delta-proprio "
-                "is wired into the actor/export contract."
+                "PIES training requires delta-proprio semantics/source, actor/export, "
+                "clock, self-filter, invariance, and smoke closure."
             )
-        if not isinstance(smoke_sha, str) or len(smoke_sha) != 64:
+        if not _is_sha256(smoke_sha):
             raise ValueError(
                 "training_ready requires a 64-character smoke receipt SHA-256."
             )
     elif smoke_sha is not None:
         raise ValueError("Unready configuration must not carry a smoke receipt.")
+
+
+def _delta_semantics_sha256(dim: int, semantics: list[str]) -> str:
+    payload = json.dumps(
+        {"dimension": dim, "semantics": semantics},
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _is_sha256(value: object) -> bool:

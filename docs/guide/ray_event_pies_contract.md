@@ -47,10 +47,29 @@ actor/deployment receipt 同时固定记录五个通道的逐通道语义、0.5 
 union 所在阶段、分包不变性证明哈希和 self-return-filter provenance，缺失任一训练
 证据都 fail-close。
 
-当前五通道 actor 尚未消费 acquisition-time delta-proprio。因此 raw-event reducer 只是
-PIES 的 range-age-delta-proprio conformance primitive，receipt 固定写入
-`pies_full_contract_ready=false`；即使合成分包证明通过，也不能据此宣称完整 PIES 或
-开启 PIES 训练。
+原有五通道 `ray_event_time` actor 仍不消费 acquisition-time delta-proprio；它保持原
+接口。仅下面的显式新类型增加 delta 输入。即使合成分包证明通过，缺少真实来源证据
+时仍不能宣称完整 PIES 或开启 PIES 训练。
+
+## Acquisition-Δproprio actor 接口
+
+`ray_event_time_delta` 是独立、显式开启的 actor 类型。它保持五通道 Ray-Event 张量
+`[B,K,5,H,W]` 不变，并额外消费
+`ray_event_delta_proprio: [B,K,D,H,W]`。`D` 由配置指定，不允许把 delta 硬塞进
+五通道输入。builder 边界同时提交 range/age winner id 与 delta winner id；两者不等
+时 packer fail-close。winner id 只用于同源证明，不进入 actor。
+
+encoder 使用 Ray-Event 的 `return_valid` mask 对 delta 做 masked pooling：invalid cell
+的全部 `D` 维必须严格为零，valid 值必须 finite。TorchScript 与 ONNX 均把
+`acquisition_delta_proprio` 暴露为独立输入；默认 `ray_time` 和 `ray_event_time` 不创建
+delta 参数，原 state_dict、forward 输入和导出输入保持不变。
+
+receipt v3 记录 delta observation group、`D`、逐维语义列表、语义 SHA-256、逻辑
+shape、TorchScript/ONNX 输入名、动态 batch 能力以及 actor/export closure。只有真实
+tensor manifest、clock alignment、delta source manifest、self-return filter、raw-event
+分包证明、smoke 和 actor/export 全部闭合时，PIES 才可能 full-ready。本阶段没有真实
+delta source manifest、没有 smoke、没有 Gym 注册或训练 promotion，因此
+`delta_proprio_source_authenticated=false` 与 `pies_full_contract_ready=false`。
 
 真实 Livox 路径由 `Mid360RayTimeTensorBuilder` 使用 CustomMsg 的
 `timebase + offset_time` 生成同源 range/valid/return-age winner，随后通过

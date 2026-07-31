@@ -119,6 +119,7 @@ class RayTimeAttentionEncoder(nn.Module):
         event_time_mode: str | None = None,
         event_time_source: str = "none",
         event_time_scale_s: float = 0.5,
+        acquisition_delta_proprio_dim: int = 0,
     ) -> None:
         super().__init__()
 
@@ -171,6 +172,17 @@ class RayTimeAttentionEncoder(nn.Module):
             else event_time_mode.lower().replace("-", "_")
         )
         self.event_time_source = event_time_source.lower().replace("-", "_")
+        if (
+            isinstance(acquisition_delta_proprio_dim, bool)
+            or not isinstance(acquisition_delta_proprio_dim, int)
+            or acquisition_delta_proprio_dim < 0
+        ):
+            raise ValueError(
+                "acquisition_delta_proprio_dim must be a non-negative integer."
+            )
+        self.acquisition_delta_proprio_dim = int(
+            acquisition_delta_proprio_dim
+        )
         if self.event_time_mode not in (
             None,
             "packet_age",
@@ -230,6 +242,14 @@ class RayTimeAttentionEncoder(nn.Module):
                     "explicit quantized_event_age mode."
                 )
             self.input_channels = 5
+        if self.acquisition_delta_proprio_dim > 0 and (
+            self.event_time_mode != "per_return_age"
+            or self.event_time_source != "livox_per_return"
+        ):
+            raise ValueError(
+                "Acquisition delta-proprio requires authenticated Livox "
+                "per-return timing."
+            )
         resolved_fusion_mode = (
             "attention" if use_query_attention else "global"
         ) if fusion_mode is None else fusion_mode.lower().replace("-", "_")
@@ -286,6 +306,17 @@ class RayTimeAttentionEncoder(nn.Module):
             )
         else:
             self.hit_pool_kernel = (0, 0)
+
+        if self.acquisition_delta_proprio_dim == 0:
+            self.delta_proprio_projection: nn.Module = nn.Identity()
+        else:
+            # Bias is deliberately disabled: a token with no valid return must
+            # contribute exactly zero acquisition-state information.
+            self.delta_proprio_projection = nn.Linear(
+                self.acquisition_delta_proprio_dim,
+                self.token_dim,
+                bias=False,
+            )
 
         self.spatial_projection = nn.Conv2d(channel_3, self.token_dim, kernel_size=1, bias=False)
         self.spatial_norm = nn.GroupNorm(_group_count(self.token_dim), self.token_dim)
@@ -348,11 +379,13 @@ class RayTimeAttentionEncoder(nn.Module):
         self,
         ray_history: torch.Tensor,
         proprio_features: torch.Tensor,
+        acquisition_delta_proprio: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return a fixed-size terrain embedding."""
         terrain_embedding, _, _ = self.forward_with_attention(
             ray_history,
             proprio_features,
+            acquisition_delta_proprio,
         )
         return terrain_embedding
 
@@ -360,6 +393,7 @@ class RayTimeAttentionEncoder(nn.Module):
         self,
         ray_history: torch.Tensor,
         proprio_features: torch.Tensor,
+        acquisition_delta_proprio: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return embedding, cross-attention weights, and valid-token mask."""
         if (
@@ -367,7 +401,11 @@ class RayTimeAttentionEncoder(nn.Module):
             and not torch.jit.is_tracing()
             and not torch.compiler.is_compiling()
         ):
-            self._validate_inputs(ray_history, proprio_features)
+            self._validate_inputs(
+                ray_history,
+                proprio_features,
+                acquisition_delta_proprio,
+            )
 
         # Rollout storage may keep the observation in fp16. Run the compact
         # policy encoder in fp32 to match the remaining actor modules.
@@ -413,6 +451,16 @@ class RayTimeAttentionEncoder(nn.Module):
                 return_age_s,
             )
             tokens = tokens + event_time_encoding
+        if self.acquisition_delta_proprio_dim > 0:
+            if acquisition_delta_proprio is None:
+                raise ValueError(
+                    "Enabled acquisition delta-proprio input is required."
+                )
+            delta_encoding = self._encode_acquisition_delta_proprio(
+                acquisition_delta_proprio.float(),
+                hit_mask,
+            )
+            tokens = tokens + delta_encoding
 
         temporal_tokens = tokens.permute(0, 2, 3, 1).reshape(
             batch_size * self.num_spatial_tokens,
@@ -534,6 +582,58 @@ class RayTimeAttentionEncoder(nn.Module):
         normalized_range = normalized_range * valid_hit.to(normalized_range.dtype)
         hit_float = valid_hit.to(normalized_range.dtype)
         return torch.stack((normalized_range, hit_float), dim=2), hit_float
+
+    def _encode_acquisition_delta_proprio(
+        self,
+        acquisition_delta_proprio: torch.Tensor,
+        hit_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return masked acquisition-state tokens with shape ``[B,K,N,C]``."""
+        batch_size = acquisition_delta_proprio.shape[0]
+        valid = hit_mask[:, :, None] > 0.5
+        # torch.where, rather than multiplication, prevents invalid NaN/Inf
+        # leakage in exported graphs. Eager validation still rejects it.
+        masked_delta = torch.where(
+            valid,
+            acquisition_delta_proprio,
+            torch.zeros_like(acquisition_delta_proprio),
+        )
+        flat_delta = masked_delta.flatten(0, 1)
+        flat_valid = hit_mask.flatten(0, 1).unsqueeze(1)
+        if self.hit_pool_kernel[0] > 0:
+            pooled_delta = F.avg_pool2d(
+                flat_delta,
+                kernel_size=self.hit_pool_kernel,
+                stride=self.hit_pool_kernel,
+            )
+            pooled_valid = F.avg_pool2d(
+                flat_valid,
+                kernel_size=self.hit_pool_kernel,
+                stride=self.hit_pool_kernel,
+            )
+        else:
+            pooled_delta = F.adaptive_avg_pool2d(
+                flat_delta,
+                self.token_spatial_size,
+            )
+            pooled_valid = F.adaptive_avg_pool2d(
+                flat_valid,
+                self.token_spatial_size,
+            )
+        pooled_delta = pooled_delta / pooled_valid.clamp_min(1.0e-6)
+        pooled_delta = torch.where(
+            pooled_valid > 0.0,
+            pooled_delta,
+            torch.zeros_like(pooled_delta),
+        )
+        pooled_delta = pooled_delta.flatten(start_dim=2).transpose(1, 2)
+        pooled_delta = pooled_delta.reshape(
+            batch_size,
+            self.history_length,
+            self.num_spatial_tokens,
+            self.acquisition_delta_proprio_dim,
+        )
+        return self.delta_proprio_projection(pooled_delta)
 
     def _query_attention(
         self,
@@ -694,6 +794,7 @@ class RayTimeAttentionEncoder(nn.Module):
         self,
         ray_history: torch.Tensor,
         proprio_features: torch.Tensor,
+        acquisition_delta_proprio: torch.Tensor | None,
     ) -> None:
         expected_shape = (
             self.history_length,
@@ -727,6 +828,47 @@ class RayTimeAttentionEncoder(nn.Module):
             )
         if not ray_history.is_floating_point() or not proprio_features.is_floating_point():
             raise ValueError("ray_history and proprio_features must be floating-point tensors.")
+        if self.acquisition_delta_proprio_dim == 0:
+            if acquisition_delta_proprio is not None:
+                raise ValueError(
+                    "Disabled acquisition delta-proprio rejects an unused tensor."
+                )
+        else:
+            if acquisition_delta_proprio is None:
+                raise ValueError(
+                    "Enabled acquisition delta-proprio input is required."
+                )
+            expected_delta_shape = (
+                ray_history.shape[0],
+                self.history_length,
+                self.acquisition_delta_proprio_dim,
+                self.vision_spatial_size[0],
+                self.vision_spatial_size[1],
+            )
+            if tuple(acquisition_delta_proprio.shape) != expected_delta_shape:
+                raise ValueError(
+                    "acquisition_delta_proprio must have shape [B,K,D,H,W] "
+                    f"equal to {expected_delta_shape}, got "
+                    f"{tuple(acquisition_delta_proprio.shape)}."
+                )
+            if acquisition_delta_proprio.device != ray_history.device:
+                raise ValueError(
+                    "acquisition_delta_proprio and ray_history must share a device."
+                )
+            if not acquisition_delta_proprio.is_floating_point():
+                raise ValueError("acquisition_delta_proprio must be floating point.")
+            if not bool(torch.isfinite(acquisition_delta_proprio).all()):
+                raise ValueError("acquisition_delta_proprio must be finite.")
+            requested_hit = ray_history[:, :, 1] > 0.5
+            if bool(
+                (
+                    ~requested_hit[:, :, None]
+                    & (acquisition_delta_proprio != 0.0)
+                ).any()
+            ):
+                raise ValueError(
+                    "Invalid returns must carry exactly zero acquisition delta-proprio."
+                )
         if self.input_channels == 5:
             return_age = ray_history[:, :, 2]
             packet_age_map = ray_history[:, :, 3]

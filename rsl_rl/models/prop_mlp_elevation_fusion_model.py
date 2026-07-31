@@ -47,6 +47,7 @@ class PropMLPElevationFusionModel(nn.Module):
         "r2plus1d",
         "ray_time",
         "ray_event_time",
+        "ray_event_time_delta",
     }
 
     def __init__(
@@ -101,6 +102,8 @@ class PropMLPElevationFusionModel(nn.Module):
         ray_event_time_mode: str | None = None,
         ray_event_time_source: str = "none",
         ray_event_time_scale_s: float = 0.5,
+        ray_event_delta_proprio_set: str | None = None,
+        ray_event_delta_proprio_dim: int = 0,
         ray_event_training_ready: bool = False,
         r2plus1d_hidden_dims: tuple[int, ...] | list[int] = (16, 24, 44),
         r2plus1d_spatial_kernel_sizes: tuple[int, ...] | list[int] = (3, 3, 3),
@@ -161,6 +164,9 @@ class PropMLPElevationFusionModel(nn.Module):
             ray_time_fusion_mode: Optional explicit fusion mode. ``None`` preserves
                 ``ray_time_use_query_attention``; supported values are ``"attention"``,
                 ``"global"``, and the non-spatial ``"query_global"`` causal control.
+            ray_event_delta_proprio_set: Separate ``[B,K,D,H,W]`` acquisition
+                delta-proprio observation group for ``ray_event_time_delta``.
+            ray_event_delta_proprio_dim: Configured semantic dimension ``D``.
             r2plus1d_hidden_dims: Output channels of the factorized R(2+1)D
                 blocks. The default is parameter-matched to the default
                 five-frame 2-D CNN elevation encoder.
@@ -180,7 +186,16 @@ class PropMLPElevationFusionModel(nn.Module):
                 f"Unsupported elevation_encoder_type '{elevation_encoder_type}'. "
                 f"Expected one of {tuple(sorted(self._ELEVATION_ENCODER_TYPES))}."
             )
-        if self.elevation_encoder_type in {"ray_time", "ray_event_time"}:
+        ray_encoder_types = {
+            "ray_time",
+            "ray_event_time",
+            "ray_event_time_delta",
+        }
+        ray_event_encoder_types = {
+            "ray_event_time",
+            "ray_event_time_delta",
+        }
+        if self.elevation_encoder_type in ray_encoder_types:
             # These aliases let the dedicated lab-side config use modality
             # names without changing the legacy fusion model/checkpoint API.
             if ray_time_set is not None:
@@ -216,29 +231,62 @@ class PropMLPElevationFusionModel(nn.Module):
         self.elevation_history_length = elevation_history_length
         self.use_prop_encoder = use_prop_encoder
         self.ray_input_channels = (
-            5 if self.elevation_encoder_type == "ray_event_time" else 2
+            5 if self.elevation_encoder_type in ray_event_encoder_types else 2
         )
+        self.ray_event_delta_proprio_set = ray_event_delta_proprio_set
+        self.ray_event_delta_proprio_dim = int(ray_event_delta_proprio_dim)
         self.ray_event_training_ready = bool(ray_event_training_ready)
         if (
-            self.elevation_encoder_type != "ray_event_time"
+            self.elevation_encoder_type not in ray_event_encoder_types
             and (
                 ray_event_time_mode is not None
                 or ray_event_time_source != "none"
+                or ray_event_delta_proprio_set is not None
+                or ray_event_delta_proprio_dim != 0
                 or ray_event_training_ready
             )
         ):
             raise ValueError(
-                "Non-event encoders reject ray-event fields; use "
-                "elevation_encoder_type='ray_event_time'."
+                "Non-event encoders reject ray-event fields."
             )
-        if self.elevation_encoder_type == "ray_event_time":
+        if self.elevation_encoder_type in ray_event_encoder_types:
             if ray_event_time_mode is None:
-                raise ValueError("ray_event_time requires ray_event_time_mode.")
+                raise ValueError("Ray-event encoders require ray_event_time_mode.")
             if self.ray_event_training_ready:
                 raise ValueError(
                     "ray_event_training_ready remains false until the formal "
                     "64-environment smoke receipt is validated."
                 )
+        if self.elevation_encoder_type == "ray_event_time_delta":
+            if (
+                not isinstance(ray_event_delta_proprio_set, str)
+                or not ray_event_delta_proprio_set
+            ):
+                raise ValueError(
+                    "ray_event_time_delta requires a delta-proprio observation set."
+                )
+            if (
+                isinstance(ray_event_delta_proprio_dim, bool)
+                or not isinstance(ray_event_delta_proprio_dim, int)
+                or ray_event_delta_proprio_dim <= 0
+            ):
+                raise ValueError(
+                    "ray_event_time_delta requires a positive integer delta dimension."
+                )
+            if (
+                ray_event_time_mode != "per_return_age"
+                or ray_event_time_source != "livox_per_return"
+            ):
+                raise ValueError(
+                    "ray_event_time_delta requires Livox per-return timing."
+                )
+        elif (
+            ray_event_delta_proprio_set is not None
+            or ray_event_delta_proprio_dim != 0
+        ):
+            raise ValueError(
+                "Only ray_event_time_delta accepts acquisition delta-proprio."
+            )
         self._cnn_use_single_frame = cnn_history_index is not None
         self._cnn_history_index = 0
         if self._cnn_use_single_frame:
@@ -267,9 +315,12 @@ class PropMLPElevationFusionModel(nn.Module):
             obs_set,
             self.elevation_set,
             expected_perception_ndim=(
-                5
-                if self.elevation_encoder_type in {"ray_time", "ray_event_time"}
-                else 4
+                5 if self.elevation_encoder_type in ray_encoder_types else 4
+            ),
+            additional_perception_sets=(
+                (ray_event_delta_proprio_set,)
+                if self.elevation_encoder_type == "ray_event_time_delta"
+                else ()
             ),
         )
 
@@ -379,6 +430,19 @@ class PropMLPElevationFusionModel(nn.Module):
                     "Ray-time observation shape mismatch: expected [B,T,C,H,W] "
                     f"with [T,C,H,W]={expected_ray_shape}, got {tuple(ray_shape)}."
                 )
+            if self.elevation_encoder_type == "ray_event_time_delta":
+                delta_shape = obs[ray_event_delta_proprio_set].shape
+                expected_delta_shape = (
+                    elevation_history_length,
+                    ray_event_delta_proprio_dim,
+                    *self.vision_spatial_size,
+                )
+                if tuple(delta_shape[1:]) != expected_delta_shape:
+                    raise ValueError(
+                        "Acquisition delta-proprio observation shape mismatch: "
+                        f"expected [B,K,D,H,W] with [K,D,H,W]="
+                        f"{expected_delta_shape}, got {tuple(delta_shape)}."
+                    )
             self.elevation_encoder = RayTimeAttentionEncoder(
                 history_length=elevation_history_length,
                 vision_spatial_size=self.vision_spatial_size,
@@ -395,15 +459,20 @@ class PropMLPElevationFusionModel(nn.Module):
                 fusion_mode=ray_time_fusion_mode,
                 event_time_mode=(
                     ray_event_time_mode
-                    if self.elevation_encoder_type == "ray_event_time"
+                    if self.elevation_encoder_type in ray_event_encoder_types
                     else None
                 ),
                 event_time_source=(
                     ray_event_time_source
-                    if self.elevation_encoder_type == "ray_event_time"
+                    if self.elevation_encoder_type in ray_event_encoder_types
                     else "none"
                 ),
                 event_time_scale_s=ray_event_time_scale_s,
+                acquisition_delta_proprio_dim=(
+                    ray_event_delta_proprio_dim
+                    if self.elevation_encoder_type == "ray_event_time_delta"
+                    else 0
+                ),
             )
 
         # Fusion head.
@@ -445,6 +514,12 @@ class PropMLPElevationFusionModel(nn.Module):
                 elevation_obs = elevation_obs[:, self._cnn_history_index : self._cnn_history_index + 1]
             elevation_obs = self._normalize_cnn_observation(elevation_obs)
             elevation_features = self.elevation_encoder(elevation_obs)
+        elif self.elevation_encoder_type == "ray_event_time_delta":
+            elevation_features = self.elevation_encoder(
+                elevation_obs,
+                proprio_features,
+                obs[self.ray_event_delta_proprio_set],
+            )
         else:
             elevation_features = self.elevation_encoder(elevation_obs, proprio_features)
 
@@ -494,6 +569,8 @@ class PropMLPElevationFusionModel(nn.Module):
 
     def as_jit(self) -> nn.Module:
         """Return a version of the model compatible with Torch JIT export."""
+        if self.elevation_encoder_type == "ray_event_time_delta":
+            return _TorchRayEventDeltaPropMLPElevationFusionModel(self)
         if self.elevation_encoder_type in {"ray_time", "ray_event_time"}:
             return _TorchRayTimePropMLPElevationFusionModel(self)
         if self.elevation_encoder_type == "ame2":
@@ -502,6 +579,12 @@ class PropMLPElevationFusionModel(nn.Module):
 
     def as_onnx(self, verbose: bool, input_mode: str = "split") -> nn.Module:
         """Return a version of the model compatible with ONNX export."""
+        if self.elevation_encoder_type == "ray_event_time_delta":
+            return _OnnxRayEventDeltaPropMLPElevationFusionModel(
+                self,
+                verbose,
+                input_mode,
+            )
         if self.elevation_encoder_type in {"ray_time", "ray_event_time"}:
             return _OnnxRayTimePropMLPElevationFusionModel(self, verbose, input_mode)
         if self.elevation_encoder_type == "ame2":
@@ -521,12 +604,16 @@ class PropMLPElevationFusionModel(nn.Module):
         obs_set: str,
         elevation_set: str,
         expected_perception_ndim: int = 4,
+        additional_perception_sets: tuple[str, ...] = (),
     ) -> tuple[list[str], int]:
         """Select proprio observation groups and compute their flattened dimension."""
         active_obs_groups = []
         obs_dim = 0
         for obs_group in obs_groups[obs_set]:
-            if obs_group == elevation_set:
+            if (
+                obs_group == elevation_set
+                or obs_group in additional_perception_sets
+            ):
                 continue
             if len(obs[obs_group].shape) != 2:
                 raise ValueError(
@@ -684,6 +771,44 @@ class _TorchRayTimePropMLPElevationFusionModel(nn.Module):
         proprio_obs = self.obs_normalizer(proprio_obs)
         proprio_features = self.prop_mlp(proprio_obs)
         ray_features = self.elevation_encoder(ray_history, proprio_features)
+        fused_features = torch.cat((proprio_features, ray_features), dim=-1)
+        out = self.mlp(fused_features)
+        return self.deterministic_output(out)
+
+    @torch.jit.export
+    def reset(self) -> None:
+        pass
+
+
+class _TorchRayEventDeltaPropMLPElevationFusionModel(nn.Module):
+    """TorchScript actor with a separate acquisition delta-proprio tensor."""
+
+    def __init__(self, model: PropMLPElevationFusionModel) -> None:
+        super().__init__()
+        self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
+        self.prop_mlp = copy.deepcopy(model.prop_mlp)
+        self.elevation_encoder = copy.deepcopy(model.elevation_encoder)
+        self.mlp = copy.deepcopy(model.mlp)
+        if model.distribution is not None:
+            self.deterministic_output = (
+                model.distribution.as_deterministic_output_module()
+            )
+        else:
+            self.deterministic_output = nn.Identity()
+
+    def forward(
+        self,
+        proprio_obs: torch.Tensor,
+        ray_history: torch.Tensor,
+        acquisition_delta_proprio: torch.Tensor,
+    ) -> torch.Tensor:
+        proprio_obs = self.obs_normalizer(proprio_obs)
+        proprio_features = self.prop_mlp(proprio_obs)
+        ray_features = self.elevation_encoder(
+            ray_history,
+            proprio_features,
+            acquisition_delta_proprio,
+        )
         fused_features = torch.cat((proprio_features, ray_features), dim=-1)
         out = self.mlp(fused_features)
         return self.deterministic_output(out)
@@ -1014,5 +1139,159 @@ class _OnnxRayTimePropMLPElevationFusionModel(nn.Module):
         return {
             "proprio_obs": {0: "batch_size"},
             "ray_history": {0: "batch_size"},
+            "actions": {0: "batch_size"},
+        }
+
+
+class _OnnxRayEventDeltaPropMLPElevationFusionModel(nn.Module):
+    """ONNX actor with independent event and acquisition-state tensors."""
+
+    is_recurrent: bool = False
+
+    def __init__(
+        self,
+        model: PropMLPElevationFusionModel,
+        verbose: bool,
+        input_mode: str = "split",
+    ) -> None:
+        super().__init__()
+        if input_mode not in ("split", "single"):
+            raise ValueError(f"Unsupported ONNX input mode: {input_mode}")
+        self.verbose = verbose
+        self.input_mode = input_mode
+        self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
+        self.prop_mlp = copy.deepcopy(model.prop_mlp)
+        self.elevation_encoder = copy.deepcopy(model.elevation_encoder)
+        self.mlp = copy.deepcopy(model.mlp)
+        if model.distribution is not None:
+            self.deterministic_output = (
+                model.distribution.as_deterministic_output_module()
+            )
+        else:
+            self.deterministic_output = nn.Identity()
+        self.proprio_input_size = model.obs_dim
+        self.ray_history_length = model.elevation_history_length
+        self.ray_input_channels = model.ray_input_channels
+        self.delta_proprio_dim = model.ray_event_delta_proprio_dim
+        self.vision_spatial_size = model.vision_spatial_size
+        self.ray_size = (
+            self.ray_history_length
+            * self.ray_input_channels
+            * self.vision_spatial_size[0]
+            * self.vision_spatial_size[1]
+        )
+        self.delta_size = (
+            self.ray_history_length
+            * self.delta_proprio_dim
+            * self.vision_spatial_size[0]
+            * self.vision_spatial_size[1]
+        )
+        self.single_input_size = (
+            self.proprio_input_size + self.ray_size + self.delta_size
+        )
+
+    def forward(
+        self,
+        proprio_obs: torch.Tensor,
+        ray_history: torch.Tensor | None = None,
+        acquisition_delta_proprio: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self.input_mode == "single":
+            obs = proprio_obs
+            if (
+                not torch.jit.is_tracing()
+                and not torch.compiler.is_compiling()
+                and (obs.ndim != 2 or obs.shape[1] != self.single_input_size)
+            ):
+                raise ValueError(
+                    "Single-input Ray-Event-Delta observations have the wrong shape."
+                )
+            proprio_obs = obs[:, : self.proprio_input_size]
+            ray_start = self.proprio_input_size
+            delta_start = ray_start + self.ray_size
+            ray_history = obs[:, ray_start:delta_start]
+            acquisition_delta_proprio = obs[
+                :, delta_start : delta_start + self.delta_size
+            ]
+            ray_shape = (
+                self.ray_history_length,
+                self.ray_input_channels,
+                self.vision_spatial_size[0],
+                self.vision_spatial_size[1],
+            )
+            delta_shape = (
+                self.ray_history_length,
+                self.delta_proprio_dim,
+                self.vision_spatial_size[0],
+                self.vision_spatial_size[1],
+            )
+            if torch.compiler.is_compiling():
+                ray_history = ray_history.unflatten(1, ray_shape)
+                acquisition_delta_proprio = (
+                    acquisition_delta_proprio.unflatten(1, delta_shape)
+                )
+            else:
+                ray_history = ray_history.reshape(-1, *ray_shape)
+                acquisition_delta_proprio = (
+                    acquisition_delta_proprio.reshape(-1, *delta_shape)
+                )
+        elif ray_history is None or acquisition_delta_proprio is None:
+            raise ValueError(
+                "Split Ray-Event-Delta export requires ray history and "
+                "acquisition delta-proprio."
+            )
+
+        proprio_obs = self.obs_normalizer(proprio_obs)
+        proprio_features = self.prop_mlp(proprio_obs)
+        ray_features = self.elevation_encoder(
+            ray_history,
+            proprio_features,
+            acquisition_delta_proprio,
+        )
+        fused_features = torch.cat((proprio_features, ray_features), dim=-1)
+        out = self.mlp(fused_features)
+        return self.deterministic_output(out)
+
+    def get_dummy_inputs(self) -> tuple[torch.Tensor, ...]:
+        if self.input_mode == "single":
+            return (torch.zeros(1, self.single_input_size),)
+        return (
+            torch.zeros(1, self.proprio_input_size),
+            torch.zeros(
+                1,
+                self.ray_history_length,
+                self.ray_input_channels,
+                *self.vision_spatial_size,
+            ),
+            torch.zeros(
+                1,
+                self.ray_history_length,
+                self.delta_proprio_dim,
+                *self.vision_spatial_size,
+            ),
+        )
+
+    @property
+    def input_names(self) -> list[str]:
+        if self.input_mode == "single":
+            return ["obs"]
+        return [
+            "proprio_obs",
+            "ray_history",
+            "acquisition_delta_proprio",
+        ]
+
+    @property
+    def output_names(self) -> list[str]:
+        return ["actions"]
+
+    @property
+    def dynamic_axes(self) -> dict[str, dict[int, str]]:
+        if self.input_mode == "single":
+            return {"obs": {0: "batch_size"}, "actions": {0: "batch_size"}}
+        return {
+            "proprio_obs": {0: "batch_size"},
+            "ray_history": {0: "batch_size"},
+            "acquisition_delta_proprio": {0: "batch_size"},
             "actions": {0: "batch_size"},
         }

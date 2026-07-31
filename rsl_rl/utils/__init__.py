@@ -55,6 +55,7 @@ from .ray_time_deployment_manifest import (
 from .ray_event_observation import (
     RAY_EVENT_CHANNELS,
     aligned_history_to_ray_event_observation,
+    pack_acquisition_delta_proprio_observation,
     pack_ray_event_observation,
 )
 from .ray_event_deployment_receipt import (
@@ -173,6 +174,7 @@ __all__ = [
     "get_param",
     "inspect_formal_checkpoint_run",
     "point_packet_from_livox_custom_msg_arrays",
+    "pack_acquisition_delta_proprio_observation",
     "pack_ray_event_observation",
     "latest_event_raster_sha256",
     "derive_checkpoint_progress",
