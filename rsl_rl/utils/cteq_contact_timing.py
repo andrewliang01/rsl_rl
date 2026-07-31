@@ -677,6 +677,8 @@ def cteq_pr01_status() -> Mapping[str, Any]:
             "multiclass_brier",
             "role_time_weights",
             "order_and_calibration_diagnostics",
+            "torch_dual_event_hazard_head",
+            "torch_survival_loss",
         ),
         "training_ready": False,
         "actor_integrated": False,
@@ -685,7 +687,6 @@ def cteq_pr01_status() -> Mapping[str, Any]:
         "future_truth_allowed_consumers": CTEQ_ALLOWED_TRUTH_CONSUMERS,
         "blocked_next_steps": (
             "administrative_censor_contract_for_early_termination",
-            "torch_hazard_head_and_gradient_smoke",
             "actor_query_integration",
             "ppo_training",
             "export_resume_validation",

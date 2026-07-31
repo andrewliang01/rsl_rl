@@ -13,6 +13,10 @@ from .normalization import EmpiricalDiscountedVariationNormalization, EmpiricalN
 from .r2plus1d_elevation_encoder import R2Plus1DBlock, R2Plus1DElevationEncoder
 from .ray_time_attention_encoder import RayTimeAttentionEncoder
 from .ray_return_event_time import RayReturnEventTimeEncoder
+from .cteq_dual_event_hazard import (
+    CteqDualEventHazardHead,
+    CteqIndependentSurvivalLoss,
+)
 from .ray_event_ablation import RayEventAblationOutput, RayEventAblationRouter
 from .rnn import RNN, HiddenState
 from .sparse_support_evidence_bottleneck import SparseSupportEvidenceBottleneck
@@ -26,6 +30,8 @@ __all__ = [
     "R2Plus1DElevationEncoder",
     "RayTimeAttentionEncoder",
     "RayReturnEventTimeEncoder",
+    "CteqDualEventHazardHead",
+    "CteqIndependentSurvivalLoss",
     "RayEventAblationOutput",
     "RayEventAblationRouter",
     "RNN",
