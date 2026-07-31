@@ -30,6 +30,13 @@ from .mid360_ray_time_builder import (
 )
 from .motion_loader import AMPLoader
 from .motion_loader_for_display import AMPLoaderDisplay
+from .perception_ablation_protocol import (
+    H1AblationSpec,
+    H2AblationSpec,
+    build_h1_protocol,
+    build_h2_protocol,
+    perception_ablation_receipt,
+)
 from .ray_time_deployment_manifest import (
     RayTimeManifestError,
     build_ray_time_deployment_manifest,
@@ -93,6 +100,8 @@ __all__ = [
     "CHECKPOINT_SIDECAR_CONTRACT",
     "FORMAL_CHECKPOINT_RUN_INSPECTION_CONTRACT",
     "FORMAL_CHECKPOINT_RUN_INSPECTION_SCHEMA_VERSION",
+    "H1AblationSpec",
+    "H2AblationSpec",
     "MID360_CAPTURE_END_ACQUISITION_WINDOW",
     "MID360_CAPTURE_END_LATEST_RETURN_LEGACY",
     "MID360_NORMALIZED_SENSOR_FRAME",
@@ -115,6 +124,8 @@ __all__ = [
     "StaleMid360PacketError",
     "TrainingReceiptError",
     "build_checkpoint_sidecar",
+    "build_h1_protocol",
+    "build_h2_protocol",
     "build_embedded_checkpoint_receipt",
     "build_ray_time_deployment_manifest",
     "build_ray_time_export_attestation",
@@ -136,6 +147,7 @@ __all__ = [
     "point_packet_from_livox_custom_msg_arrays",
     "derive_checkpoint_progress",
     "parse_canonical_training_receipt_json",
+    "perception_ablation_receipt",
     "retain_regular_file",
     "resolve_callable",
     "resolve_nn_activation",

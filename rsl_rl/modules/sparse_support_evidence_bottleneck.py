@@ -16,7 +16,7 @@ Keeping the geometry mask outside this module avoids inventing camera or LiDAR
 calibration, near/far thresholds, or body-frame conventions.  A real
 integration must construct those masks from calibrated ray/token geometry.
 
-For integer total budgets ``M_total in {4, 8, 16, 32}``, every query receives
+For integer total budgets ``M_total in {4, 8, 16, 32, 64}``, every query receives
 ``M_total / 4`` slots.  The selected union may contain fewer than ``M_total``
 unique tokens when eligibility overlaps or a query has insufficient evidence.
 The special budget ``"all"`` selects every valid token and is the non-sparse
@@ -67,7 +67,7 @@ QUERY_NAMES: Final[tuple[str, ...]] = (
     "right_far",
 )
 NUM_QUERIES: Final[int] = len(QUERY_NAMES)
-SUPPORTED_TOTAL_BUDGETS: Final[tuple[int, ...]] = (4, 8, 16, 32)
+SUPPORTED_TOTAL_BUDGETS: Final[tuple[int, ...]] = (4, 8, 16, 32, 64)
 SUPPORTED_MODES: Final[tuple[str, ...]] = (
     "full",
     "selected_only",
@@ -144,7 +144,7 @@ class SparseSupportEvidenceBottleneck(nn.Module):
         terrain_value_dim: Width of the terrain values behind the bottleneck.
         proprio_dim: Width of the proprioceptive state.
         output_dim: Width of the returned policy embedding.
-        total_budget: One of ``4, 8, 16, 32`` or ``"all"``.
+        total_budget: One of ``4, 8, 16, 32, 64`` or ``"all"``.
         score_dim: Width of the score key/query space.
         value_embedding_dim: Width of each query's aggregated terrain value.
         mode: Default intervention mode.

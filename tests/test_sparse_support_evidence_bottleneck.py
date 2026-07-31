@@ -1441,8 +1441,9 @@ def test_construction_and_mode_contracts() -> None:
     assert QUERY_NAMES == model.query_names
     assert model.per_query_quota == 2
     assert _model(total_budget="all").per_query_quota is None
+    assert _model(total_budget=64).per_query_quota == 16
 
-    for bad_budget in (0, 5, 12, 64, True, 4.0, "everything"):
+    for bad_budget in (0, 5, 12, 60, True, 4.0, "everything"):
         with pytest.raises(ValueError, match="total_budget"):
             _model(total_budget=bad_budget)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="output_dim must be at least 2"):
