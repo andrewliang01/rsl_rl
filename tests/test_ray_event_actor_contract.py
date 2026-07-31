@@ -360,9 +360,12 @@ def test_latest_receipt_separates_raster_prototype_from_raw_pies_proof():
         self_return_filter="upstream_static_mask",
         self_return_filter_config_sha256="b" * 64,
         self_return_filtered_count=7,
+        real_tensor_manifest_sha256="1" * 64,
+        clock_alignment_receipt_sha256="2" * 64,
     )
     assert raw_event["packetization_invariance_proven"] is True
     assert raw_event["packetization_invariance_proof_sha256"] == proof_sha
+    assert raw_event["per_return_claim_allowed"] is True
     validate_ray_event_deployment_receipt(raw_event)
     assert raw_event["pies_full_contract_ready"] is False
     assert raw_event["acquisition_delta_proprio_contract"].endswith(
@@ -383,6 +386,24 @@ def test_training_ready_fails_closed_without_real_self_return_filter():
         )
 
 
+def test_livox_per_return_claim_requires_tensor_and_clock_receipts():
+    unbound = build_ray_event_deployment_receipt(
+        history_length=5,
+        spatial_size=(16, 96),
+        source="livox_per_return",
+        temporal_baseline="per_return_age",
+    )
+    assert unbound["per_return_claim_allowed"] is False
+    with pytest.raises(ValueError, match="requires both"):
+        build_ray_event_deployment_receipt(
+            history_length=5,
+            spatial_size=(16, 96),
+            source="livox_per_return",
+            temporal_baseline="per_return_age",
+            real_tensor_manifest_sha256="3" * 64,
+        )
+
+
 def test_raw_pies_training_stays_blocked_without_actor_delta_proprio():
     with pytest.raises(ValueError, match="delta-proprio"):
         build_ray_event_deployment_receipt(
@@ -399,6 +420,8 @@ def test_raw_pies_training_stays_blocked_without_actor_delta_proprio():
             self_return_filter="upstream_static_mask",
             self_return_filter_config_sha256="e" * 64,
             self_return_filtered_count=4,
+            real_tensor_manifest_sha256="6" * 64,
+            clock_alignment_receipt_sha256="7" * 64,
         )
 
 

@@ -48,6 +48,8 @@ def build_ray_event_deployment_receipt(
     self_return_filtered_count: int | None = None,
     event_union_stage: str | None = None,
     packetization_invariance_proof_sha256: str | None = None,
+    real_tensor_manifest_sha256: str | None = None,
+    clock_alignment_receipt_sha256: str | None = None,
 ) -> dict[str, Any]:
     deployment_scope = (
         "deployment_candidate"
@@ -65,6 +67,11 @@ def build_ray_event_deployment_receipt(
         event_union_stage == "raw_event"
         and isinstance(packetization_invariance_proof_sha256, str)
         and len(packetization_invariance_proof_sha256) == 64
+    )
+    real_source_authenticated = (
+        source == "livox_per_return"
+        and _is_sha256(real_tensor_manifest_sha256)
+        and _is_sha256(clock_alignment_receipt_sha256)
     )
     receipt = {
         "contract": RAY_EVENT_DEPLOYMENT_CONTRACT,
@@ -90,6 +97,8 @@ def build_ray_event_deployment_receipt(
         "packetization_invariance_proof_sha256": (
             packetization_invariance_proof_sha256
         ),
+        "real_tensor_manifest_sha256": real_tensor_manifest_sha256,
+        "clock_alignment_receipt_sha256": clock_alignment_receipt_sha256,
         "acquisition_delta_proprio_contract": (
             "raw_conformance_same_winner_actor_not_wired"
         ),
@@ -102,7 +111,7 @@ def build_ray_event_deployment_receipt(
         "training_ready": training_ready,
         "smoke_receipt_sha256": smoke_receipt_sha256,
         "legacy_ray_time_tasks_unchanged": True,
-        "per_return_claim_allowed": source == "livox_per_return",
+        "per_return_claim_allowed": real_source_authenticated,
         "self_return_filter": self_return_filter,
         "self_return_filter_config_sha256": self_return_filter_config_sha256,
         "self_return_filtered_count": self_return_filtered_count,
@@ -131,6 +140,8 @@ def validate_ray_event_deployment_receipt(receipt: dict[str, Any]) -> None:
         "event_window_s",
         "packetization_invariance_proven",
         "packetization_invariance_proof_sha256",
+        "real_tensor_manifest_sha256",
+        "clock_alignment_receipt_sha256",
         "acquisition_delta_proprio_contract",
         "pies_full_contract_ready",
         "geometry",
@@ -200,10 +211,26 @@ def validate_ray_event_deployment_receipt(receipt: dict[str, Any]) -> None:
         raise ValueError(
             "quantized_event_age requires raycaster_quantized_event source."
         )
-    if source != "livox_per_return" and receipt["per_return_claim_allowed"] is not False:
-        raise ValueError("Only Livox per-return timestamps allow the per-return claim.")
-    if source == "livox_per_return" and receipt["per_return_claim_allowed"] is not True:
-        raise ValueError("Authenticated Livox receipt must preserve its source claim.")
+    real_manifest_sha = receipt["real_tensor_manifest_sha256"]
+    clock_receipt_sha = receipt["clock_alignment_receipt_sha256"]
+    if source != "livox_per_return":
+        if real_manifest_sha is not None or clock_receipt_sha is not None:
+            raise ValueError("RayCaster sources reject real-sensor provenance hashes.")
+        expected_per_return_claim = False
+    else:
+        provenance_values = (real_manifest_sha, clock_receipt_sha)
+        if any(value is not None for value in provenance_values) and not all(
+            _is_sha256(value) for value in provenance_values
+        ):
+            raise ValueError(
+                "Livox provenance requires both lowercase real-tensor and "
+                "clock-alignment SHA-256 receipts."
+            )
+        expected_per_return_claim = all(
+            _is_sha256(value) for value in provenance_values
+        )
+    if receipt["per_return_claim_allowed"] is not expected_per_return_claim:
+        raise ValueError("Per-return claim conflicts with authenticated source provenance.")
     quantization = receipt["packet_time_quantization_upper_bound_s"]
     if source in ("raycaster_packet", "raycaster_quantized_event"):
         if (
@@ -323,6 +350,10 @@ def validate_ray_event_deployment_receipt(receipt: dict[str, Any]) -> None:
             raise ValueError(
                 "training_ready requires authenticated real self-return filtering."
             )
+        if source == "livox_per_return" and not receipt["per_return_claim_allowed"]:
+            raise ValueError(
+                "training_ready requires bound real-tensor and clock-alignment receipts."
+            )
         if receipt["history_reduction"] == "raster_latest_event_prototype":
             raise ValueError("Raster latest-event prototype can never be training-ready.")
         if (
@@ -344,6 +375,14 @@ def validate_ray_event_deployment_receipt(receipt: dict[str, Any]) -> None:
             )
     elif smoke_sha is not None:
         raise ValueError("Unready configuration must not carry a smoke receipt.")
+
+
+def _is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 def copy_validated_ray_event_deployment_receipt(

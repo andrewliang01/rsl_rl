@@ -55,6 +55,9 @@ PIES 的 range-age-delta-proprio conformance primitive，receipt 固定写入
 真实 Livox 路径由 `Mid360RayTimeTensorBuilder` 使用 CustomMsg 的
 `timebase + offset_time` 生成同源 range/valid/return-age winner，随后通过
 `aligned_history_to_ray_event_observation` 接入相同 actor。
+仅把 `source` 字符串写成 `livox_per_return` 不构成认证。只有同时绑定 real-tensor
+manifest 与 common-clock alignment receipt 的 SHA-256 后，receipt 才允许
+`per_return_claim_allowed=true`；缺任一项时保持未认证并禁止 training promotion。
 
 可选的未来控制是把 RayCaster 更新率提高到每个 control step（20 ms），每步只保留
 一个稀疏子包，再按真实 capture step 聚合。它只能称为 “20 ms-quantized packet
