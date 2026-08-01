@@ -48,6 +48,9 @@ MID360_NORMALIZED_SENSOR_FRAME = (
 MID360_TIMESTAMP_LIVOX_CUSTOM_MSG = (
     "livox_custom_msg_timebase_ns_plus_point_offset_time_ns"
 )
+MID360_TIMESTAMP_LIVOX_CUSTOM_MSG_ACTION_CLOCK = (
+    "livox_custom_msg_return_times_affine_mapped_to_action_clock"
+)
 MID360_TIMESTAMP_ADAPTER_ABSOLUTE_POINTS = (
     "adapter_declared_absolute_point_times_in_capture_clock"
 )
@@ -66,6 +69,7 @@ MID360_STRICT_MAX_TIMESTAMP_TOLERANCE_S = 1.0e-4
 _INT64_MAX = int(np.iinfo(np.int64).max)
 _MID360_TIMESTAMP_SEMANTICS = (
     MID360_TIMESTAMP_LIVOX_CUSTOM_MSG,
+    MID360_TIMESTAMP_LIVOX_CUSTOM_MSG_ACTION_CLOCK,
     MID360_TIMESTAMP_ADAPTER_ABSOLUTE_POINTS,
     MID360_TIMESTAMP_CAPTURE_WINDOW_ONLY,
 )
@@ -1063,6 +1067,7 @@ class Mid360RayTimeTensorBuilder:
             point_times = np.clip(point_times, start, end)
         if packet.timestamp_semantics in (
             MID360_TIMESTAMP_LIVOX_CUSTOM_MSG,
+            MID360_TIMESTAMP_LIVOX_CUSTOM_MSG_ACTION_CLOCK,
             MID360_TIMESTAMP_ADAPTER_ABSOLUTE_POINTS,
         ) and packet.point_timestamps_s is None:
             raise Mid360RayTimeBuilderError(

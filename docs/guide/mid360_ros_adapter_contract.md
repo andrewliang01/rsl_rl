@@ -5,6 +5,8 @@
 以下函数：
 
 - `livox_custom_msg_to_mid360_packet()`；
+- `extract_livox_custom_msg()` 与
+  `livox_custom_msg_to_sensor_clock_packet()`，用于后续显式跨时钟映射；
 - `livox_pointcloud2_to_mid360_packet()`；
 - `extract_livox_pointcloud2()`，用于逐字节审计 PointCloud2。
 
@@ -30,6 +32,11 @@
 5. callback 显式提供 `window_index`、`capture_end_s`、`received_time_s` 和时钟域；
 6. `received_time_s >= capture_end_s >= latest return time`；
 7. 不用 `header.stamp` 替换或猜测上述时间。
+
+若设备 `timebase` 与策略 action clock 不同，不得调用第一条路径伪称共同时钟。
+`livox_custom_msg_to_sensor_clock_packet()` 会保留设备时钟并故意将 receive time 留为
+`None`；随后必须通过 `Mid360ClockAlignment` 映射，才能写入 action-clock callback
+receive time 并计算 transport latency。软件不会用 receive latency 反推 clock offset。
 
 输出坐标合同固定为
 `mid360_physical_sensor_frame_x_forward_y_left_z_up_metres`。调用方只有在确认消息已经位于

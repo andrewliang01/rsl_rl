@@ -83,26 +83,24 @@ class PointCloud2Extraction:
     is_bigendian: bool
 
 
-def livox_custom_msg_to_mid360_packet(
+@dataclass(frozen=True)
+class LivoxCustomMsgExtraction:
+    """All successful CustomMsg returns in their native sensor clock."""
+
+    xyz_m: np.ndarray
+    timebase_ns: int
+    offset_time_ns: np.ndarray
+    point_count: int
+    frame_id: str
+
+
+def extract_livox_custom_msg(
     message: Any,
     *,
     expected_frame_id: str,
-    window_index: int,
-    capture_end_s: float,
-    received_time_s: float,
-    monotonic_clock_domain: str,
-) -> Mid360PointPacket:
-    """Convert one native Livox ``CustomMsg`` without dropping any point.
-
-    ``capture_end_s`` and ``received_time_s`` must share the same numeric clock
-    domain as ``timebase + offset_time``.  This is an explicit deployment
-    assertion; the adapter never substitutes ``header.stamp``.
-    """
-    _require_frame_id(message, expected_frame_id)
-    end = _finite_number(capture_end_s, "capture_end_s")
-    received = _finite_number(received_time_s, "received_time_s")
-    if received < end:
-        raise Mid360RosAdapterError("received_time_s cannot precede capture_end_s.")
+) -> LivoxCustomMsgExtraction:
+    """Extract every CustomMsg return without assigning an action clock."""
+    frame_id = _require_frame_id(message, expected_frame_id)
     timebase_ns = _bounded_int(
         _attribute(message, "timebase"),
         "CustomMsg.timebase",
@@ -142,11 +140,43 @@ def livox_custom_msg_to_mid360_packet(
     maximum_offset_ns = 0 if offset_time_ns.size == 0 else int(offset_time_ns.max())
     if timebase_ns > _UINT64_MAX - maximum_offset_ns:
         raise Mid360RosAdapterError("CustomMsg.timebase + offset_time overflows uint64.")
-
-    return point_packet_from_livox_custom_msg_arrays(
+    return LivoxCustomMsgExtraction(
         xyz_m=xyz_m,
         timebase_ns=timebase_ns,
         offset_time_ns=offset_time_ns,
+        point_count=declared_count,
+        frame_id=frame_id,
+    )
+
+
+def livox_custom_msg_to_mid360_packet(
+    message: Any,
+    *,
+    expected_frame_id: str,
+    window_index: int,
+    capture_end_s: float,
+    received_time_s: float,
+    monotonic_clock_domain: str,
+) -> Mid360PointPacket:
+    """Convert one native Livox ``CustomMsg`` without dropping any point.
+
+    ``capture_end_s`` and ``received_time_s`` must share the same numeric clock
+    domain as ``timebase + offset_time``.  This is an explicit deployment
+    assertion; the adapter never substitutes ``header.stamp``.
+    """
+    end = _finite_number(capture_end_s, "capture_end_s")
+    received = _finite_number(received_time_s, "received_time_s")
+    if received < end:
+        raise Mid360RosAdapterError("received_time_s cannot precede capture_end_s.")
+    extracted = extract_livox_custom_msg(
+        message,
+        expected_frame_id=expected_frame_id,
+    )
+
+    return point_packet_from_livox_custom_msg_arrays(
+        xyz_m=extracted.xyz_m,
+        timebase_ns=extracted.timebase_ns,
+        offset_time_ns=extracted.offset_time_ns,
         coordinate_frame=MID360_NORMALIZED_SENSOR_FRAME,
         window_index=_bounded_int(
             window_index,
@@ -158,6 +188,47 @@ def livox_custom_msg_to_mid360_packet(
         monotonic_clock_domain=_nonempty_string(
             monotonic_clock_domain,
             "monotonic_clock_domain",
+        ),
+    )
+
+
+def livox_custom_msg_to_sensor_clock_packet(
+    message: Any,
+    *,
+    expected_frame_id: str,
+    window_index: int,
+    capture_end_sensor_s: float,
+    sensor_clock_domain: str,
+) -> Mid360PointPacket:
+    """Build a pre-alignment CustomMsg packet with no mixed receive time.
+
+    This is the only CustomMsg adapter intended for a later cross-clock
+    mapping.  ``received_time_s`` remains ``None`` until the caller applies a
+    validated action-clock alignment and supplies the callback receive time in
+    that action clock.
+    """
+    extracted = extract_livox_custom_msg(
+        message,
+        expected_frame_id=expected_frame_id,
+    )
+    return point_packet_from_livox_custom_msg_arrays(
+        xyz_m=extracted.xyz_m,
+        timebase_ns=extracted.timebase_ns,
+        offset_time_ns=extracted.offset_time_ns,
+        coordinate_frame=MID360_NORMALIZED_SENSOR_FRAME,
+        window_index=_bounded_int(
+            window_index,
+            "window_index",
+            maximum=_INT64_MAX,
+        ),
+        capture_end_s=_finite_number(
+            capture_end_sensor_s,
+            "capture_end_sensor_s",
+        ),
+        received_time_s=None,
+        monotonic_clock_domain=_nonempty_string(
+            sensor_clock_domain,
+            "sensor_clock_domain",
         ),
     )
 
@@ -441,9 +512,12 @@ def _nonempty_string(value: Any, name: str) -> str:
 
 __all__ = [
     "LIVOX_POINTCLOUD2_TIMESTAMP_FIELD",
+    "LivoxCustomMsgExtraction",
     "Mid360RosAdapterError",
     "PointCloud2Extraction",
+    "extract_livox_custom_msg",
     "extract_livox_pointcloud2",
     "livox_custom_msg_to_mid360_packet",
+    "livox_custom_msg_to_sensor_clock_packet",
     "livox_pointcloud2_to_mid360_packet",
 ]
