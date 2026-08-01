@@ -37,6 +37,10 @@ from .ray_event_ablation import RayEventAblationOutput, RayEventAblationRouter
 from .rnn import RNN, HiddenState
 from .sparse_support_evidence_bottleneck import SparseSupportEvidenceBottleneck
 from .support_selection_ablation import FixedBudgetSupportSelector
+from .shared_unique_support_actor import (
+    SharedUniqueSupportActorAdapter,
+    SupportMaskProvenance,
+)
 
 __all__ = [
     "CNN",
@@ -67,6 +71,8 @@ __all__ = [
     "RNN",
     "SparseSupportEvidenceBottleneck",
     "FixedBudgetSupportSelector",
+    "SharedUniqueSupportActorAdapter",
+    "SupportMaskProvenance",
     "Distribution",
     "EmpiricalDiscountedVariationNormalization",
     "EmpiricalNormalization",

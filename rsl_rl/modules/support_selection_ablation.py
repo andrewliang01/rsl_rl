@@ -22,6 +22,12 @@ tokens:
     Top-M over the union of caller-supplied calibrated support roles.  A token
     is assigned to its highest-scoring eligible role and can spend only one
     slot even when role masks overlap.
+``role_quota_shared_unique_m``
+    Assigns ``M / 4`` unique ownership slots to every support role.  Token
+    ownership is globally unique, so an overlapping token is charged once;
+    downstream consumers may still expose that selected token to every role
+    for which it is eligible.  Empty role slots remain explicit shortfalls and
+    are never backfilled from another role or from outside the role union.
 ``matched_random_m``
     Random-M without replacement from the exact same eligible union as the
     role-constrained selector.  It is matched in candidate opportunity and
@@ -53,6 +59,7 @@ SUPPORTED_SUPPORT_SELECTION_STRATEGIES: Final[tuple[str, ...]] = (
     "full",
     "glad_top_m",
     "role_shared_total_m",
+    "role_quota_shared_unique_m",
     "matched_random_m",
 )
 
@@ -134,7 +141,10 @@ class FixedBudgetSupportSelector(nn.Module):
                 selector_entropy_applicable = torch.ones(
                     batch_size, device=scores.device, dtype=torch.bool
                 )
-            elif self.strategy == "role_shared_total_m":
+            elif self.strategy in (
+                "role_shared_total_m",
+                "role_quota_shared_unique_m",
+            ):
                 candidate_mask = role_union
                 token_scores, assignment = self._eligible_token_scores(
                     scores, role_candidates
@@ -170,26 +180,35 @@ class FixedBudgetSupportSelector(nn.Module):
                 torch.zeros_like(selector_entropy),
             )
 
-            indices, slot_valid, unique_mask = self._top_m_unique(
-                token_scores,
-                candidate_mask,
-                budget,
-            )
-            query_mask = torch.zeros_like(role_candidates)
-            safe_indices = torch.where(
-                slot_valid,
-                indices,
-                torch.zeros_like(indices),
-            )
-            selected_roles = torch.gather(assignment, 1, safe_indices)
-            batch_indices = torch.arange(
-                batch_size, device=scores.device
-            )[:, None].expand_as(indices)
-            query_mask[
-                batch_indices[slot_valid],
-                selected_roles[slot_valid],
-                indices[slot_valid],
-            ] = True
+            if self.strategy == "role_quota_shared_unique_m":
+                indices, slot_valid, query_mask, unique_mask = (
+                    self._role_quota_unique(
+                        scores,
+                        role_candidates,
+                        budget,
+                    )
+                )
+            else:
+                indices, slot_valid, unique_mask = self._top_m_unique(
+                    token_scores,
+                    candidate_mask,
+                    budget,
+                )
+                query_mask = torch.zeros_like(role_candidates)
+                safe_indices = torch.where(
+                    slot_valid,
+                    indices,
+                    torch.zeros_like(indices),
+                )
+                selected_roles = torch.gather(assignment, 1, safe_indices)
+                batch_indices = torch.arange(
+                    batch_size, device=scores.device
+                )[:, None].expand_as(indices)
+                query_mask[
+                    batch_indices[slot_valid],
+                    selected_roles[slot_valid],
+                    indices[slot_valid],
+                ] = True
             requested = torch.full(
                 (batch_size,),
                 budget,
@@ -199,6 +218,19 @@ class FixedBudgetSupportSelector(nn.Module):
 
         realized = unique_mask.sum(dim=-1)
         per_role = query_mask.sum(dim=-1)
+        if self.strategy == "role_quota_shared_unique_m":
+            requested_per_role = torch.full_like(
+                per_role,
+                int(self.total_budget) // NUM_QUERIES,
+            )
+        else:
+            requested_per_role = per_role
+        per_role_quota_applicable = torch.full(
+            (batch_size,),
+            self.strategy == "role_quota_shared_unique_m",
+            device=scores.device,
+            dtype=torch.bool,
+        )
         pairwise_overlap = (
             query_mask[:, :, None, :] & query_mask[:, None, :, :]
         ).sum(dim=-1)
@@ -220,6 +252,12 @@ class FixedBudgetSupportSelector(nn.Module):
             "realized_unique_count": realized,
             "unique_budget_shortfall": requested - realized,
             "realized_per_role": per_role,
+            "requested_per_role": requested_per_role,
+            "per_role_shortfall": requested_per_role - per_role,
+            "per_role_quota_applicable": per_role_quota_applicable,
+            "selected_eligible_role_mask": (
+                unique_mask[:, None, :] & role_candidates
+            ),
             "pairwise_role_overlap_count": pairwise_overlap,
             "selected_score_contribution": selected_score,
             "valid_token_count": token_valid.sum(dim=-1),
@@ -230,6 +268,7 @@ class FixedBudgetSupportSelector(nn.Module):
                 (batch_size,),
                 self.strategy in (
                     "role_shared_total_m",
+                    "role_quota_shared_unique_m",
                     "matched_random_m",
                 ),
                 device=scores.device,
@@ -243,6 +282,105 @@ class FixedBudgetSupportSelector(nn.Module):
             ),
         }
         return query_mask, diagnostics
+
+    @staticmethod
+    def _role_quota_unique(
+        scores: torch.Tensor,
+        role_candidates: torch.Tensor,
+        budget: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return a maximum-cardinality role-quota/unique-token matching.
+
+        This intentionally auditable CPU scaffold uses a deterministic
+        augmenting-path matching.  Each role owns at most ``budget / Q``
+        distinct tokens.  A token can have one owner only, but the returned
+        unique set can subsequently be consumed by every eligible role.
+        """
+        batch_size, num_roles, num_tokens = role_candidates.shape
+        quota = budget // num_roles
+        query_mask = torch.zeros_like(role_candidates)
+        indices = torch.full(
+            (batch_size, budget),
+            -1,
+            dtype=torch.long,
+            device=scores.device,
+        )
+        slot_valid = torch.zeros(
+            batch_size,
+            budget,
+            dtype=torch.bool,
+            device=scores.device,
+        )
+
+        for batch_index in range(batch_size):
+            preferences: list[list[int]] = []
+            candidate_counts: list[int] = []
+            for role_index in range(num_roles):
+                order = torch.argsort(
+                    scores[batch_index, role_index],
+                    descending=True,
+                    stable=True,
+                )
+                eligible_order = order[
+                    role_candidates[batch_index, role_index, order]
+                ]
+                role_preferences = [int(value) for value in eligible_order]
+                preferences.append(role_preferences)
+                candidate_counts.append(len(role_preferences))
+
+            # Scarce roles enter every round first.  Augmenting paths then
+            # preserve maximum cardinality without allowing any role > quota.
+            role_order = sorted(
+                range(num_roles),
+                key=lambda role: (candidate_counts[role], role),
+            )
+            slot_roles = [
+                role
+                for _ in range(quota)
+                for role in role_order
+            ]
+            slot_to_token = [-1] * budget
+            token_to_slot = [-1] * num_tokens
+
+            def augment(
+                slot: int,
+                seen_tokens: set[int],
+                seen_slots: set[int],
+            ) -> bool:
+                if slot in seen_slots:
+                    return False
+                seen_slots.add(slot)
+                role = slot_roles[slot]
+                for token in preferences[role]:
+                    if token in seen_tokens:
+                        continue
+                    seen_tokens.add(token)
+                    previous_slot = token_to_slot[token]
+                    if previous_slot == -1 or augment(
+                        previous_slot,
+                        seen_tokens,
+                        seen_slots,
+                    ):
+                        slot_to_token[slot] = token
+                        token_to_slot[token] = slot
+                        return True
+                return False
+
+            for slot in range(budget):
+                augment(slot, set(), set())
+
+            write_position = 0
+            for slot, token in enumerate(slot_to_token):
+                if token == -1:
+                    continue
+                role = slot_roles[slot]
+                query_mask[batch_index, role, token] = True
+                indices[batch_index, write_position] = token
+                slot_valid[batch_index, write_position] = True
+                write_position += 1
+
+        unique_mask = query_mask.any(dim=1)
+        return indices, slot_valid, query_mask, unique_mask
 
     @staticmethod
     def _masked_entropy(
