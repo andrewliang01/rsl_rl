@@ -16,7 +16,6 @@ from tensordict import TensorDict
 from rsl_rl.modules import MLP, EmpiricalNormalization, HiddenState
 from rsl_rl.modules.ame2_encoder import AME2Encoder
 from rsl_rl.modules.bank_lidar_heightmap import (
-    BankLidarHeightmapReconstructor,
     load_frozen_reconstructor_checkpoint,
     normalize_heightmap_target_contract,
     preflight_validate_lidar_history,
@@ -195,9 +194,10 @@ class PropMLPElevationFusionModel(nn.Module):
             bank_downstream_heightmap_contract: Independently supplied input
                 contract for the downstream height encoder. It must exactly
                 match the reconstructed target contract.
-            bank_reconstructor_checkpoint: Optional strict frozen Bank
-                checkpoint. Absence creates a trainable reconstructor; presence
-                must bind the same history length and semantic target contract.
+            bank_reconstructor_checkpoint: Required strict frozen Bank
+                checkpoint for the explicit H0b-primary branch. Pretraining is
+                performed only through the independent Bank module; PropMLP
+                intentionally exposes no implicit joint-training path.
         """
         super().__init__()
 
@@ -322,6 +322,11 @@ class PropMLPElevationFusionModel(nn.Module):
                 raise ValueError(
                     "bank_lidar_heightmap fails closed without both reconstructed "
                     "target and downstream heightmap contracts."
+                )
+            if bank_reconstructor_checkpoint is None:
+                raise ValueError(
+                    "bank_lidar_heightmap requires a strict frozen reconstructor "
+                    "checkpoint; implicit joint training is forbidden."
                 )
             reconstructed_contract = normalize_heightmap_target_contract(
                 bank_heightmap_target_contract
@@ -504,27 +509,21 @@ class PropMLPElevationFusionModel(nn.Module):
                 raise ValueError(
                     "bank_lidar_heightmap input spatial size must be (16,96)."
                 )
-            if bank_reconstructor_checkpoint is None:
-                self.heightmap_reconstructor = BankLidarHeightmapReconstructor(
-                    history_length=elevation_history_length,
-                    target_contract=self.bank_heightmap_contract,
+            self.heightmap_reconstructor = (
+                load_frozen_reconstructor_checkpoint(
+                    bank_reconstructor_checkpoint
                 )
-            else:
-                self.heightmap_reconstructor = (
-                    load_frozen_reconstructor_checkpoint(
-                        bank_reconstructor_checkpoint
-                    )
+            )
+            if (
+                self.heightmap_reconstructor.history_length
+                != elevation_history_length
+                or self.heightmap_reconstructor.target_contract
+                != self.bank_heightmap_contract
+            ):
+                raise ValueError(
+                    "Frozen Bank reconstructor history/target contract mismatch."
                 )
-                if (
-                    self.heightmap_reconstructor.history_length
-                    != elevation_history_length
-                    or self.heightmap_reconstructor.target_contract
-                    != self.bank_heightmap_contract
-                ):
-                    raise ValueError(
-                        "Frozen Bank reconstructor history/target contract mismatch."
-                    )
-                self.bank_reconstructor_loaded_frozen = True
+            self.bank_reconstructor_loaded_frozen = True
             self.elevation_encoder = Elevation2DCNNEncoder(
                 in_channels=1,
                 hidden_dims=list(cnn_hidden_dims),
@@ -780,6 +779,8 @@ class PropMLPElevationFusionModel(nn.Module):
             "reconstructor_loaded_frozen": (
                 self.bank_reconstructor_loaded_frozen
             ),
+            "primary_contract": "strict_frozen_reconstructor",
+            "joint_training_authorized": False,
             "downstream_elevation_encoder_parameter_count": count(
                 self.elevation_encoder
             ),

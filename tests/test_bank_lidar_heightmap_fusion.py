@@ -21,6 +21,9 @@ from rsl_rl.modules.bank_lidar_heightmap import (
 )
 
 
+_AUTO_CHECKPOINT = object()
+
+
 def _contract(**overrides) -> dict:
     contract = {
         "schema_version": 1,
@@ -82,7 +85,7 @@ def _model(
     history_length: int,
     target_contract: dict | None = None,
     downstream_contract: dict | None = None,
-    checkpoint: dict | None = None,
+    checkpoint: dict | None | object = _AUTO_CHECKPOINT,
 ) -> PropMLPElevationFusionModel:
     target_contract = _contract() if target_contract is None else target_contract
     downstream_contract = (
@@ -90,6 +93,13 @@ def _model(
         if downstream_contract is None
         else downstream_contract
     )
+    if checkpoint is _AUTO_CHECKPOINT:
+        reconstructor = BankLidarHeightmapReconstructor(
+            history_length=history_length,
+            target_contract=target_contract,
+        )
+        freeze_reconstructor(reconstructor)
+        checkpoint = create_frozen_reconstructor_checkpoint(reconstructor)
     return PropMLPElevationFusionModel(
         obs=observations,
         obs_groups={"actor": ["policy", "ray_policy"]},
@@ -171,6 +181,13 @@ def test_bank_branch_fails_closed_without_static_height_contract_evidence() -> N
             ray_time_spatial_size=(16, 96),
         )
 
+    with pytest.raises(ValueError, match="strict frozen reconstructor"):
+        _model(
+            observations,
+            history_length=5,
+            checkpoint=None,
+        )
+
     lab_style = _contract(
         target_definition="base_z_minus_hit_z",
         height_sign="positive_when_hit_is_below_base",
@@ -198,7 +215,7 @@ def test_bank_branch_fails_closed_without_static_height_contract_evidence() -> N
 
 
 @pytest.mark.parametrize("history_length", [1, 5])
-def test_trainable_bank_branch_backpropagates_through_every_history_frame(
+def test_frozen_bank_branch_backpropagates_only_to_inputs_and_downstream(
     history_length: int,
 ) -> None:
     torch.manual_seed(6200 + history_length)
@@ -218,7 +235,7 @@ def test_trainable_bank_branch_backpropagates_through_every_history_frame(
     for frame_index in range(history_length):
         assert torch.count_nonzero(ray.grad[:, frame_index, 0]) > 0
     assert all(
-        parameter.grad is not None
+        parameter.grad is None and not parameter.requires_grad
         for parameter in model.heightmap_reconstructor.parameters()
     )
     assert all(
@@ -274,6 +291,8 @@ def test_frozen_reconstructor_checkpoint_and_parameter_audit(
     assert audit["reconstructor_trainable_parameter_count"] == 0
     assert audit["reconstructor_training"] is False
     assert audit["reconstructor_loaded_frozen"] is True
+    assert audit["primary_contract"] == "strict_frozen_reconstructor"
+    assert audit["joint_training_authorized"] is False
     assert audit["downstream_elevation_encoder_parameter_count"] == sum(
         parameter.numel() for parameter in model.elevation_encoder.parameters()
     )
