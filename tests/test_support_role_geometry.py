@@ -152,6 +152,9 @@ def test_history_registration_has_exact_strata_and_stable_cell_ids() -> None:
     assert torch.equal(batch.range_stratum, torch.ones(1, 8, dtype=torch.long))
     assert torch.equal(batch.age_stratum[0, :4], torch.zeros(4, dtype=torch.long))
     assert torch.equal(batch.age_stratum[0, 4:], torch.full((4,), 2))
+    assert batch.score_features[0, 4, 7].item() == pytest.approx(0.1)
+    assert batch.score_features[0, 4, 8].item() == pytest.approx(0.1)
+    assert batch.terrain_values[0, 4, 4].item() == pytest.approx(0.1)
     assert metadata.registration_sha256 == metadata.computed_sha256()
     assert torch.equal(metadata.role_eligibility, batch.role_eligibility)
 

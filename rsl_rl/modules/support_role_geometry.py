@@ -286,9 +286,14 @@ class CalibratedSphericalSupportRoleGeometry(nn.Module):
         current_centres = current_foot_centres_body.to(dtype=compute_dtype)
         landing_centres = landing_foot_centres_body.to(dtype=compute_dtype)
 
+        packet_age_grid = packet_age_value[:, :, None, None].expand(
+            -1, -1, self.height, self.width
+        )
         finite = torch.isfinite(ranges) & torch.isfinite(return_age)
         range_admissible = (ranges >= self.min_range) & (ranges <= self.max_range)
-        age_admissible = return_age >= 0.0
+        age_admissible = (return_age >= 0.0) & (
+            return_age + 1.0e-7 >= packet_age_grid
+        )
         token_valid_grid = (
             return_valid_history & finite & range_admissible & age_admissible
         )
@@ -313,12 +318,8 @@ class CalibratedSphericalSupportRoleGeometry(nn.Module):
         return_age_flat = torch.where(
             token_valid_grid, return_age, torch.zeros_like(return_age)
         ).flatten(1, 3)
-        packet_age_grid = packet_age_value[:, :, None, None].expand(
-            -1, -1, self.height, self.width
-        )
-        total_age_grid = return_age + packet_age_grid
-        total_age_flat = torch.where(
-            token_valid_grid, total_age_grid, torch.zeros_like(total_age_grid)
+        packet_age_flat = torch.where(
+            token_valid_grid, packet_age_grid, torch.zeros_like(packet_age_grid)
         ).flatten(1, 3)
         directions_flat = directions.flatten(1, 3)
 
@@ -352,7 +353,7 @@ class CalibratedSphericalSupportRoleGeometry(nn.Module):
             ranges_flat.contiguous(), self.range_strata_edges
         )
         age_stratum = torch.bucketize(
-            total_age_flat.contiguous(), self.age_strata_edges
+            return_age_flat.contiguous(), self.age_strata_edges
         )
         azimuth = torch.atan2(directions_flat[..., 1], directions_flat[..., 0])
         elevation = torch.asin(directions_flat[..., 2].clamp(-1.0, 1.0))
@@ -380,7 +381,7 @@ class CalibratedSphericalSupportRoleGeometry(nn.Module):
                 directions_flat,
                 ranges_flat[..., None],
                 return_age_flat[..., None],
-                total_age_flat[..., None],
+                packet_age_flat[..., None],
             ),
             dim=-1,
         )
@@ -388,7 +389,7 @@ class CalibratedSphericalSupportRoleGeometry(nn.Module):
             (
                 points_flat,
                 ranges_flat[..., None],
-                total_age_flat[..., None],
+                return_age_flat[..., None],
             ),
             dim=-1,
         )
