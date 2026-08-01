@@ -38,6 +38,8 @@ from .rnn import RNN, HiddenState
 from .sparse_support_evidence_bottleneck import SparseSupportEvidenceBottleneck
 from .support_selection_ablation import FixedBudgetSupportSelector
 from .shared_unique_support_actor import (
+    MatchedSubstitutionMetadata,
+    MatchedSubstitutionShortfallError,
     SharedUniqueSupportActorAdapter,
     SupportMaskProvenance,
 )
@@ -71,6 +73,8 @@ __all__ = [
     "RNN",
     "SparseSupportEvidenceBottleneck",
     "FixedBudgetSupportSelector",
+    "MatchedSubstitutionMetadata",
+    "MatchedSubstitutionShortfallError",
     "SharedUniqueSupportActorAdapter",
     "SupportMaskProvenance",
     "Distribution",
