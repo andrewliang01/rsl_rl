@@ -31,7 +31,7 @@ def test_h2_protocol_has_causal_2x2_exact_union_and_age_controls():
         for association in ("correct", "shuffled"):
             name = f"h2_{geometry}_{association}_history_per_return_age"
             assert name in specs
-    assert "h2_native_correct_exact_union_k1_per_return_age" in specs
+    assert "h2_native_correct_exact_union_k1_age_zero" in specs
     assert (
         "h2_native_correct_raster_latest_event_prototype_per_return_age"
         in specs
@@ -43,7 +43,7 @@ def test_h2_protocol_has_causal_2x2_exact_union_and_age_controls():
 def test_protocol_receipt_does_not_claim_registered_training_tasks():
     receipt = perception_ablation_receipt()
     assert receipt["training_task_registration"] == "intentionally_deferred"
-    assert receipt["schema"] == "g1_perception_ablation_protocol_v2"
+    assert receipt["schema"] == "g1_perception_ablation_protocol_v3"
     assert receipt["h1_role_semantics"] == "cteq_current_landing_v2"
     assert receipt["incompatible_role_migration"]["automatic_aliasing"] is False
     assert "causal/action_kl_clean_vs_intervention" in receipt["metric_keys"]["paired_causal"]
@@ -66,4 +66,12 @@ def test_specs_reject_false_training_readiness_and_invalid_randomness():
             name="bad",
             geometry="native",
             time_association="shuffled",
+        )
+    with pytest.raises(ValueError, match="must use age_zero"):
+        H2AblationSpec(
+            name="bad_exact_union_with_time",
+            geometry="native",
+            time_association="correct",
+            temporal_baseline="per_return_age",
+            history_reduction="exact_union_k1",
         )
