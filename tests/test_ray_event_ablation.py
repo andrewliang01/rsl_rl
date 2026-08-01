@@ -1,7 +1,13 @@
 import pytest
 import torch
 
-from rsl_rl.modules.ray_event_ablation import RayEventAblationRouter
+from rsl_rl.modules.ray_event_ablation import (
+    EXACT_UNION_TIE_EQUAL_RANGE_AGE_LOWEST_SLOT,
+    EXACT_UNION_TIE_EQUAL_RANGE_OLDER_AGE,
+    EXACT_UNION_TIE_INVALID,
+    EXACT_UNION_TIE_NEAREST_ONLY,
+    RayEventAblationRouter,
+)
 
 
 def _batch():
@@ -98,6 +104,20 @@ def test_exact_union_k1_keeps_range_and_age_from_same_winner():
     assert output.return_age_s[0, 0, 0, 0].item() == pytest.approx(0.28)
     assert output.diagnostics["exact_union_winner_frame_index"][0, 0, 0].item() == 2
     assert output.diagnostics["exact_union_collision_cell_count"].item() == 1
+    assert output.diagnostics["exact_union_return_multiplicity"][0, 0, 0] == 3
+    assert output.diagnostics["exact_union_winner_range_m"][0, 0, 0] == 1.5
+    assert output.diagnostics["exact_union_winner_return_age_s"][0, 0, 0] == (
+        pytest.approx(0.28)
+    )
+    assert output.diagnostics["exact_union_tie_reason_code"][0, 0, 0] == (
+        EXACT_UNION_TIE_EQUAL_RANGE_OLDER_AGE
+    )
+    assert output.diagnostics["exact_union_tie_reason_code"][0, 0, 1] == (
+        EXACT_UNION_TIE_NEAREST_ONLY
+    )
+    assert output.diagnostics["exact_union_tie_reason_code"][0, 1, 0] == (
+        EXACT_UNION_TIE_INVALID
+    )
     assert output.packet_age_s.item() == pytest.approx(0.05)
 
 
@@ -115,6 +135,14 @@ def test_exact_union_equal_range_and_age_uses_lowest_history_index():
     assert output.return_age_s.item() == 0.0
     assert output.packet_age_s.item() == 0.0
     assert output.diagnostics["exact_union_winner_frame_index"].item() == 0
+    assert output.diagnostics["exact_union_return_multiplicity"].item() == 3
+    assert output.diagnostics["exact_union_winner_range_m"].item() == 1.5
+    assert output.diagnostics["exact_union_winner_return_age_s"].item() == (
+        pytest.approx(0.2)
+    )
+    assert output.diagnostics["exact_union_tie_reason_code"].item() == (
+        EXACT_UNION_TIE_EQUAL_RANGE_AGE_LOWEST_SLOT
+    )
 
 
 def test_raster_latest_prototype_is_distinct_from_nearest_range_oracle():

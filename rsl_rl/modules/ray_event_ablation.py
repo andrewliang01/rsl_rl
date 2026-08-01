@@ -39,6 +39,10 @@ SUPPORTED_HISTORY_REDUCTIONS: Final[tuple[str, ...]] = (
     "raster_latest_event_prototype",
 )
 LATEST_EVENT_WINDOW_S: Final[float] = 0.5
+EXACT_UNION_TIE_INVALID: Final[int] = 0
+EXACT_UNION_TIE_NEAREST_ONLY: Final[int] = 1
+EXACT_UNION_TIE_EQUAL_RANGE_OLDER_AGE: Final[int] = 2
+EXACT_UNION_TIE_EQUAL_RANGE_AGE_LOWEST_SLOT: Final[int] = 3
 
 
 @dataclass(frozen=True)
@@ -213,6 +217,22 @@ class RayEventAblationRouter(nn.Module):
             device=range_m.device,
             dtype=torch.long,
         )
+        exact_union_return_multiplicity = torch.zeros_like(
+            winner_frame_index,
+            dtype=torch.int16,
+        )
+        exact_union_winner_range_m = torch.zeros_like(
+            winner_frame_index,
+            dtype=torch.float32,
+        )
+        exact_union_winner_return_age_s = torch.zeros_like(
+            winner_frame_index,
+            dtype=torch.float32,
+        )
+        exact_union_tie_reason_code = torch.zeros_like(
+            winner_frame_index,
+            dtype=torch.uint8,
+        )
         if self.history_reduction == "exact_union_k1":
             (
                 range_m,
@@ -221,6 +241,10 @@ class RayEventAblationRouter(nn.Module):
                 packet_age_s,
                 frame_valid,
                 winner_frame_index,
+                exact_union_return_multiplicity,
+                exact_union_winner_range_m,
+                exact_union_winner_return_age_s,
+                exact_union_tie_reason_code,
             ) = self._exact_union_k1(
                 range_m,
                 return_valid,
@@ -290,6 +314,14 @@ class RayEventAblationRouter(nn.Module):
             "changed_age_association_count": changed_age_association_count,
             "exact_union_collision_cell_count": collision_count,
             "exact_union_winner_frame_index": winner_frame_index,
+            "exact_union_return_multiplicity": (
+                exact_union_return_multiplicity
+            ),
+            "exact_union_winner_range_m": exact_union_winner_range_m,
+            "exact_union_winner_return_age_s": (
+                exact_union_winner_return_age_s
+            ),
+            "exact_union_tie_reason_code": exact_union_tie_reason_code,
             "history_reduction_winner_frame_index": winner_frame_index,
             "shuffle_seed": torch.full(
                 (range_m.shape[0],),
@@ -408,6 +440,10 @@ class RayEventAblationRouter(nn.Module):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
     ]:
         masked_range = torch.where(
             return_valid,
@@ -441,10 +477,37 @@ class RayEventAblationRouter(nn.Module):
         )
         union_range = torch.where(
             union_valid, nearest, torch.zeros_like(nearest)
-        )[:, None]
+        )
         union_age = torch.where(
             union_valid, winning_age, torch.zeros_like(winning_age)
-        )[:, None]
+        )
+        return_multiplicity = return_valid.sum(dim=1).to(torch.int16)
+        nearest_tie_count = nearest_ties.sum(dim=1)
+        age_tie_count = age_ties.sum(dim=1)
+        tie_reason = torch.zeros_like(winner_index, dtype=torch.uint8)
+        tie_reason = torch.where(
+            union_valid & (nearest_tie_count == 1),
+            torch.full_like(tie_reason, EXACT_UNION_TIE_NEAREST_ONLY),
+            tie_reason,
+        )
+        tie_reason = torch.where(
+            union_valid & (nearest_tie_count > 1) & (age_tie_count == 1),
+            torch.full_like(
+                tie_reason,
+                EXACT_UNION_TIE_EQUAL_RANGE_OLDER_AGE,
+            ),
+            tie_reason,
+        )
+        tie_reason = torch.where(
+            union_valid & (nearest_tie_count > 1) & (age_tie_count > 1),
+            torch.full_like(
+                tie_reason,
+                EXACT_UNION_TIE_EQUAL_RANGE_AGE_LOWEST_SLOT,
+            ),
+            tie_reason,
+        )
+        union_range_output = union_range[:, None]
+        union_age_output = union_age[:, None]
         union_valid = union_valid[:, None]
         union_frame_valid = frame_valid.any(dim=1, keepdim=True)
         # A synthetic exact union has no single physical packet.  Export the
@@ -452,7 +515,7 @@ class RayEventAblationRouter(nn.Module):
         # compatible with the event-time encoder's return_age >= packet_age
         # invariant and avoids pretending all cells came from one packet.
         flat_valid = union_valid.flatten(start_dim=2)
-        flat_age = union_age.flatten(start_dim=2)
+        flat_age = union_age_output.flatten(start_dim=2)
         union_packet_age = torch.where(
             flat_valid,
             flat_age,
@@ -464,12 +527,16 @@ class RayEventAblationRouter(nn.Module):
             torch.zeros_like(union_packet_age),
         )
         return (
-            union_range,
+            union_range_output,
             union_valid,
-            union_age,
+            union_age_output,
             union_packet_age,
             union_frame_valid,
             winner_index,
+            return_multiplicity,
+            union_range,
+            union_age,
+            tie_reason,
         )
 
     @staticmethod
