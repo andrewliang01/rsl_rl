@@ -62,3 +62,31 @@ This remains a CPU contract primitive. It is not connected to the actor, Gym,
 PPO, or GPU execution. Training remains disabled until the real runner proves
 the exact `done`/`time_outs`/base-contact mapping and whether the terminal
 contact sample is valid and included in `fully_observed_bins`.
+
+## On-policy termination provenance
+
+`build_cteq_on_policy_termination_provenance` freezes the required boundary
+between an auto-reset environment and the administrative label builder. In
+addition to `dones`, the environment-owned `extras` must provide:
+
+- `time_outs`, base-contact termination, and other termination masks;
+- a reset-before terminal foot-contact sample and its validity mask;
+- the episode ID before the step, the episode ID attached to terminal contact,
+  and the post-step episode ID.
+
+The three termination masks must be mutually exclusive and exhaustive. Every
+done row requires a valid terminal contact whose episode ID equals the
+pre-reset ID, while its post-step ID must be strictly newer. Non-done rows must
+remain in the same episode and carry no latent terminal contact. These checks
+prevent reset-state contact from being appended to the previous episode's
+future TD/LO trace.
+
+The stock RSL on-policy interface currently guarantees only `dones` and an
+optional `extras["time_outs"]`; it does not guarantee the remaining fields.
+Missing terminal contact or episode IDs therefore fail closed. A validated
+provenance batch can authenticate the matching termination masks in the
+administrative-censor receipt, but `training_ready` remains false until a real
+environment adapter emits and receipts this exact interface.
+The later collector must additionally receipt the anchor-to-terminal sample
+count used as `fully_observed_bins`; this step-level provenance contract does
+not infer that count from reset observations.

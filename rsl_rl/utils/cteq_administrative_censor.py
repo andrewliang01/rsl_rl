@@ -31,6 +31,11 @@ from .cteq_contact_timing import (
     EventIndex,
     PrivilegedLabelLeakageError,
 )
+from .cteq_runner_termination_provenance import (
+    CTEQ_RUNNER_TERMINATION_PROVENANCE_SCHEMA,
+    CteqOnPolicyTerminationProvenance,
+    validate_cteq_runner_termination_provenance_receipt,
+)
 
 
 CTEQ_ADMINISTRATIVE_CENSOR_SCHEMA: Final[str] = (
@@ -190,6 +195,9 @@ def build_cteq_administrative_censor_batch(
     foot_event_source_contract: str = CTEQ_FOOT_EVENT_SOURCE_CONTRACT,
     observed_bin_contract: str = CTEQ_OBSERVED_BIN_CONTRACT,
     runner_termination_provenance_sha256: str | None = None,
+    runner_termination_provenance: (
+        CteqOnPolicyTerminationProvenance | None
+    ) = None,
 ) -> CteqAdministrativeCensorBatch:
     """Adapt audited event bins and explicit boundaries without guessing.
 
@@ -220,6 +228,14 @@ def build_cteq_administrative_censor_batch(
         raise CteqContractError(
             "The terminal-sample/exposure convention is missing or changed."
         )
+    if (
+        runner_termination_provenance is not None
+        and runner_termination_provenance_sha256 is not None
+    ):
+        raise CteqContractError(
+            "Supply either a validated runner provenance batch or a legacy "
+            "unverified hash, not both."
+        )
 
     exposure = np.asarray(fully_observed_bins)
     if exposure.shape != (batch_size,) or exposure.dtype.kind not in "iu":
@@ -238,6 +254,38 @@ def build_cteq_administrative_censor_batch(
     other_early = _bool_batch(
         other_early_termination, "other_early_termination", batch_size
     )
+    provenance_receipt: dict[str, Any] | None = None
+    provenance_authenticated = False
+    if runner_termination_provenance is not None:
+        if not isinstance(
+            runner_termination_provenance,
+            CteqOnPolicyTerminationProvenance,
+        ):
+            raise CteqContractError(
+                "runner_termination_provenance has the wrong contract type."
+            )
+        provenance = runner_termination_provenance
+        if not (
+            np.array_equal(done, provenance.episode_done)
+            and np.array_equal(timeout, provenance.time_limit)
+            and np.array_equal(
+                base_contact, provenance.base_contact_termination
+            )
+            and np.array_equal(
+                other_early, provenance.other_early_termination
+            )
+        ):
+            raise CteqContractError(
+                "Administrative labels and runner termination provenance differ."
+            )
+        provenance_receipt = provenance.receipt()
+        validate_cteq_runner_termination_provenance_receipt(
+            provenance_receipt
+        )
+        runner_termination_provenance_sha256 = provenance_receipt[
+            "receipt_sha256"
+        ]
+        provenance_authenticated = True
     termination_sum = (
         timeout.astype(np.int8)
         + base_contact.astype(np.int8)
@@ -343,9 +391,15 @@ def build_cteq_administrative_censor_batch(
             runner_termination_provenance_sha256
         ),
         "runner_termination_provenance_receipted": provenance_receipted,
-        # A syntactically valid evidence hash is not proof that this CPU-only
-        # adapter has inspected the real runner or terminal sensor sample.
-        "runner_termination_provenance_authenticated": False,
+        "runner_termination_provenance_contract": (
+            CTEQ_RUNNER_TERMINATION_PROVENANCE_SCHEMA
+            if provenance_authenticated
+            else None
+        ),
+        "runner_termination_provenance_receipt": provenance_receipt,
+        "runner_termination_provenance_authenticated": (
+            provenance_authenticated
+        ),
         "termination_is_event": False,
         "future_truth_consumers": list(CTEQ_ALLOWED_TRUTH_CONSUMERS),
         "actor_future_truth_access": False,
@@ -606,10 +660,24 @@ def validate_cteq_administrative_censor_receipt(
         _is_sha256(provenance)
     ):
         raise CteqContractError("Runner termination receipt hash is inconsistent.")
-    if receipt.get("runner_termination_provenance_authenticated") is not False:
-        raise CteqContractError(
-            "The CPU adapter cannot authenticate real runner provenance."
-        )
+    nested_provenance = receipt.get("runner_termination_provenance_receipt")
+    provenance_contract = receipt.get("runner_termination_provenance_contract")
+    provenance_authenticated = receipt.get(
+        "runner_termination_provenance_authenticated"
+    )
+    if nested_provenance is None:
+        if provenance_contract is not None or provenance_authenticated is not False:
+            raise CteqContractError(
+                "Unbound runner provenance cannot be authenticated."
+            )
+    else:
+        validate_cteq_runner_termination_provenance_receipt(nested_provenance)
+        if provenance_contract != CTEQ_RUNNER_TERMINATION_PROVENANCE_SCHEMA:
+            raise CteqContractError("Runner provenance contract changed.")
+        if provenance_authenticated is not True:
+            raise CteqContractError("Validated runner provenance lost authentication.")
+        if provenance != nested_provenance.get("receipt_sha256"):
+            raise CteqContractError("Nested runner provenance digest differs.")
     counts = receipt.get("reason_counts")
     expected_count_keys = {
         *_REASON_NAMES.values(),
@@ -626,6 +694,19 @@ def validate_cteq_administrative_censor_receipt(
         raise CteqContractError("CTEQ censor reason counts are invalid.")
     if sum(counts[name] for name in _REASON_NAMES.values()) != batch_size * 4:
         raise CteqContractError("CTEQ per-target reason counts are incomplete.")
+    if nested_provenance is not None:
+        nested_counts = nested_provenance["counts"]
+        if nested_provenance["batch_size"] != batch_size:
+            raise CteqContractError("Nested runner provenance batch size differs.")
+        if (
+            nested_counts["time_limit"] != counts["episode_time_limit"]
+            or nested_counts["base_contact"] != counts["episode_base_contact"]
+            or nested_counts["other_termination"]
+            != counts["episode_other_early_termination"]
+        ):
+            raise CteqContractError(
+                "Nested runner termination counts differ from label reasons."
+            )
     if not _is_sha256(receipt.get("label_tensor_sha256")):
         raise CteqContractError("CTEQ label tensor digest is invalid.")
     horizon = receipt.get("forecast_horizon_s")

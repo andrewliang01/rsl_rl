@@ -89,5 +89,13 @@ class VecEnv(ABC):
             - "log" (dict[str, float | torch.Tensor]): Additional information for logging and debugging purposes.
                The key should be a string and start with "/" for namespacing. The value can be a scalar or a
                tensor. If it is a tensor, the mean of the tensor is used for logging.
+
+            Environments that opt into the CPU-first CTEQ administrative-label
+            contract must also provide the exact extras listed by
+            ``CTEQ_REQUIRED_EXTRAS_KEYS``. The stock runner does not synthesize
+            missing base-contact, terminal-contact, or episode-id fields.
+            These privileged fields are reserved for the offline label builder,
+            loss, and evaluator; they must not enter actor observations or
+            critic hidden state.
         """
         raise NotImplementedError
