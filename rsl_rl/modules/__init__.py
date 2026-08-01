@@ -20,6 +20,10 @@ from .bank_lidar_heightmap import (
     supervised_height_valid_mse,
     valid_masked_range_mse,
 )
+from .causal_foot_support_projector import (
+    CausalCommandFootSupportProjector,
+    CausalFootSupportProjection,
+)
 from .cnn import CNN
 from .cteq_dual_event_hazard import (
     CteqAdministrativeSurvivalLoss,
@@ -56,6 +60,8 @@ __all__ = [
     "SUPPORT_ROLE_NAMES",
     "BankLidarHeightmapReconstructor",
     "CalibratedSphericalSupportRoleGeometry",
+    "CausalCommandFootSupportProjector",
+    "CausalFootSupportProjection",
     "CteqAdministrativeSurvivalLoss",
     "CteqDualEventHazardHead",
     "CteqIndependentSurvivalLoss",
