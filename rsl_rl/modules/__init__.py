@@ -6,6 +6,19 @@
 """Building blocks for neural models."""
 
 from .cnn import CNN
+from .bank_lidar_heightmap import (
+    BankLidarHeightmapReconstructor,
+    SphericalAutoencoderOutput,
+    SphericalAutoencoderPretrainHead,
+    SphericalRangeFrameEncoder,
+    create_frozen_reconstructor_checkpoint,
+    freeze_reconstructor,
+    load_frozen_reconstructor_checkpoint,
+    reconstructor_checkpoint_schema,
+    spherical_valid_bce,
+    supervised_height_valid_mse,
+    valid_masked_range_mse,
+)
 from .distribution import Distribution, GaussianDistribution, HeteroscedasticGaussianDistribution
 from .mlp import MLP
 from .multimodal_ray_evidence_encoder import MultimodalRayEvidenceEncoder
@@ -25,6 +38,17 @@ from .support_selection_ablation import FixedBudgetSupportSelector
 
 __all__ = [
     "CNN",
+    "BankLidarHeightmapReconstructor",
+    "SphericalAutoencoderOutput",
+    "SphericalAutoencoderPretrainHead",
+    "SphericalRangeFrameEncoder",
+    "create_frozen_reconstructor_checkpoint",
+    "freeze_reconstructor",
+    "load_frozen_reconstructor_checkpoint",
+    "reconstructor_checkpoint_schema",
+    "spherical_valid_bce",
+    "supervised_height_valid_mse",
+    "valid_masked_range_mse",
     "MLP",
     "MultimodalRayEvidenceEncoder",
     "R2Plus1DBlock",
