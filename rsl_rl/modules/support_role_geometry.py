@@ -112,6 +112,24 @@ class CalibratedSphericalSupportRoleGeometry(nn.Module):
 
     score_feature_dim: Final[int] = 9
     terrain_value_dim: Final[int] = 5
+    score_feature_names: Final[tuple[str, ...]] = (
+        "point_x_body_m",
+        "point_y_body_m",
+        "point_z_body_m",
+        "ray_direction_x_body",
+        "ray_direction_y_body",
+        "ray_direction_z_body",
+        "range_m",
+        "evidence_age_s",
+        "packet_age_s",
+    )
+    terrain_value_names: Final[tuple[str, ...]] = (
+        "point_x_body_m",
+        "point_y_body_m",
+        "point_z_body_m",
+        "range_m",
+        "evidence_age_s",
+    )
 
     def __init__(
         self,
@@ -218,6 +236,9 @@ class CalibratedSphericalSupportRoleGeometry(nn.Module):
             "external_calibration_verified_by_component": False,
             "role_order": SUPPORT_ROLE_NAMES,
             "invalid_cell_semantics": "unknown_not_free_space",
+            "evidence_age_semantics": "max(return_age_s,packet_age_s)",
+            "score_feature_names": self.score_feature_names,
+            "terrain_value_names": self.terrain_value_names,
             "geometry_inputs": (
                 "calibrated_spherical_return_rays",
                 "causal_acquisition_body_to_current_body_transform",
@@ -291,9 +312,7 @@ class CalibratedSphericalSupportRoleGeometry(nn.Module):
         )
         finite = torch.isfinite(ranges) & torch.isfinite(return_age)
         range_admissible = (ranges >= self.min_range) & (ranges <= self.max_range)
-        age_admissible = (return_age >= 0.0) & (
-            return_age + 1.0e-7 >= packet_age_grid
-        )
+        age_admissible = return_age >= 0.0
         token_valid_grid = (
             return_valid_history & finite & range_admissible & age_admissible
         )
@@ -315,8 +334,11 @@ class CalibratedSphericalSupportRoleGeometry(nn.Module):
         points_flat = points.flatten(1, 3)
         valid_flat = token_valid_grid.flatten(1, 3)
         ranges_flat = safe_ranges.flatten(1, 3)
-        return_age_flat = torch.where(
-            token_valid_grid, return_age, torch.zeros_like(return_age)
+        evidence_age_grid = torch.maximum(return_age, packet_age_grid)
+        evidence_age_flat = torch.where(
+            token_valid_grid,
+            evidence_age_grid,
+            torch.zeros_like(evidence_age_grid),
         ).flatten(1, 3)
         packet_age_flat = torch.where(
             token_valid_grid, packet_age_grid, torch.zeros_like(packet_age_grid)
@@ -353,7 +375,7 @@ class CalibratedSphericalSupportRoleGeometry(nn.Module):
             ranges_flat.contiguous(), self.range_strata_edges
         )
         age_stratum = torch.bucketize(
-            return_age_flat.contiguous(), self.age_strata_edges
+            evidence_age_flat.contiguous(), self.age_strata_edges
         )
         azimuth = torch.atan2(directions_flat[..., 1], directions_flat[..., 0])
         elevation = torch.asin(directions_flat[..., 2].clamp(-1.0, 1.0))
@@ -380,7 +402,7 @@ class CalibratedSphericalSupportRoleGeometry(nn.Module):
                 points_flat,
                 directions_flat,
                 ranges_flat[..., None],
-                return_age_flat[..., None],
+                evidence_age_flat[..., None],
                 packet_age_flat[..., None],
             ),
             dim=-1,
@@ -389,7 +411,7 @@ class CalibratedSphericalSupportRoleGeometry(nn.Module):
             (
                 points_flat,
                 ranges_flat[..., None],
-                return_age_flat[..., None],
+                evidence_age_flat[..., None],
             ),
             dim=-1,
         )

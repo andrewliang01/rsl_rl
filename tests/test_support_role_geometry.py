@@ -183,6 +183,29 @@ def test_history_points_require_causal_acquisition_to_current_transform() -> Non
     assert not batch.role_eligibility[0, 1, 0]
 
 
+def test_packet_age_is_effective_age_when_raycaster_has_no_return_time() -> None:
+    """Use packet age for honest RayCaster packet-time training observations."""
+    geometry = _geometry()
+    current, landing = _centres()
+    rotation, translation = _transforms()
+    batch = geometry(
+        torch.ones(1, 1, 1, 4),
+        torch.ones(1, 1, 1, 4, dtype=torch.bool),
+        torch.zeros(1, 1, 1, 4),
+        torch.tensor([[0.1]]),
+        rotation,
+        translation,
+        current,
+        landing,
+    )
+
+    assert batch.token_valid.all()
+    assert torch.allclose(batch.score_features[..., 7], torch.full((1, 4), 0.1))
+    assert torch.allclose(batch.score_features[..., 8], torch.full((1, 4), 0.1))
+    assert torch.allclose(batch.terrain_values[..., 4], torch.full((1, 4), 0.1))
+    assert torch.equal(batch.age_stratum, torch.full((1, 4), 2))
+
+
 def test_receipt_does_not_overclaim_external_calibration_or_training() -> None:
     """Keep calibration, formal-task, training, and real-robot claims false."""
     geometry = _geometry()
@@ -191,6 +214,7 @@ def test_receipt_does_not_overclaim_external_calibration_or_training() -> None:
     assert receipt["external_calibration_sha256"] == "a" * 64
     assert receipt["external_calibration_verified_by_component"] is False
     assert receipt["invalid_cell_semantics"] == "unknown_not_free_space"
+    assert receipt["evidence_age_semantics"] == "max(return_age_s,packet_age_s)"
     assert receipt["simulator_contact_truth"] is False
     assert receipt["simulator_terrain_truth"] is False
     assert receipt["training_ready"] is False
