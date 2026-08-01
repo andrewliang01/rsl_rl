@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import git
+import math
 import os
 import pathlib
 import statistics
@@ -15,6 +16,18 @@ import torch
 from collections import deque
 
 import rsl_rl
+
+
+def format_duration(seconds: float) -> str:
+    """Format an elapsed duration without wrapping at the 24-hour boundary."""
+    if not math.isfinite(seconds) or seconds < 0.0:
+        raise ValueError("Duration must be finite and non-negative.")
+    total_seconds = int(seconds)
+    days, remainder = divmod(total_seconds, 24 * 60 * 60)
+    hours, remainder = divmod(remainder, 60 * 60)
+    minutes, seconds_part = divmod(remainder, 60)
+    clock = f"{hours:02d}:{minutes:02d}:{seconds_part:02d}"
+    return f"{days}d {clock}" if days else clock
 
 
 class Logger:
@@ -286,8 +299,8 @@ class Logger:
             log_string += (
                 f"""{"-" * width}\n"""
                 f"""{"Iteration time:":>{pad}} {iteration_time:.2f}s\n"""
-                f"""{"Time elapsed:":>{pad}} {time.strftime("%H:%M:%S", time.gmtime(self.tot_time))}\n"""
-                f"""{"ETA:":>{pad}} {time.strftime("%H:%M:%S", time.gmtime(eta))}\n"""
+                f"""{"Time elapsed:":>{pad}} {format_duration(self.tot_time)}\n"""
+                f"""{"ETA:":>{pad}} {format_duration(eta)}\n"""
             )
             print(log_string)
 
