@@ -29,14 +29,17 @@ unique-token 总预算；`random` 从与 role 完全相同的候选并集无放�
 
 时间/历史控制：
 
-- `h2_native_correct_exact_union_k1_per_return_age`
+- `h2_native_correct_exact_union_k1_age_zero`
 - `h2_native_correct_raster_latest_event_prototype_per_return_age`
 - `h2_native_correct_history_packet_age`
 - `h2_native_correct_history_age_zero`
 
-`exact_union_k1` 是 coverage oracle，在每个角度栅格选择全历史最近回波；距离相同时选择更早采集的
-回波，range 与 return age 始终来自同一个 winner。`shuffled` 只在同一 packet 的
-有效回波内部打乱时间，并验证每帧时间多重集守恒。
+`exact_union_k1` 是 coverage oracle，在每个角度栅格选择全历史最近回波；距离相同
+时选择更早采集的回波，内部 winner 的 range 与 return age 始终同源。但该正式
+density control 输出固定为 `age_zero`，actor 不读取 winner age、packet age 或源
+frame，避免一边声称“只匹配覆盖”一边保留时间线索。winner age 与源 frame 只能写入
+审计 provenance。`shuffled` 只在同一 packet 的有效回波内部打乱时间，并验证每帧
+时间多重集守恒。
 
 `raster_latest_event_prototype` 只在已按 packet 栅格化的历史上选择最新有效值，
 不得称为 PIES；两者不得混名。

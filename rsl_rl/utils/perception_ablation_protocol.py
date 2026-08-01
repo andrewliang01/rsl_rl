@@ -155,6 +155,14 @@ class H2AblationSpec:
             raise ValueError(
                 f"Unsupported H2 history reduction {self.history_reduction!r}."
             )
+        if (
+            self.history_reduction == "exact_union_k1"
+            and self.temporal_baseline != "age_zero"
+        ):
+            raise ValueError(
+                "The exact-union K1 density control must use age_zero so it "
+                "cannot retain winner time while claiming to isolate coverage."
+            )
         if self.time_association == "shuffled":
             if self.shuffle_seed is None or self.shuffle_seed < 0:
                 raise ValueError("Shuffled time requires a non-negative seed.")
@@ -239,7 +247,7 @@ def build_h2_protocol(*, shuffle_seed: int = 42) -> dict[str, H2AblationSpec]:
             specs[name] = spec
 
     for history_reduction, baseline in (
-        ("exact_union_k1", "per_return_age"),
+        ("exact_union_k1", "age_zero"),
         ("raster_latest_event_prototype", "per_return_age"),
         ("history", "packet_age"),
         ("history", "age_zero"),
@@ -261,7 +269,7 @@ def perception_ablation_receipt() -> dict[str, object]:
     h1 = build_h1_protocol()
     h2 = build_h2_protocol()
     return {
-        "schema": "g1_perception_ablation_protocol_v2",
+        "schema": "g1_perception_ablation_protocol_v3",
         "h1_role_semantics": H1_ROLE_SEMANTICS,
         "incompatible_role_migration": {
             "rejected_legacy_order": (
