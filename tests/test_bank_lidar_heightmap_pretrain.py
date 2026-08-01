@@ -113,6 +113,7 @@ def _dataset(tmp_path: Path) -> tuple[dict, dict]:
             "rsl_rl": "d" * 40,
             "isaaclab": "e" * 40,
         },
+        target_contract=contract,
     )
     return manifest, contract
 

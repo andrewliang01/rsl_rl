@@ -87,6 +87,7 @@ _TARGET_CONTRACT_KEYS = {
     "unknown_cell_policy",
     "contract_source_sha256",
 }
+H0B_MANIFEST_TARGET_CONTRACT_ENCODING = "canonical_compact_json_ascii_sorted_no_trailing_lf_v1"
 
 
 def _group_count(num_channels: int, maximum: int = 8) -> int:
@@ -155,6 +156,115 @@ def normalize_heightmap_target_contract(
         "resolution_m": float(resolution_m),
         "unknown_cell_policy": contract["unknown_cell_policy"],
         "contract_source_sha256": source_sha256,
+    }
+
+
+def manifest_target_contract_json_bytes(contract: Mapping[str, Any]) -> bytes:
+    """Return the exact no-newline preimage bound by H0b dataset manifests.
+
+    The manifest digest is semantic: the 13-key contract is validated and
+    normalized before its compact ASCII JSON representation is hashed.  It is
+    deliberately not the SHA-256 of a JSON sidecar file, whose encoding may
+    append one final line feed.
+    """
+    normalized = normalize_heightmap_target_contract(contract)
+    return json.dumps(
+        normalized,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("ascii")
+
+
+def manifest_target_contract_payload_sha256(contract: Mapping[str, Any]) -> str:
+    """Hash :func:`manifest_target_contract_json_bytes` with SHA-256."""
+    return hashlib.sha256(manifest_target_contract_json_bytes(contract)).hexdigest()
+
+
+def validate_manifest_target_contract_binding(
+    contract: Mapping[str, Any],
+    expected_payload_sha256: str,
+) -> dict[str, Any]:
+    """Return the normalized contract only when its manifest digest matches."""
+    expected = _require_sha256(
+        expected_payload_sha256,
+        field="manifest target_contract_payload_sha256",
+    )
+    normalized = normalize_heightmap_target_contract(contract)
+    if manifest_target_contract_payload_sha256(normalized) != expected:
+        raise ValueError("Heightmap target contract payload SHA-256 mismatch.")
+    return normalized
+
+
+def audit_heightmap_target_contract_json_bytes(
+    payload: bytes,
+    *,
+    expected_manifest_payload_sha256: str | None = None,
+    expected_file_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Parse JSON bytes and bind file encoding separately from contract meaning.
+
+    This boundary accepts equivalent JSON encodings, rejects duplicate keys and
+    non-finite constants, and reports both the raw-file digest and the normalized
+    no-newline manifest digest.  Callers may supply either or both expected
+    digests to reject a raw/semantic cross-splice.
+    """
+    if not isinstance(payload, bytes):
+        raise TypeError("Heightmap target contract payload must be bytes.")
+
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"Heightmap target contract repeats key: {key}.")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(
+            payload.decode("utf-8"),
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=lambda constant: (_ for _ in ()).throw(
+                ValueError(f"Non-finite JSON constant is forbidden: {constant}.")
+            ),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("Heightmap target contract is not valid UTF-8 JSON.") from error
+    if not isinstance(value, Mapping):
+        raise TypeError("Heightmap target contract JSON must contain one object.")
+
+    normalized = normalize_heightmap_target_contract(value)
+    manifest_preimage = manifest_target_contract_json_bytes(normalized)
+    manifest_digest = hashlib.sha256(manifest_preimage).hexdigest()
+    file_digest = hashlib.sha256(payload).hexdigest()
+    if expected_manifest_payload_sha256 is not None:
+        expected_manifest = _require_sha256(
+            expected_manifest_payload_sha256,
+            field="expected manifest target contract payload SHA-256",
+        )
+        if manifest_digest != expected_manifest:
+            raise ValueError("Heightmap target contract payload SHA-256 mismatch.")
+    if expected_file_sha256 is not None:
+        expected_file = _require_sha256(
+            expected_file_sha256,
+            field="expected target contract file SHA-256",
+        )
+        if file_digest != expected_file:
+            raise ValueError("Heightmap target contract file SHA-256 mismatch.")
+    if payload == manifest_preimage:
+        encoding_relation = "manifest_preimage_no_trailing_lf"
+    elif payload == manifest_preimage + b"\n":
+        encoding_relation = "manifest_preimage_plus_one_trailing_lf"
+    else:
+        encoding_relation = "semantic_equivalent_noncanonical_json"
+    return {
+        "normalized_contract": normalized,
+        "manifest_target_contract_encoding": H0B_MANIFEST_TARGET_CONTRACT_ENCODING,
+        "manifest_target_contract_payload_sha256": manifest_digest,
+        "file_sha256": file_digest,
+        "file_size_bytes": len(payload),
+        "encoding_relation": encoding_relation,
     }
 
 
@@ -941,17 +1051,22 @@ def load_frozen_reconstructor_artifact(
 
 __all__ = [
     "BankLidarHeightmapReconstructor",
+    "H0B_MANIFEST_TARGET_CONTRACT_ENCODING",
     "SphericalAutoencoderOutput",
     "SphericalAutoencoderPretrainHead",
     "SphericalRangeFrameEncoder",
+    "audit_heightmap_target_contract_json_bytes",
     "create_frozen_reconstructor_checkpoint",
     "freeze_reconstructor",
     "load_frozen_reconstructor_artifact",
     "load_frozen_reconstructor_checkpoint",
+    "manifest_target_contract_json_bytes",
+    "manifest_target_contract_payload_sha256",
     "normalize_heightmap_target_contract",
     "preflight_validate_lidar_history",
     "reconstructor_checkpoint_schema",
     "spherical_valid_bce",
     "supervised_height_valid_mse",
+    "validate_manifest_target_contract_binding",
     "valid_masked_range_mse",
 ]

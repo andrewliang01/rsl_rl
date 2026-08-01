@@ -17,11 +17,14 @@ import hashlib
 import json
 import os
 import re
+import torch
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-import torch
+from rsl_rl.modules.bank_lidar_heightmap import (
+    validate_manifest_target_contract_binding,
+)
 
 
 H0B_PACKED_SHARD_SCHEMA_VERSION = 1
@@ -454,6 +457,7 @@ def create_h0b_dataset_manifest(
     collector_receipt_payload_sha256: str,
     source_commits: Mapping[str, str],
     classification: str = "engineering_dataset",
+    target_contract: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Hash all shards and create a grouped-split manifest without copying data."""
     root = Path(dataset_root).resolve(strict=True)
@@ -467,6 +471,11 @@ def create_h0b_dataset_manifest(
     ):
         if not isinstance(digest, str) or _HEX64.fullmatch(digest) is None:
             raise ValueError(f"H0b {digest_name} SHA-256 must be lowercase 64-hex.")
+    if target_contract is not None:
+        validate_manifest_target_contract_binding(
+            target_contract,
+            target_contract_payload_sha256,
+        )
     if not isinstance(classification, str) or not classification:
         raise ValueError("H0b dataset classification must be non-empty.")
 

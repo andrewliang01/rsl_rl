@@ -33,9 +33,9 @@ from rsl_rl.modules.bank_lidar_heightmap import (
     SphericalAutoencoderPretrainHead,
     create_frozen_reconstructor_checkpoint,
     freeze_reconstructor,
-    normalize_heightmap_target_contract,
     spherical_valid_bce,
     supervised_height_valid_mse,
+    validate_manifest_target_contract_binding,
     valid_masked_range_mse,
 )
 from rsl_rl.utils.bank_lidar_heightmap_dataset import (
@@ -214,14 +214,14 @@ class _ValidatedPackedDataset:
     ) -> None:
         self.root = Path(dataset_root).resolve(strict=True)
         self.manifest = dict(manifest)
-        self.target_contract = normalize_heightmap_target_contract(target_contract)
-        target_digest = _canonical_json_sha256(self.target_contract)
         expected_target_digest = _validate_sha256(
             self.manifest.get("target_contract_payload_sha256"),
             name="manifest target_contract_payload_sha256",
         )
-        if target_digest != expected_target_digest:
-            raise ValueError("Heightmap target contract payload SHA-256 mismatch.")
+        self.target_contract = validate_manifest_target_contract_binding(
+            target_contract,
+            expected_target_digest,
+        )
         self.manifest_audit = validate_h0b_dataset_manifest(
             self.manifest,
             self.root,

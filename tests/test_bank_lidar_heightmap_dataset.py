@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from rsl_rl.modules import manifest_target_contract_payload_sha256
 from rsl_rl.utils.bank_lidar_heightmap_dataset import (
     H0B_PACKET_SPATIAL_SIZE,
     H0B_TARGET_SPATIAL_SIZE,
@@ -181,6 +182,57 @@ def _manifest(tmp_path: Path) -> dict:
     )
 
 
+def _target_contract() -> dict:
+    return {
+        "schema_version": 1,
+        "target_definition": "synthetic current-frame target",
+        "height_unit": "metre",
+        "height_sign": "positive_down_from_sensor",
+        "grid_shape": [28, 20],
+        "grid_axis_order": ["x", "y"],
+        "grid_axis_directions": ["negative_to_positive", "negative_to_positive"],
+        "flatten_order": "C_contiguous_row_major",
+        "coordinate_frame": "yaw_aligned_sensor_grid",
+        "origin": "sensor_origin",
+        "resolution_m": 0.05,
+        "unknown_cell_policy": "zero plus separate validity mask",
+        "contract_source_sha256": "6" * 64,
+    }
+
+
+def test_manifest_builder_semantic_binding_preserves_legacy_payload(tmp_path: Path) -> None:
+    _manifest(tmp_path)
+    split_paths = {split: [f"{split}/part-000.pt"] for split in ("train", "val", "test")}
+    contract = _target_contract()
+    digest = manifest_target_contract_payload_sha256(contract)
+    common = {
+        "split_shards": split_paths,
+        "target_contract_payload_sha256": digest,
+        "collector_receipt_payload_sha256": "2" * 64,
+        "source_commits": {
+            "lab_pro": "3" * 40,
+            "rsl_rl": "4" * 40,
+            "isaaclab": "5" * 40,
+        },
+    }
+    legacy = create_h0b_dataset_manifest(tmp_path, **common)
+    semantically_bound = create_h0b_dataset_manifest(
+        tmp_path,
+        **common,
+        target_contract=contract,
+    )
+    assert semantically_bound == legacy
+
+    alternate = copy.deepcopy(contract)
+    alternate["origin"] = "different_origin"
+    with pytest.raises(ValueError, match="payload SHA-256 mismatch"):
+        create_h0b_dataset_manifest(
+            tmp_path,
+            **common,
+            target_contract=alternate,
+        )
+
+
 def test_dataset_manifest_rehashes_shards_and_proves_group_isolation(tmp_path: Path) -> None:
     manifest = _manifest(tmp_path)
     audit = validate_h0b_dataset_manifest(manifest, tmp_path)
@@ -222,4 +274,3 @@ def test_dataset_manifest_rejects_tamper_and_unearned_formal_label(tmp_path: Pat
         validate_h0b_dataset_manifest(tampered, tmp_path)
     with pytest.raises(ValueError, match="formal_400k"):
         validate_h0b_dataset_manifest(manifest, tmp_path, require_formal_400k=True)
-    create_h0b_dataset_manifest,
