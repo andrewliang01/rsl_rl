@@ -178,3 +178,75 @@ def test_native_training_preserves_native_outputs_and_gradients() -> None:
         assert audited_gradient is not None, name
         assert torch.isfinite(fast_gradient).all(), name
         assert torch.equal(fast_gradient, audited_gradient), name
+
+
+def test_native_actor_training_skips_critic_and_host_audit_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prove actor-only native forward never enters critic or audit paths."""
+    torch.manual_seed(7121)
+    model = _model().eval()
+
+    def forbidden(*_args: object, **_kwargs: object) -> NoReturn:
+        raise AssertionError("Actor-only native forward entered forbidden path")
+
+    monkeypatch.setattr(actor_module, "_tensor_sha256", forbidden)
+    monkeypatch.setattr(model, "_apply_intervention", forbidden)
+    monkeypatch.setattr(model.critic_backbone, "forward", forbidden)
+    monkeypatch.setattr(model.value_head, "forward", forbidden)
+
+    with torch.inference_mode(), _RejectLocalScalarMode():
+        action, finite_gate = model.forward_native_actor_training(*_inputs(), mask_provenance=_provenance())
+
+    assert action.shape == (3, ACTION_DIM)
+    assert finite_gate.dtype == torch.bool
+    assert finite_gate.shape == (3,)
+    assert finite_gate.all()
+
+
+def test_native_actor_training_matches_action_and_actor_gradients() -> None:
+    """Match the full native action graph while leaving critic gradients absent."""
+    torch.manual_seed(7127)
+    actor_model = _model()
+    full_model = copy.deepcopy(actor_model)
+    inputs = _inputs()
+
+    actor_action, actor_gate = actor_model.forward_native_actor_training(*inputs, mask_provenance=_provenance())
+    full_action, _, full_gate = full_model.forward_native_training(*inputs, mask_provenance=_provenance())
+    actor_action.square().mean().backward()
+    full_action.square().mean().backward()
+
+    assert torch.equal(actor_action, full_action)
+    assert torch.equal(actor_gate, full_gate)
+    full_parameters = dict(full_model.named_parameters())
+    for name, parameter in actor_model.named_parameters():
+        full_gradient = full_parameters[name].grad
+        if name.startswith(("critic_backbone.", "value_head.")):
+            assert parameter.grad is None, name
+            assert full_gradient is None, name
+            continue
+        assert parameter.grad is not None, name
+        assert full_gradient is not None, name
+        assert torch.isfinite(parameter.grad).all(), name
+        assert torch.equal(parameter.grad, full_gradient), name
+
+
+def test_native_actor_gate_is_independent_of_critic_parameters() -> None:
+    """Exclude non-finite critic parameters from actor-only outputs and gate."""
+    torch.manual_seed(7129)
+    model = _model().eval()
+    inputs = _inputs()
+    with torch.no_grad():
+        for parameter in model.critic_backbone.parameters():
+            parameter.fill_(torch.nan)
+        for parameter in model.value_head.parameters():
+            parameter.fill_(torch.nan)
+
+    with torch.inference_mode():
+        actor_action, actor_gate = model.forward_native_actor_training(*inputs, mask_provenance=_provenance())
+        full_action, full_value, full_gate = model.forward_native_training(*inputs, mask_provenance=_provenance())
+
+    assert torch.equal(actor_action, full_action)
+    assert actor_gate.all()
+    assert not torch.isfinite(full_value).any()
+    assert not full_gate.any()

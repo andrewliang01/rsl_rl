@@ -555,6 +555,57 @@ class SharedUniqueSupportActorAdapter(nn.Module):
         Python exceptions based on tensor values.  GPU latency remains
         unmeasured and no performance claim follows from this API.
         """
+        action, fused, finite_gate = self._forward_native_actor_path(
+            score_features,
+            terrain_values,
+            proprio,
+            token_valid,
+            role_eligibility,
+            mask_provenance=mask_provenance,
+        )
+        value = self.value_head(self.critic_backbone(fused))
+        finite_gate = finite_gate & torch.isfinite(value).all(dim=-1)
+        return action, value, finite_gate
+
+    def forward_native_actor_training(
+        self,
+        score_features: torch.Tensor,
+        terrain_values: torch.Tensor,
+        proprio: torch.Tensor,
+        token_valid: torch.Tensor,
+        role_eligibility: torch.Tensor,
+        *,
+        mask_provenance: SupportMaskProvenance,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the selected-only native actor without constructing a critic graph.
+
+        The returned ``finite_gate`` has shape ``[B]`` and covers the native
+        actor inputs, support-role contract, selector scores, and action.  It
+        intentionally has no dependency on ``critic_backbone`` or
+        ``value_head`` parameters.  A production actor runner must reject or
+        quarantine every row for which the gate is false.
+        """
+        action, _, finite_gate = self._forward_native_actor_path(
+            score_features,
+            terrain_values,
+            proprio,
+            token_valid,
+            role_eligibility,
+            mask_provenance=mask_provenance,
+        )
+        return action, finite_gate
+
+    def _forward_native_actor_path(
+        self,
+        score_features: torch.Tensor,
+        terrain_values: torch.Tensor,
+        proprio: torch.Tensor,
+        token_valid: torch.Tensor,
+        role_eligibility: torch.Tensor,
+        *,
+        mask_provenance: SupportMaskProvenance,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Share native selected-only fusion and actor computation."""
         self._validate_provenance(mask_provenance)
         self._validate_input_structure(
             score_features,
@@ -632,15 +683,13 @@ class SharedUniqueSupportActorAdapter(nn.Module):
         )
         fused = torch.cat((proprio, role_values.flatten(start_dim=1)), dim=-1)
         action = self.action_head(self.actor_backbone(fused))
-        value = self.value_head(self.critic_backbone(fused))
         finite_gate = (
             input_finite
             & role_contract_valid
             & selector_diagnostics["valid_scores_finite"]
             & torch.isfinite(action).all(dim=-1)
-            & torch.isfinite(value).all(dim=-1)
         )
-        return action, value, finite_gate
+        return action, fused, finite_gate
 
     def _apply_intervention(
         self,
