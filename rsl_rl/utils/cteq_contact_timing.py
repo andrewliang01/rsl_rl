@@ -632,6 +632,9 @@ def hazard_calibration_diagnostics(
 
 
 _FORBIDDEN_OBSERVATION_KEY_PARTS = (
+    "administrative_censor",
+    "censor_after_bin",
+    "censor_reason",
     "future_contact",
     "future_event",
     "event_bin_target",
@@ -645,7 +648,9 @@ _FORBIDDEN_OBSERVATION_KEY_PARTS = (
 def validate_causal_observation(observation: Any, *, path: str = "observation") -> None:
     """Reject future-label objects or reserved truth keys recursively."""
 
-    if isinstance(observation, (IndependentEventLabels, StableContactTrace, ContactEvent)):
+    if isinstance(observation, (IndependentEventLabels, StableContactTrace, ContactEvent)) or (
+        getattr(observation, "_cteq_privileged_truth_marker", False) is True
+    ):
         raise PrivilegedLabelLeakageError(
             f"{path} contains simulation future-contact truth."
         )
@@ -679,6 +684,8 @@ def cteq_pr01_status() -> Mapping[str, Any]:
             "order_and_calibration_diagnostics",
             "torch_dual_event_hazard_head",
             "torch_survival_loss",
+            "administrative_censor_label_adapter",
+            "termination_reason_audit_receipt",
         ),
         "training_ready": False,
         "actor_integrated": False,
@@ -686,7 +693,8 @@ def cteq_pr01_status() -> Mapping[str, Any]:
         "gpu_required": False,
         "future_truth_allowed_consumers": CTEQ_ALLOWED_TRUTH_CONSUMERS,
         "blocked_next_steps": (
-            "administrative_censor_contract_for_early_termination",
+            "real_runner_termination_and_terminal_sample_provenance",
+            "administrative_censor_aware_survival_loss",
             "actor_query_integration",
             "ppo_training",
             "export_resume_validation",

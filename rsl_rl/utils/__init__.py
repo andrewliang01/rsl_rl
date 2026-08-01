@@ -5,6 +5,16 @@
 
 """Helper functions."""
 
+from .cteq_administrative_censor import (
+    CTEQ_ADMINISTRATIVE_CENSOR_RECEIPT_SCHEMA,
+    CTEQ_ADMINISTRATIVE_CENSOR_SCHEMA,
+    CTEQ_FOOT_EVENT_SOURCE_CONTRACT,
+    CTEQ_OBSERVED_BIN_CONTRACT,
+    CteqAdministrativeCensorBatch,
+    CteqCensorReason,
+    build_cteq_administrative_censor_batch,
+    validate_cteq_administrative_censor_receipt,
+)
 from .formal_training_io import (
     FORMAL_CHECKPOINT_RUN_INSPECTION_CONTRACT,
     FORMAL_CHECKPOINT_RUN_INSPECTION_SCHEMA_VERSION,
@@ -118,10 +128,16 @@ __all__ = [
     "AMPLoader",
     "CHECKPOINT_EMBEDDED_RECEIPT_CONTRACT",
     "CHECKPOINT_SIDECAR_CONTRACT",
+    "CTEQ_ADMINISTRATIVE_CENSOR_RECEIPT_SCHEMA",
+    "CTEQ_ADMINISTRATIVE_CENSOR_SCHEMA",
+    "CTEQ_FOOT_EVENT_SOURCE_CONTRACT",
+    "CTEQ_OBSERVED_BIN_CONTRACT",
     "FORMAL_CHECKPOINT_RUN_INSPECTION_CONTRACT",
     "FORMAL_CHECKPOINT_RUN_INSPECTION_SCHEMA_VERSION",
     "H1AblationSpec",
     "H2AblationSpec",
+    "CteqAdministrativeCensorBatch",
+    "CteqCensorReason",
     "MID360_CAPTURE_END_ACQUISITION_WINDOW",
     "MID360_CAPTURE_END_LATEST_RETURN_LEGACY",
     "MID360_NORMALIZED_SENSOR_FRAME",
@@ -151,6 +167,7 @@ __all__ = [
     "StaleMid360PacketError",
     "TrainingReceiptError",
     "build_checkpoint_sidecar",
+    "build_cteq_administrative_censor_batch",
     "build_h1_protocol",
     "build_h2_protocol",
     "build_ray_event_deployment_receipt",
@@ -197,6 +214,7 @@ __all__ = [
     "validate_checkpoint_progress",
     "validate_checkpoint_receipt_chain",
     "validate_checkpoint_sidecar",
+    "validate_cteq_administrative_censor_receipt",
     "validate_embedded_checkpoint_receipt",
     "validate_formal_checkpoint_run_inspection_document",
     "validate_training_launch_receipt",
