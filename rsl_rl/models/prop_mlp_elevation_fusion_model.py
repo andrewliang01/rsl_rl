@@ -7,12 +7,21 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Mapping
+
 import torch
 import torch.nn as nn
 from tensordict import TensorDict
 
 from rsl_rl.modules import MLP, EmpiricalNormalization, HiddenState
 from rsl_rl.modules.ame2_encoder import AME2Encoder
+from rsl_rl.modules.bank_lidar_heightmap import (
+    BankLidarHeightmapReconstructor,
+    load_frozen_reconstructor_checkpoint,
+    normalize_heightmap_target_contract,
+    preflight_validate_lidar_history,
+    reconstructor_checkpoint_schema,
+)
 from rsl_rl.modules.distribution import Distribution
 from rsl_rl.modules.elevation_2D_cnn_encoder import Elevation2DCNNEncoder
 from rsl_rl.modules.r2plus1d_elevation_encoder import R2Plus1DElevationEncoder
@@ -48,6 +57,7 @@ class PropMLPElevationFusionModel(nn.Module):
         "ray_time",
         "ray_event_time",
         "ray_event_time_delta",
+        "bank_lidar_heightmap",
     }
 
     def __init__(
@@ -109,6 +119,9 @@ class PropMLPElevationFusionModel(nn.Module):
         r2plus1d_spatial_kernel_sizes: tuple[int, ...] | list[int] = (3, 3, 3),
         r2plus1d_temporal_kernel_sizes: tuple[int, ...] | list[int] = (3, 3, 3),
         r2plus1d_spatial_strides: tuple[int, ...] | list[int] = (2, 2, 2),
+        bank_heightmap_target_contract: dict | None = None,
+        bank_downstream_heightmap_contract: dict | None = None,
+        bank_reconstructor_checkpoint: Mapping | None = None,
     ) -> None:
         """Initialize the proprio-elevation fusion model.
 
@@ -176,6 +189,15 @@ class PropMLPElevationFusionModel(nn.Module):
                 factorized R(2+1)D blocks.
             r2plus1d_spatial_strides: Spatial strides of the factorized
                 R(2+1)D blocks; temporal stride remains one.
+            bank_heightmap_target_contract: Semantic metadata bound to the
+                Bank reconstructor output. Required only by the explicit Bank
+                branch and never inferred from tensor shape.
+            bank_downstream_heightmap_contract: Independently supplied input
+                contract for the downstream height encoder. It must exactly
+                match the reconstructed target contract.
+            bank_reconstructor_checkpoint: Optional strict frozen Bank
+                checkpoint. Absence creates a trainable reconstructor; presence
+                must bind the same history length and semantic target contract.
         """
         super().__init__()
 
@@ -190,6 +212,7 @@ class PropMLPElevationFusionModel(nn.Module):
             "ray_time",
             "ray_event_time",
             "ray_event_time_delta",
+            "bank_lidar_heightmap",
         }
         ray_event_encoder_types = {
             "ray_event_time",
@@ -286,6 +309,52 @@ class PropMLPElevationFusionModel(nn.Module):
         ):
             raise ValueError(
                 "Only ray_event_time_delta accepts acquisition delta-proprio."
+            )
+        self.bank_heightmap_contract: dict | None = None
+        self.bank_ray_input_contract: dict | None = None
+        self.bank_heightmap_spatial_size: tuple[int, int] | None = None
+        self.bank_reconstructor_loaded_frozen = False
+        if self.elevation_encoder_type == "bank_lidar_heightmap":
+            if (
+                bank_heightmap_target_contract is None
+                or bank_downstream_heightmap_contract is None
+            ):
+                raise ValueError(
+                    "bank_lidar_heightmap fails closed without both reconstructed "
+                    "target and downstream heightmap contracts."
+                )
+            reconstructed_contract = normalize_heightmap_target_contract(
+                bank_heightmap_target_contract
+            )
+            downstream_contract = normalize_heightmap_target_contract(
+                bank_downstream_heightmap_contract
+            )
+            if reconstructed_contract != downstream_contract:
+                raise ValueError(
+                    "Bank reconstructed and downstream heightmap contracts differ."
+                )
+            if self.cnn_observation_type != "elevationmap":
+                raise ValueError(
+                    "bank_lidar_heightmap only supports elevationmap normalization."
+                )
+            self.bank_heightmap_contract = reconstructed_contract
+            self.bank_heightmap_spatial_size = (28, 20)
+            self.bank_ray_input_contract = {
+                "layout": "B_K_C_H_W",
+                "flatten_order": "C_contiguous_row_major_K_C_H_W",
+                "channels": ["range_m", "valid"],
+                "range_unit": "metre",
+                "valid_semantics": "finite exact binary {0,1}",
+                "history_order": "oldest_to_newest",
+                "spatial_shape": [16, 96],
+            }
+        elif (
+            bank_heightmap_target_contract is not None
+            or bank_downstream_heightmap_contract is not None
+            or bank_reconstructor_checkpoint is not None
+        ):
+            raise ValueError(
+                "Bank heightmap fields are only accepted by bank_lidar_heightmap."
             )
         self._cnn_use_single_frame = cnn_history_index is not None
         self._cnn_history_index = 0
@@ -418,6 +487,52 @@ class PropMLPElevationFusionModel(nn.Module):
                 height_scale=ame2_height_scale,
                 num_heads=ame2_num_heads,
             )
+        elif self.elevation_encoder_type == "bank_lidar_heightmap":
+            ray_shape = obs[elevation_set].shape
+            expected_ray_shape = (
+                elevation_history_length,
+                2,
+                *self.vision_spatial_size,
+            )
+            if tuple(ray_shape[1:]) != expected_ray_shape:
+                raise ValueError(
+                    "Bank LiDAR observation shape mismatch: expected "
+                    f"[B,K,2,H,W] with [K,2,H,W]={expected_ray_shape}, "
+                    f"got {tuple(ray_shape)}."
+                )
+            if self.vision_spatial_size != (16, 96):
+                raise ValueError(
+                    "bank_lidar_heightmap input spatial size must be (16,96)."
+                )
+            if bank_reconstructor_checkpoint is None:
+                self.heightmap_reconstructor = BankLidarHeightmapReconstructor(
+                    history_length=elevation_history_length,
+                    target_contract=self.bank_heightmap_contract,
+                )
+            else:
+                self.heightmap_reconstructor = (
+                    load_frozen_reconstructor_checkpoint(
+                        bank_reconstructor_checkpoint
+                    )
+                )
+                if (
+                    self.heightmap_reconstructor.history_length
+                    != elevation_history_length
+                    or self.heightmap_reconstructor.target_contract
+                    != self.bank_heightmap_contract
+                ):
+                    raise ValueError(
+                        "Frozen Bank reconstructor history/target contract mismatch."
+                    )
+                self.bank_reconstructor_loaded_frozen = True
+            self.elevation_encoder = Elevation2DCNNEncoder(
+                in_channels=1,
+                hidden_dims=list(cnn_hidden_dims),
+                kernel_sizes=list(cnn_kernel_sizes),
+                strides=list(cnn_strides),
+                out_dim=vision_feature_dim,
+                vision_spatial_size=self.bank_heightmap_spatial_size,
+            )
         else:
             ray_shape = obs[elevation_set].shape
             expected_ray_shape = (
@@ -514,6 +629,12 @@ class PropMLPElevationFusionModel(nn.Module):
                 elevation_obs = elevation_obs[:, self._cnn_history_index : self._cnn_history_index + 1]
             elevation_obs = self._normalize_cnn_observation(elevation_obs)
             elevation_features = self.elevation_encoder(elevation_obs)
+        elif self.elevation_encoder_type == "bank_lidar_heightmap":
+            reconstructed_height_m = self.heightmap_reconstructor(elevation_obs)
+            normalized_height = self._normalize_cnn_observation(
+                reconstructed_height_m
+            )
+            elevation_features = self.elevation_encoder(normalized_height)
         elif self.elevation_encoder_type == "ray_event_time_delta":
             elevation_features = self.elevation_encoder(
                 elevation_obs,
@@ -528,6 +649,13 @@ class PropMLPElevationFusionModel(nn.Module):
     def reset(self, dones: torch.Tensor | None = None, hidden_state: HiddenState = None) -> None:
         """Reset the internal state for recurrent models (no-op)."""
         pass
+
+    def train(self, mode: bool = True) -> PropMLPElevationFusionModel:
+        """Preserve an explicitly loaded frozen reconstructor in eval mode."""
+        super().train(mode)
+        if self.bank_reconstructor_loaded_frozen:
+            self.heightmap_reconstructor.eval()
+        return self
 
     def get_hidden_state(self) -> HiddenState:
         """Return the recurrent hidden state (``None`` for non-recurrent models)."""
@@ -569,6 +697,11 @@ class PropMLPElevationFusionModel(nn.Module):
 
     def as_jit(self) -> nn.Module:
         """Return a version of the model compatible with Torch JIT export."""
+        if self.elevation_encoder_type == "bank_lidar_heightmap":
+            raise RuntimeError(
+                "Bank heightmap export remains fail-closed until its external "
+                "target contract is bound by a deployment manifest."
+            )
         if self.elevation_encoder_type == "ray_event_time_delta":
             return _TorchRayEventDeltaPropMLPElevationFusionModel(self)
         if self.elevation_encoder_type in {"ray_time", "ray_event_time"}:
@@ -579,6 +712,11 @@ class PropMLPElevationFusionModel(nn.Module):
 
     def as_onnx(self, verbose: bool, input_mode: str = "split") -> nn.Module:
         """Return a version of the model compatible with ONNX export."""
+        if self.elevation_encoder_type == "bank_lidar_heightmap":
+            raise RuntimeError(
+                "Bank heightmap export remains fail-closed until its external "
+                "target contract is bound by a deployment manifest."
+            )
         if self.elevation_encoder_type == "ray_event_time_delta":
             return _OnnxRayEventDeltaPropMLPElevationFusionModel(
                 self,
@@ -596,6 +734,67 @@ class PropMLPElevationFusionModel(nn.Module):
         if self.obs_normalization:
             proprio_obs = torch.cat([obs[obs_group] for obs_group in self.obs_groups], dim=-1)
             self.obs_normalizer.update(proprio_obs)  # type: ignore
+
+    def preflight_bank_heightmap_observation(
+        self,
+        obs: TensorDict,
+    ) -> dict:
+        """Run explicit synchronized Bank source validation outside collection."""
+        if self.elevation_encoder_type != "bank_lidar_heightmap":
+            raise RuntimeError(
+                "Bank observation preflight requires bank_lidar_heightmap."
+            )
+        audit = preflight_validate_lidar_history(
+            obs[self.elevation_set],
+            history_length=self.elevation_history_length,
+        )
+        return {
+            **audit,
+            "actor_observation_contract": dict(self.bank_ray_input_contract),
+            "heightmap_contract": dict(self.bank_heightmap_contract),
+        }
+
+    def bank_heightmap_parameter_audit(self) -> dict:
+        """Return an offline parameter/schema audit for the explicit H0b branch."""
+        if self.elevation_encoder_type != "bank_lidar_heightmap":
+            raise RuntimeError(
+                "Bank parameter audit requires bank_lidar_heightmap."
+            )
+
+        def count(module: nn.Module, *, trainable_only: bool = False) -> int:
+            return sum(
+                parameter.numel()
+                for parameter in module.parameters()
+                if not trainable_only or parameter.requires_grad
+            )
+
+        return {
+            "reconstructor_parameter_count": count(
+                self.heightmap_reconstructor
+            ),
+            "reconstructor_trainable_parameter_count": count(
+                self.heightmap_reconstructor,
+                trainable_only=True,
+            ),
+            "reconstructor_training": self.heightmap_reconstructor.training,
+            "reconstructor_loaded_frozen": (
+                self.bank_reconstructor_loaded_frozen
+            ),
+            "downstream_elevation_encoder_parameter_count": count(
+                self.elevation_encoder
+            ),
+            "total_model_parameter_count": count(self),
+            "total_model_trainable_parameter_count": count(
+                self,
+                trainable_only=True,
+            ),
+            "reconstructor_checkpoint_schema": (
+                reconstructor_checkpoint_schema(
+                    self.heightmap_reconstructor
+                )
+            ),
+            "heightmap_contract": dict(self.bank_heightmap_contract),
+        }
 
     def _get_prop_obs_dim(
         self,

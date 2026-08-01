@@ -13,6 +13,9 @@ recurrent carry, previous prediction, or supervised target interface.
 from __future__ import annotations
 
 import hashlib
+import json
+import math
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -30,13 +33,28 @@ _FRAME_CHANNELS = (16, 24, 32)
 _ENCODED_SPATIAL_SIZE = (2, 12)
 _GRU_HIDDEN_SIZE = 128
 _MAX_RANGE_M = 6.0
-_CHECKPOINT_SCHEMA_VERSION = 1
+_CHECKPOINT_SCHEMA_VERSION = 2
 _DEPLOY_VALIDATION_MODE = "trusted_no_sync"
 _SOURCE_CONTRACT = {
     "range_channel": "range_m; ignored and zeroed where valid=0",
     "valid_channel": "finite exact binary {0,1}",
     "valid_range_m": "finite and in (0,6]",
     "content_preflight": "preflight_validate_lidar_history",
+}
+_TARGET_CONTRACT_KEYS = {
+    "schema_version",
+    "target_definition",
+    "height_unit",
+    "height_sign",
+    "grid_shape",
+    "grid_axis_order",
+    "grid_axis_directions",
+    "flatten_order",
+    "coordinate_frame",
+    "origin",
+    "resolution_m",
+    "unknown_cell_policy",
+    "contract_source_sha256",
 }
 
 
@@ -45,6 +63,82 @@ def _group_count(num_channels: int, maximum: int = 8) -> int:
         if num_channels % num_groups == 0:
             return num_groups
     return 1
+
+
+def normalize_heightmap_target_contract(
+    contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate and canonicalize semantic metadata without guessing geometry."""
+    if not isinstance(contract, Mapping) or set(contract) != _TARGET_CONTRACT_KEYS:
+        raise ValueError(
+            "Heightmap target contract must contain the exact semantic key set."
+        )
+    if type(contract["schema_version"]) is not int or contract["schema_version"] != 1:
+        raise ValueError("Heightmap target contract schema_version must be 1.")
+    for field in (
+        "target_definition",
+        "height_sign",
+        "coordinate_frame",
+        "origin",
+        "unknown_cell_policy",
+    ):
+        if not isinstance(contract[field], str) or not contract[field]:
+            raise ValueError(f"Heightmap target contract {field} must be non-empty.")
+    if contract["height_unit"] != "metre":
+        raise ValueError("Heightmap target height_unit must be 'metre'.")
+    grid_shape = contract["grid_shape"]
+    if (
+        not isinstance(grid_shape, (list, tuple))
+        or list(grid_shape) != list(_OUTPUT_SPATIAL_SIZE)
+    ):
+        raise ValueError("Heightmap target grid_shape must be [28,20].")
+    for field in ("grid_axis_order", "grid_axis_directions"):
+        values = contract[field]
+        if (
+            not isinstance(values, (list, tuple))
+            or len(values) != 2
+            or any(not isinstance(value, str) or not value for value in values)
+        ):
+            raise ValueError(
+                f"Heightmap target contract {field} must contain two labels."
+            )
+    if len(set(contract["grid_axis_order"])) != 2:
+        raise ValueError("Heightmap target grid_axis_order labels must be distinct.")
+    if contract["flatten_order"] != "C_contiguous_row_major":
+        raise ValueError(
+            "Heightmap target flatten_order must be C_contiguous_row_major."
+        )
+    resolution_m = contract["resolution_m"]
+    if (
+        isinstance(resolution_m, bool)
+        or not isinstance(resolution_m, (int, float))
+        or not math.isfinite(float(resolution_m))
+        or resolution_m <= 0.0
+    ):
+        raise ValueError("Heightmap target resolution_m must be positive.")
+    source_sha256 = contract["contract_source_sha256"]
+    if (
+        not isinstance(source_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", source_sha256) is None
+    ):
+        raise ValueError(
+            "Heightmap target contract_source_sha256 must be lowercase 64-hex."
+        )
+    return {
+        "schema_version": 1,
+        "target_definition": contract["target_definition"],
+        "height_unit": "metre",
+        "height_sign": contract["height_sign"],
+        "grid_shape": list(_OUTPUT_SPATIAL_SIZE),
+        "grid_axis_order": list(contract["grid_axis_order"]),
+        "grid_axis_directions": list(contract["grid_axis_directions"]),
+        "flatten_order": "C_contiguous_row_major",
+        "coordinate_frame": contract["coordinate_frame"],
+        "origin": contract["origin"],
+        "resolution_m": float(resolution_m),
+        "unknown_cell_policy": contract["unknown_cell_policy"],
+        "contract_source_sha256": source_sha256,
+    }
 
 
 def _validate_history_structure(
@@ -287,11 +381,21 @@ class SphericalAutoencoderPretrainHead(nn.Module):
 class BankLidarHeightmapReconstructor(nn.Module):
     """Reconstruct ``[B,1,28,20]`` local height from LiDAR history only."""
 
-    def __init__(self, *, history_length: int) -> None:
+    def __init__(
+        self,
+        *,
+        history_length: int,
+        target_contract: Mapping[str, Any] | None = None,
+    ) -> None:
         super().__init__()
         if history_length not in (1, 5):
             raise ValueError("history_length must be exactly 1 or 5.")
         self.history_length = int(history_length)
+        self.target_contract = (
+            None
+            if target_contract is None
+            else normalize_heightmap_target_contract(target_contract)
+        )
         self.frame_encoder = SphericalRangeFrameEncoder()
         frame_feature_dim = (
             _FRAME_CHANNELS[-1]
@@ -480,6 +584,16 @@ def _state_schema(model: BankLidarHeightmapReconstructor) -> dict[str, Any]:
     }
 
 
+def _schema_sha256(schema: Mapping[str, Any]) -> str:
+    payload = json.dumps(
+        schema,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def reconstructor_checkpoint_schema(
     model: BankLidarHeightmapReconstructor,
 ) -> dict[str, Any]:
@@ -510,6 +624,11 @@ def reconstructor_checkpoint_schema(
         "critic_input": False,
         "pretrain_head_in_deploy_checkpoint": False,
         "height_unit": "metre",
+        "target_contract": (
+            None
+            if model.target_contract is None
+            else dict(model.target_contract)
+        ),
         "deploy_inputs": ["ray_history"],
         "state_schema": _state_schema(model),
     }
@@ -527,8 +646,10 @@ def freeze_reconstructor(
     model.requires_grad_(False)
     state = model.state_dict()
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
+    schema = reconstructor_checkpoint_schema(model)
     return {
-        "schema": reconstructor_checkpoint_schema(model),
+        "schema": schema,
+        "schema_sha256": _schema_sha256(schema),
         "parameter_count": parameter_count,
         "trainable_parameter_count": sum(
             parameter.numel()
@@ -554,8 +675,10 @@ def create_frozen_reconstructor_checkpoint(
         name: value.detach().contiguous().cpu().clone()
         for name, value in model.state_dict().items()
     }
+    schema = reconstructor_checkpoint_schema(model)
     return {
-        "schema": reconstructor_checkpoint_schema(model),
+        "schema": schema,
+        "schema_sha256": _schema_sha256(schema),
         "state_dict": state,
         "state_sha256": _state_sha256(state),
     }
@@ -567,19 +690,30 @@ def load_frozen_reconstructor_checkpoint(
     """Strictly reconstruct and freeze a deployable H0b module."""
     if not isinstance(checkpoint, Mapping) or set(checkpoint) != {
         "schema",
+        "schema_sha256",
         "state_dict",
         "state_sha256",
     }:
         raise ValueError("Frozen reconstructor checkpoint keys changed.")
     schema = checkpoint["schema"]
+    schema_digest = checkpoint["schema_sha256"]
     state = checkpoint["state_dict"]
     digest = checkpoint["state_sha256"]
     if not isinstance(schema, Mapping) or not isinstance(state, Mapping):
         raise TypeError("Checkpoint schema and state_dict must be mappings.")
+    if (
+        not isinstance(schema_digest, str)
+        or _schema_sha256(schema) != schema_digest
+    ):
+        raise ValueError("Frozen reconstructor checkpoint schema mismatch: digest.")
     history_length = schema.get("history_length")
     if history_length not in (1, 5):
         raise ValueError("Checkpoint history_length must be exactly 1 or 5.")
-    model = BankLidarHeightmapReconstructor(history_length=history_length)
+    target_contract = schema.get("target_contract")
+    model = BankLidarHeightmapReconstructor(
+        history_length=history_length,
+        target_contract=target_contract,
+    )
     expected_schema = reconstructor_checkpoint_schema(model)
     if dict(schema) != expected_schema:
         raise ValueError("Frozen reconstructor checkpoint schema mismatch.")
@@ -609,6 +743,7 @@ __all__ = [
     "create_frozen_reconstructor_checkpoint",
     "freeze_reconstructor",
     "load_frozen_reconstructor_checkpoint",
+    "normalize_heightmap_target_contract",
     "preflight_validate_lidar_history",
     "reconstructor_checkpoint_schema",
     "spherical_valid_bce",
