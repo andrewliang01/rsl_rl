@@ -423,13 +423,12 @@ def cteq_current_on_policy_runner_provenance_status() -> Mapping[str, Any]:
         "missing_from_stock_runner_contract": [
             key for key in CTEQ_REQUIRED_EXTRAS_KEYS if key != CTEQ_TIME_LIMIT_KEY
         ],
+        "opt_in_isaaclab_extras_bridge_available": True,
+        "opt_in_bridge_module": "rsl_rl.utils.cteq_isaaclab_extras_bridge",
+        "stock_runner_modified": False,
         "remaining_interfaces": [
-            "environment_pre_reset_terminal_contact_export",
-            "base_contact_and_other_termination_masks",
-            "monotonic_episode_ids_across_auto_reset",
-            "terminal_contact_source_receipt_sha256",
-            "explicit_cpu_transfer_before_provenance_adapter",
-            "anchor_to_terminal_fully_observed_bin_receipt",
+            "explicit_environment_opt_in_to_pre_reset_recorder",
+            "real_anchor_to_terminal_fully_observed_bins_provider",
         ],
         "terminal_contact_authoritative": False,
         "episode_reset_boundary_authenticated": False,

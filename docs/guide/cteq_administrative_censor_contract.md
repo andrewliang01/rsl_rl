@@ -90,3 +90,26 @@ environment adapter emits and receipts this exact interface.
 The later collector must additionally receipt the anchor-to-terminal sample
 count used as `fully_observed_bins`; this step-level provenance contract does
 not infer that count from reset observations.
+
+## Opt-in IsaacLab recorder bridge
+
+The companion Lab-Pro adapter can use IsaacLab's recorder ordering without
+patching IsaacLab: `record_post_step()` runs after termination computation and
+before `record_pre_reset()`/`_reset_idx()`. Its disabled-by-default recorder
+captures ordered left/right foot contact, the individual `base_contact` term,
+raw timeout, and monotonic episode IDs at that boundary. A simultaneous raw
+timeout and MDP termination is classified by the MDP reason for CTEQ labels,
+while the original `extras["time_outs"]` is left untouched for PPO.
+
+`build_cteq_isaaclab_termination_batch` is an explicit CPU bridge. GPU tensors
+are rejected unless the caller passes `allow_device_transfer=True`, and every
+transferred field is listed in the receipt. The result is marked as privileged
+truth and rejects actor-observation, critic-hidden-state, and reward access.
+Neither the stock runner nor any registered Gym task calls this bridge.
+
+The recorder does **not** infer `fully_observed_bins` from episode length. It
+requires an environment-owned provider to prove the number of complete 20 ms
+post-anchor contact samples observed before the boundary, together with a
+provider source SHA and semantic receipt. No such real collector is currently
+implemented. Without it the Lab-Pro recorder omits those extras and this bridge
+fails closed. Consequently `training_ready=false` remains mandatory.

@@ -138,9 +138,11 @@ def test_stock_runner_fields_fail_closed_without_terminal_contact_and_ids():
     assert status["terminal_contact_authoritative"] is False
     assert status["episode_reset_boundary_authenticated"] is False
     assert status["provenance_authenticated"] is False
-    assert "environment_pre_reset_terminal_contact_export" in status[
+    assert "explicit_environment_opt_in_to_pre_reset_recorder" in status[
         "remaining_interfaces"
     ]
+    assert status["opt_in_isaaclab_extras_bridge_available"] is True
+    assert status["stock_runner_modified"] is False
     assert status["training_ready"] is False
 
 
@@ -243,7 +245,7 @@ def test_provenance_truth_is_never_actor_observation_or_critic_hidden_state():
     assert "on_policy_runner_termination_provenance_contract" in status[
         "implemented"
     ]
-    assert "environment_extras_binding_for_runner_termination_provenance" in (
+    assert "real_anchor_to_boundary_fully_observed_bins_provider" in (
         status["blocked_next_steps"]
     )
     assert status["training_ready"] is False

@@ -97,5 +97,15 @@ class VecEnv(ABC):
             These privileged fields are reserved for the offline label builder,
             loss, and evaluator; they must not enter actor observations or
             critic hidden state.
+
+            The IsaacLab-specific opt-in recorder uses a separate
+            ``cteq_time_limit_terminations`` field for its mutually-exclusive
+            label taxonomy. It never overwrites ``time_outs``: simultaneous
+            timeout/MDP termination remains visible to PPO exactly as returned
+            by the environment. ``build_cteq_isaaclab_termination_batch``
+            cross-checks the raw timeout, transfers tensors to CPU only when
+            explicitly authorized, and requires a receipted pre-reset
+            ``fully_observed_bins`` provider. The runner does not invoke this
+            bridge automatically.
         """
         raise NotImplementedError
