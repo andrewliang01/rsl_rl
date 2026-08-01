@@ -50,6 +50,12 @@ from .shared_unique_support_actor import (
     SupportMaskProvenance,
 )
 from .sparse_support_evidence_bottleneck import SparseSupportEvidenceBottleneck
+from .support_observation_contract import (
+    RayEventSupportObservation,
+    SupportMotionObservation,
+    unpack_ray_event_support_observation,
+    unpack_support_motion_observation,
+)
 from .support_role_geometry import (
     SUPPORT_ROLE_NAMES,
     CalibratedSphericalSupportRoleGeometry,
@@ -85,6 +91,7 @@ __all__ = [
     "R2Plus1DElevationEncoder",
     "RayEventAblationOutput",
     "RayEventAblationRouter",
+    "RayEventSupportObservation",
     "RayReturnEventTimeEncoder",
     "RayTimeAttentionEncoder",
     "SharedUniqueSupportActorAdapter",
@@ -93,6 +100,7 @@ __all__ = [
     "SphericalAutoencoderPretrainHead",
     "SphericalRangeFrameEncoder",
     "SupportMaskProvenance",
+    "SupportMotionObservation",
     "SupportRoleGeometryBatch",
     "create_frozen_reconstructor_checkpoint",
     "freeze_reconstructor",
@@ -102,5 +110,7 @@ __all__ = [
     "reconstructor_checkpoint_schema",
     "spherical_valid_bce",
     "supervised_height_valid_mse",
+    "unpack_ray_event_support_observation",
+    "unpack_support_motion_observation",
     "valid_masked_range_mse",
 ]
