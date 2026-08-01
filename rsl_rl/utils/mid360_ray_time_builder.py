@@ -1116,6 +1116,15 @@ class Mid360RayTimeTensorBuilder:
             )
 
         emitted = self._validate_emitted_mask(packet.emitted_sensor_mask)
+        if (
+            packet.timestamp_semantics
+            == MID360_TIMESTAMP_LIVOX_CUSTOM_MSG_ACTION_CLOCK
+            and packet.received_time_s is None
+        ):
+            raise Mid360RayTimeBuilderError(
+                "Action-clock-mapped Livox packets require action-clock "
+                "received_time_s for transport-latency audit."
+            )
         received, latency = self._validate_received_time(
             end,
             packet.received_time_s,
