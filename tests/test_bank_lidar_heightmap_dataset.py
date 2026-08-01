@@ -9,11 +9,13 @@ import torch
 from rsl_rl.utils.bank_lidar_heightmap_dataset import (
     H0B_PACKET_SPATIAL_SIZE,
     H0B_TARGET_SPATIAL_SIZE,
+    create_h0b_dataset_manifest,
     load_packed_h0b_shard,
     materialize_h0b_batch,
     pack_bool_mask,
     save_packed_h0b_shard,
     unpack_bool_mask,
+    validate_h0b_dataset_manifest,
     validate_packed_h0b_shard,
 )
 
@@ -59,6 +61,14 @@ def _shard() -> dict:
             spatial_size=H0B_TARGET_SPATIAL_SIZE,
         ),
     }
+
+
+def _shift_identity(shard: dict, *, anchor_delta: int, trajectory_delta: int) -> dict:
+    shifted = copy.deepcopy(shard)
+    shifted["anchor_id"] += anchor_delta
+    shifted["anchor_trajectory_id"] += trajectory_delta
+    shifted["packet_trajectory_id"] += trajectory_delta
+    return shifted
 
 
 @pytest.mark.parametrize("spatial_size", (H0B_PACKET_SPATIAL_SIZE, H0B_TARGET_SPATIAL_SIZE))
@@ -143,3 +153,73 @@ def test_payload_hash_rejects_semantic_tensor_change(tmp_path: Path) -> None:
             expected_file_sha256=changed_receipt["file_sha256"],
             expected_payload_sha256=receipt["payload_sha256"],
         )
+
+
+def _manifest(tmp_path: Path) -> dict:
+    split_paths: dict[str, list[str]] = {"train": [], "val": [], "test": []}
+    for index, split in enumerate(("train", "val", "test")):
+        relative = f"{split}/part-000.pt"
+        save_packed_h0b_shard(
+            tmp_path / relative,
+            _shift_identity(
+                _shard(),
+                anchor_delta=index * 1000,
+                trajectory_delta=index * 100,
+            ),
+        )
+        split_paths[split].append(relative)
+    return create_h0b_dataset_manifest(
+        tmp_path,
+        split_shards=split_paths,
+        target_contract_payload_sha256="1" * 64,
+        collector_receipt_payload_sha256="2" * 64,
+        source_commits={
+            "lab_pro": "3" * 40,
+            "rsl_rl": "4" * 40,
+            "isaaclab": "5" * 40,
+        },
+    )
+
+
+def test_dataset_manifest_rehashes_shards_and_proves_group_isolation(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path)
+    audit = validate_h0b_dataset_manifest(manifest, tmp_path)
+    assert audit["split_anchor_counts"] == {"train": 2, "val": 2, "test": 2}
+    assert audit["split_trajectory_counts"] == {"train": 2, "val": 2, "test": 2}
+    assert audit["num_shards"] == 3
+    assert audit["formal_400k_validated"] is False
+
+
+def test_dataset_manifest_rejects_cross_split_trajectory_leak(tmp_path: Path) -> None:
+    for index, split in enumerate(("train", "val", "test")):
+        save_packed_h0b_shard(
+            tmp_path / f"{split}.pt",
+            _shift_identity(_shard(), anchor_delta=index * 1000, trajectory_delta=0),
+        )
+    with pytest.raises(ValueError, match="trajectory leakage"):
+        create_h0b_dataset_manifest(
+            tmp_path,
+            split_shards={
+                "train": ["train.pt"],
+                "val": ["val.pt"],
+                "test": ["test.pt"],
+            },
+            target_contract_payload_sha256="1" * 64,
+            collector_receipt_payload_sha256="2" * 64,
+            source_commits={
+                "lab_pro": "3" * 40,
+                "rsl_rl": "4" * 40,
+                "isaaclab": "5" * 40,
+            },
+        )
+
+
+def test_dataset_manifest_rejects_tamper_and_unearned_formal_label(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path)
+    tampered = copy.deepcopy(manifest)
+    tampered["split_anchor_counts"]["train"] += 1
+    with pytest.raises(ValueError, match="payload SHA"):
+        validate_h0b_dataset_manifest(tampered, tmp_path)
+    with pytest.raises(ValueError, match="formal_400k"):
+        validate_h0b_dataset_manifest(manifest, tmp_path, require_formal_400k=True)
+    create_h0b_dataset_manifest,

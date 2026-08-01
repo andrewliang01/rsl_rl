@@ -14,7 +14,9 @@ forward paths.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
+import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -43,6 +45,30 @@ _SHARD_KEYS = {
     "target_height_m",
     "target_valid_bits",
 }
+_MANIFEST_SPLITS = ("train", "val", "test")
+_MANIFEST_KEYS = {
+    "schema_version",
+    "classification",
+    "target_contract_payload_sha256",
+    "collector_receipt_payload_sha256",
+    "source_commits",
+    "k1_k5_shared_anchor_set",
+    "shards",
+    "split_anchor_counts",
+    "split_trajectory_ids",
+    "manifest_payload_sha256",
+}
+_MANIFEST_SHARD_KEYS = {
+    "split",
+    "relative_path",
+    "file_size_bytes",
+    "file_sha256",
+    "payload_sha256",
+    "num_unique_packets",
+    "num_anchors",
+}
+_HEX40 = re.compile(r"[0-9a-f]{40}")
+_HEX64 = re.compile(r"[0-9a-f]{64}")
 
 
 def _require_cpu_tensor(
@@ -115,6 +141,17 @@ def _tensor_payload_sha256(shard: Mapping[str, Any]) -> str:
         digest.update(str(tuple(contiguous.shape)).encode("ascii"))
         digest.update(contiguous.view(torch.uint8).numpy().tobytes(order="C"))
     return digest.hexdigest()
+
+
+def _canonical_json_sha256(value: Any) -> str:
+    payload = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("ascii")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def validate_packed_h0b_shard(shard: Mapping[str, Any]) -> dict[str, Any]:
@@ -380,16 +417,215 @@ def load_packed_h0b_shard(
     }
 
 
+def _load_unbound_packed_h0b_shard(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    with path.open("rb") as stream:
+        file_sha256 = hashlib.file_digest(stream, "sha256").hexdigest()
+    loaded = torch.load(path, map_location="cpu", weights_only=True)
+    audit = validate_packed_h0b_shard(loaded)
+    return dict(loaded), {
+        **audit,
+        "path": str(path),
+        "file_size_bytes": path.stat().st_size,
+        "file_sha256": file_sha256,
+    }
+
+
+def _normalize_source_commits(source_commits: Mapping[str, str]) -> dict[str, str]:
+    if not isinstance(source_commits, Mapping) or set(source_commits) != {
+        "lab_pro",
+        "rsl_rl",
+        "isaaclab",
+    }:
+        raise ValueError("H0b source commits must bind lab_pro, rsl_rl, and isaaclab.")
+    normalized = dict(source_commits)
+    if any(
+        not isinstance(value, str) or _HEX40.fullmatch(value) is None
+        for value in normalized.values()
+    ):
+        raise ValueError("Every H0b source commit must be lowercase 40-hex.")
+    return normalized
+
+
+def create_h0b_dataset_manifest(
+    dataset_root: str | Path,
+    *,
+    split_shards: Mapping[str, Sequence[str | Path]],
+    target_contract_payload_sha256: str,
+    collector_receipt_payload_sha256: str,
+    source_commits: Mapping[str, str],
+    classification: str = "engineering_dataset",
+) -> dict[str, Any]:
+    """Hash all shards and create a grouped-split manifest without copying data."""
+    root = Path(dataset_root).resolve(strict=True)
+    if not isinstance(split_shards, Mapping) or set(split_shards) != set(
+        _MANIFEST_SPLITS
+    ):
+        raise ValueError("H0b dataset manifest requires train/val/test shard lists.")
+    for digest_name, digest in (
+        ("target contract", target_contract_payload_sha256),
+        ("collector receipt", collector_receipt_payload_sha256),
+    ):
+        if not isinstance(digest, str) or _HEX64.fullmatch(digest) is None:
+            raise ValueError(f"H0b {digest_name} SHA-256 must be lowercase 64-hex.")
+    if not isinstance(classification, str) or not classification:
+        raise ValueError("H0b dataset classification must be non-empty.")
+
+    shard_records: list[dict[str, Any]] = []
+    split_anchor_counts: dict[str, int] = {}
+    split_trajectory_ids: dict[str, list[int]] = {}
+    all_anchor_ids: set[int] = set()
+    split_trajectory_sets: dict[str, set[int]] = {}
+    seen_paths: set[str] = set()
+    for split in _MANIFEST_SPLITS:
+        paths = split_shards[split]
+        if not isinstance(paths, Sequence) or isinstance(paths, (str, bytes)) or not paths:
+            raise ValueError(f"H0b split {split} must contain at least one shard.")
+        split_anchor_count = 0
+        trajectories: set[int] = set()
+        for raw_path in paths:
+            path = Path(raw_path)
+            if not path.is_absolute():
+                path = root / path
+            path = path.resolve(strict=True)
+            try:
+                relative_path = path.relative_to(root).as_posix()
+            except ValueError as exc:
+                raise ValueError("H0b shard path must remain under dataset_root.") from exc
+            if relative_path in seen_paths:
+                raise ValueError("One H0b shard path cannot appear more than once.")
+            seen_paths.add(relative_path)
+            shard, audit = _load_unbound_packed_h0b_shard(path)
+            anchor_ids = set(map(int, shard["anchor_id"].tolist()))
+            if all_anchor_ids.intersection(anchor_ids):
+                raise ValueError("H0b anchor IDs must be globally unique across shards.")
+            all_anchor_ids.update(anchor_ids)
+            trajectories.update(map(int, shard["anchor_trajectory_id"].tolist()))
+            split_anchor_count += audit["num_anchors"]
+            shard_records.append(
+                {
+                    "split": split,
+                    "relative_path": relative_path,
+                    "file_size_bytes": audit["file_size_bytes"],
+                    "file_sha256": audit["file_sha256"],
+                    "payload_sha256": audit["payload_sha256"],
+                    "num_unique_packets": audit["num_unique_packets"],
+                    "num_anchors": audit["num_anchors"],
+                }
+            )
+        split_anchor_counts[split] = split_anchor_count
+        split_trajectory_sets[split] = trajectories
+        split_trajectory_ids[split] = sorted(trajectories)
+
+    for index, left in enumerate(_MANIFEST_SPLITS):
+        for right in _MANIFEST_SPLITS[index + 1 :]:
+            if split_trajectory_sets[left].intersection(split_trajectory_sets[right]):
+                raise ValueError(
+                    f"H0b trajectory leakage exists between {left} and {right}."
+                )
+
+    payload = {
+        "schema_version": 1,
+        "classification": classification,
+        "target_contract_payload_sha256": target_contract_payload_sha256,
+        "collector_receipt_payload_sha256": collector_receipt_payload_sha256,
+        "source_commits": _normalize_source_commits(source_commits),
+        "k1_k5_shared_anchor_set": True,
+        "shards": shard_records,
+        "split_anchor_counts": split_anchor_counts,
+        "split_trajectory_ids": split_trajectory_ids,
+    }
+    return {**payload, "manifest_payload_sha256": _canonical_json_sha256(payload)}
+
+
+def validate_h0b_dataset_manifest(
+    manifest: Mapping[str, Any],
+    dataset_root: str | Path,
+    *,
+    require_formal_400k: bool = False,
+) -> dict[str, Any]:
+    """Re-hash every shard and prove grouped split isolation."""
+    if not isinstance(manifest, Mapping) or set(manifest) != _MANIFEST_KEYS:
+        raise ValueError("H0b dataset manifest keys differ from schema version 1.")
+    if type(manifest["schema_version"]) is not int or manifest["schema_version"] != 1:
+        raise ValueError("H0b dataset manifest schema_version must be exactly 1.")
+    if manifest["k1_k5_shared_anchor_set"] is not True:
+        raise ValueError("H0b K1 and K5 must share one frozen anchor set.")
+    for field in (
+        "target_contract_payload_sha256",
+        "collector_receipt_payload_sha256",
+        "manifest_payload_sha256",
+    ):
+        if not isinstance(manifest[field], str) or _HEX64.fullmatch(manifest[field]) is None:
+            raise ValueError(f"H0b manifest field {field} must be lowercase 64-hex.")
+    payload = {key: manifest[key] for key in _MANIFEST_KEYS - {"manifest_payload_sha256"}}
+    if _canonical_json_sha256(payload) != manifest["manifest_payload_sha256"]:
+        raise ValueError("H0b dataset manifest payload SHA-256 mismatch.")
+    normalized_commits = _normalize_source_commits(manifest["source_commits"])
+
+    shards = manifest["shards"]
+    if not isinstance(shards, list) or not shards:
+        raise ValueError("H0b dataset manifest must list at least one shard.")
+    reconstructed_paths: dict[str, list[str]] = {split: [] for split in _MANIFEST_SPLITS}
+    for record in shards:
+        if not isinstance(record, Mapping) or set(record) != _MANIFEST_SHARD_KEYS:
+            raise ValueError("H0b dataset shard record keys changed.")
+        split = record["split"]
+        if split not in _MANIFEST_SPLITS:
+            raise ValueError("H0b dataset shard split is invalid.")
+        relative_path = record["relative_path"]
+        if (
+            not isinstance(relative_path, str)
+            or not relative_path
+            or Path(relative_path).is_absolute()
+            or ".." in Path(relative_path).parts
+        ):
+            raise ValueError("H0b dataset shard path must be a safe relative path.")
+        reconstructed_paths[split].append(relative_path)
+
+    rebuilt = create_h0b_dataset_manifest(
+        dataset_root,
+        split_shards=reconstructed_paths,
+        target_contract_payload_sha256=manifest["target_contract_payload_sha256"],
+        collector_receipt_payload_sha256=manifest[
+            "collector_receipt_payload_sha256"
+        ],
+        source_commits=normalized_commits,
+        classification=manifest["classification"],
+    )
+    if rebuilt != dict(manifest):
+        raise ValueError("H0b dataset manifest differs from live shard evidence.")
+    if require_formal_400k:
+        expected_counts = {"train": 280_000, "val": 60_000, "test": 60_000}
+        if manifest["classification"] != "formal_400k_grouped_v1":
+            raise ValueError("Formal H0b data requires formal_400k_grouped_v1 classification.")
+        if manifest["split_anchor_counts"] != expected_counts:
+            raise ValueError("Formal H0b data must use the frozen 280k/60k/60k split.")
+    return {
+        "schema_version": 1,
+        "classification": manifest["classification"],
+        "manifest_payload_sha256": manifest["manifest_payload_sha256"],
+        "split_anchor_counts": dict(manifest["split_anchor_counts"]),
+        "split_trajectory_counts": {
+            split: len(manifest["split_trajectory_ids"][split])
+            for split in _MANIFEST_SPLITS
+        },
+        "num_shards": len(shards),
+        "formal_400k_validated": require_formal_400k,
+    }
+
+
 __all__ = [
     "H0B_HISTORY_SLOTS",
     "H0B_MAX_RANGE_M",
     "H0B_PACKED_SHARD_SCHEMA_VERSION",
     "H0B_PACKET_SPATIAL_SIZE",
     "H0B_TARGET_SPATIAL_SIZE",
+    "create_h0b_dataset_manifest",
     "load_packed_h0b_shard",
     "materialize_h0b_batch",
     "pack_bool_mask",
     "save_packed_h0b_shard",
     "unpack_bool_mask",
+    "validate_h0b_dataset_manifest",
     "validate_packed_h0b_shard",
 ]
