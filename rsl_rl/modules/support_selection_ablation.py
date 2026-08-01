@@ -101,7 +101,12 @@ class FixedBudgetSupportSelector(nn.Module):
         generator: torch.Generator | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Return ``[B,Q,N]`` selected membership and audit diagnostics."""
-        self._validate_inputs(scores, token_valid, role_eligibility)
+        self._validate_inputs(
+            scores,
+            token_valid,
+            role_eligibility,
+            check_finite=self.strategy != "role_quota_shared_unique_m",
+        )
         self._validate_randomness(random_seed, generator, scores.device)
 
         batch_size, _, num_tokens = scores.shape
@@ -181,7 +186,7 @@ class FixedBudgetSupportSelector(nn.Module):
 
             if self.strategy == "role_quota_shared_unique_m":
                 indices, slot_valid, query_mask, unique_mask = (
-                    self._role_quota_unique(
+                    self._role_quota_unique_tensor(
                         scores,
                         role_candidates,
                         budget,
@@ -216,6 +221,9 @@ class FixedBudgetSupportSelector(nn.Module):
             )
 
         realized = unique_mask.sum(dim=-1)
+        valid_scores_finite = (
+            torch.isfinite(scores) | ~token_valid[:, None, :]
+        ).all(dim=(-1, -2))
         per_role = query_mask.sum(dim=-1)
         if self.strategy == "role_quota_shared_unique_m":
             requested_per_role = torch.full_like(
@@ -279,21 +287,301 @@ class FixedBudgetSupportSelector(nn.Module):
                 device=scores.device,
                 dtype=torch.long,
             ),
+            "gpu_latency_unmeasured": torch.ones(
+                batch_size,
+                device=scores.device,
+                dtype=torch.bool,
+            ),
+            "matcher_performance_claimed": torch.zeros(
+                batch_size,
+                device=scores.device,
+                dtype=torch.bool,
+            ),
+            "valid_scores_finite": valid_scores_finite,
         }
         return query_mask, diagnostics
 
     @staticmethod
-    def _role_quota_unique(
+    def _role_quota_unique_tensor(
         scores: torch.Tensor,
         role_candidates: torch.Tensor,
         budget: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return a maximum-cardinality role-quota/unique-token matching.
+        """Run exact batched augmenting paths without host synchronization.
 
-        This intentionally auditable CPU scaffold uses a deterministic
-        augmenting-path matching.  Each role owns at most ``budget / Q``
-        distinct tokens.  A token can have one owner only, but the returned
-        unique set can subsequently be consumed by every eligible role.
+        The state machine below is the tensor equivalent of
+        :meth:`_role_quota_unique_reference`.  Its Python loops have fixed
+        bounds determined only by static ``M`` and ``N``.  Every batch row can
+        be at a different DFS depth while all branching remains tensor-valued.
+        """
+        batch_size, num_roles, num_tokens = role_candidates.shape
+        quota = budget // num_roles
+        device = scores.device
+        candidate_counts = role_candidates.sum(dim=-1)
+        role_order = torch.argsort(
+            candidate_counts,
+            dim=-1,
+            descending=False,
+            stable=True,
+        )
+        slot_roles = role_order[:, None, :].expand(
+            -1, quota, -1
+        ).reshape(batch_size, budget)
+        preferences = torch.argsort(
+            scores,
+            dim=-1,
+            descending=True,
+            stable=True,
+        )
+        slot_to_token = torch.full(
+            (batch_size, budget), -1, device=device, dtype=torch.long
+        )
+        token_to_slot = torch.full(
+            (batch_size, num_tokens), -1, device=device, dtype=torch.long
+        )
+        path_positions = torch.arange(
+            budget, device=device, dtype=torch.long
+        )[None, :]
+        max_transitions = budget * (num_tokens + 3) + 1
+
+        for new_slot in range(budget):
+            stack_slots = torch.full_like(slot_to_token, -1)
+            stack_slots[:, 0] = new_slot
+            edge_tokens = torch.full_like(slot_to_token, -1)
+            next_candidate = torch.zeros_like(slot_to_token)
+            seen_tokens = torch.zeros(
+                batch_size,
+                num_tokens,
+                device=device,
+                dtype=torch.bool,
+            )
+            seen_slots = torch.zeros(
+                batch_size,
+                budget,
+                device=device,
+                dtype=torch.bool,
+            )
+            seen_slots[:, new_slot] = True
+            depth = torch.zeros(
+                batch_size, device=device, dtype=torch.long
+            )
+            success_depth = torch.zeros_like(depth)
+            succeeded = torch.zeros(
+                batch_size, device=device, dtype=torch.bool
+            )
+            failed = torch.zeros_like(succeeded)
+
+            for _ in range(max_transitions):
+                active = ~succeeded & ~failed
+                safe_depth = depth.clamp(min=0, max=budget - 1)
+                current_slot = torch.gather(
+                    stack_slots, 1, safe_depth[:, None]
+                ).squeeze(1)
+                safe_slot = current_slot.clamp(min=0, max=budget - 1)
+                current_role = torch.gather(
+                    slot_roles, 1, safe_slot[:, None]
+                ).squeeze(1)
+                cursor = torch.gather(
+                    next_candidate, 1, safe_depth[:, None]
+                ).squeeze(1)
+                has_candidate = active & (cursor < num_tokens)
+                exhausted = active & ~has_candidate
+                failed = failed | (exhausted & (depth == 0))
+                depth_after_pop = torch.where(
+                    exhausted & (depth > 0), depth - 1, depth
+                )
+
+                role_preferences = torch.gather(
+                    preferences,
+                    1,
+                    current_role[:, None, None].expand(
+                        -1, 1, num_tokens
+                    ),
+                ).squeeze(1)
+                safe_cursor = cursor.clamp(min=0, max=num_tokens - 1)
+                candidate = torch.gather(
+                    role_preferences, 1, safe_cursor[:, None]
+                ).squeeze(1)
+
+                updated_cursor = torch.where(
+                    has_candidate, cursor + 1, cursor
+                )
+                next_candidate.scatter_(
+                    1, safe_depth[:, None], updated_cursor[:, None]
+                )
+                role_candidate_row = torch.gather(
+                    role_candidates,
+                    1,
+                    current_role[:, None, None].expand(
+                        -1, 1, num_tokens
+                    ),
+                ).squeeze(1)
+                eligible = torch.gather(
+                    role_candidate_row, 1, candidate[:, None]
+                ).squeeze(1)
+                already_seen_token = torch.gather(
+                    seen_tokens, 1, candidate[:, None]
+                ).squeeze(1)
+                take_token = has_candidate & eligible & ~already_seen_token
+                seen_tokens.scatter_(
+                    1,
+                    candidate[:, None],
+                    (already_seen_token | take_token)[:, None],
+                )
+
+                owner_slot = torch.gather(
+                    token_to_slot, 1, candidate[:, None]
+                ).squeeze(1)
+                safe_owner = owner_slot.clamp(min=0, max=budget - 1)
+                owner_seen = torch.gather(
+                    seen_slots, 1, safe_owner[:, None]
+                ).squeeze(1)
+                found_free = take_token & (owner_slot < 0)
+                push_owner = take_token & (owner_slot >= 0) & ~owner_seen
+                record_edge = found_free | push_owner
+                previous_edge = torch.gather(
+                    edge_tokens, 1, safe_depth[:, None]
+                ).squeeze(1)
+                edge_tokens.scatter_(
+                    1,
+                    safe_depth[:, None],
+                    torch.where(
+                        record_edge, candidate, previous_edge
+                    )[:, None],
+                )
+                success_depth = torch.where(
+                    found_free, depth, success_depth
+                )
+                succeeded = succeeded | found_free
+
+                pushed_depth = (depth + 1).clamp(max=budget - 1)
+                previous_stack_slot = torch.gather(
+                    stack_slots, 1, pushed_depth[:, None]
+                ).squeeze(1)
+                stack_slots.scatter_(
+                    1,
+                    pushed_depth[:, None],
+                    torch.where(
+                        push_owner, owner_slot, previous_stack_slot
+                    )[:, None],
+                )
+                previous_child_cursor = torch.gather(
+                    next_candidate, 1, pushed_depth[:, None]
+                ).squeeze(1)
+                next_candidate.scatter_(
+                    1,
+                    pushed_depth[:, None],
+                    torch.where(
+                        push_owner,
+                        torch.zeros_like(previous_child_cursor),
+                        previous_child_cursor,
+                    )[:, None],
+                )
+                previous_owner_seen = torch.gather(
+                    seen_slots, 1, safe_owner[:, None]
+                ).squeeze(1)
+                seen_slots.scatter_(
+                    1,
+                    safe_owner[:, None],
+                    (previous_owner_seen | push_owner)[:, None],
+                )
+                depth = torch.where(
+                    push_owner, depth + 1, depth_after_pop
+                )
+
+            path_valid = succeeded[:, None] & (
+                path_positions <= success_depth[:, None]
+            )
+            path_slots = torch.where(
+                path_valid,
+                stack_slots,
+                torch.full_like(stack_slots, budget),
+            )
+            path_tokens = torch.where(
+                path_valid,
+                edge_tokens,
+                torch.full_like(edge_tokens, num_tokens),
+            )
+            slot_with_sentinel = torch.cat(
+                (
+                    slot_to_token,
+                    torch.full(
+                        (batch_size, 1),
+                        -1,
+                        device=device,
+                        dtype=torch.long,
+                    ),
+                ),
+                dim=1,
+            )
+            token_with_sentinel = torch.cat(
+                (
+                    token_to_slot,
+                    torch.full(
+                        (batch_size, 1),
+                        -1,
+                        device=device,
+                        dtype=torch.long,
+                    ),
+                ),
+                dim=1,
+            )
+            slot_with_sentinel.scatter_(
+                1,
+                path_slots,
+                torch.where(
+                    path_valid, path_tokens, torch.full_like(path_tokens, -1)
+                ),
+            )
+            token_with_sentinel.scatter_(
+                1,
+                path_tokens,
+                torch.where(
+                    path_valid, stack_slots, torch.full_like(stack_slots, -1)
+                ),
+            )
+            slot_to_token = slot_with_sentinel[:, :budget]
+            token_to_slot = token_with_sentinel[:, :num_tokens]
+
+        owner_slot_valid = slot_to_token >= 0
+        flat_query_mask = torch.zeros(
+            batch_size,
+            num_roles * num_tokens + 1,
+            device=device,
+            dtype=torch.bool,
+        )
+        flat_indices = torch.where(
+            owner_slot_valid,
+            slot_roles * num_tokens + slot_to_token,
+            torch.full_like(slot_to_token, num_roles * num_tokens),
+        )
+        flat_query_mask.scatter_(
+            1, flat_indices, owner_slot_valid
+        )
+        query_mask = flat_query_mask[:, :-1].reshape(
+            batch_size, num_roles, num_tokens
+        )
+        compact_order = torch.argsort(
+            ~owner_slot_valid, dim=-1, descending=False, stable=True
+        )
+        compact_tokens = torch.gather(slot_to_token, 1, compact_order)
+        slot_valid = torch.gather(owner_slot_valid, 1, compact_order)
+        indices = torch.where(
+            slot_valid, compact_tokens, torch.full_like(compact_tokens, -1)
+        )
+        unique_mask = query_mask.any(dim=1)
+        return indices, slot_valid, query_mask, unique_mask
+
+    @staticmethod
+    def _role_quota_unique_reference(
+        scores: torch.Tensor,
+        role_candidates: torch.Tensor,
+        budget: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return the original CPU reference for parity/property tests.
+
+        This routine intentionally retains Python scalar conversion and must
+        never be called by :meth:`forward`.
         """
         batch_size, num_roles, num_tokens = role_candidates.shape
         quota = budget // num_roles
@@ -384,6 +672,19 @@ class FixedBudgetSupportSelector(nn.Module):
 
         unique_mask = query_mask.any(dim=1)
         return indices, slot_valid, query_mask, unique_mask
+
+    @staticmethod
+    def _role_quota_unique(
+        scores: torch.Tensor,
+        role_candidates: torch.Tensor,
+        budget: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Preserve the former private entry point with the tensor backend."""
+        return FixedBudgetSupportSelector._role_quota_unique_tensor(
+            scores,
+            role_candidates,
+            budget,
+        )
 
     @staticmethod
     def _masked_entropy(
@@ -524,6 +825,8 @@ class FixedBudgetSupportSelector(nn.Module):
         scores: torch.Tensor,
         token_valid: torch.Tensor,
         role_eligibility: torch.Tensor,
+        *,
+        check_finite: bool = True,
     ) -> None:
         if scores.ndim != 3 or scores.shape[1] != NUM_QUERIES:
             raise ValueError(
@@ -533,6 +836,8 @@ class FixedBudgetSupportSelector(nn.Module):
         if not scores.is_floating_point():
             raise ValueError("scores must be floating point.")
         expected_token = (scores.shape[0], scores.shape[2])
+        if scores.shape[0] <= 0 or scores.shape[2] <= 0:
+            raise ValueError("scores batch and token dimensions must be positive.")
         if tuple(token_valid.shape) != expected_token:
             raise ValueError(
                 f"token_valid must have shape {expected_token}, got "
@@ -549,9 +854,10 @@ class FixedBudgetSupportSelector(nn.Module):
             raise ValueError("role_eligibility must be boolean.")
         if token_valid.device != scores.device or role_eligibility.device != scores.device:
             raise ValueError("scores and masks must be on the same device.")
-        relevant = token_valid[:, None, :].expand_as(scores)
-        if not bool(torch.isfinite(scores[relevant]).all()):
-            raise ValueError("Scores on valid tokens must be finite.")
+        if check_finite:
+            relevant = token_valid[:, None, :].expand_as(scores)
+            if not bool(torch.isfinite(scores[relevant]).all()):
+                raise ValueError("Scores on valid tokens must be finite.")
 
     @staticmethod
     def _normalize_strategy(strategy: str) -> str:
