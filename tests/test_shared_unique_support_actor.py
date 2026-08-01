@@ -1,5 +1,6 @@
-import pytest
 import torch
+
+import pytest
 
 from rsl_rl.modules import (
     MatchedSubstitutionMetadata,
@@ -10,7 +11,6 @@ from rsl_rl.modules import (
 from rsl_rl.modules.support_selection_ablation import (
     FixedBudgetSupportSelector,
 )
-
 
 SCORE_DIM = 5
 VALUE_DIM = 3
@@ -26,7 +26,16 @@ def _provenance() -> SupportMaskProvenance:
     )
 
 
-def _actor_inputs(batch_size: int = 2, num_tokens: int = 24):
+def _actor_inputs(
+    batch_size: int = 2,
+    num_tokens: int = 24,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
     generator = torch.Generator().manual_seed(5101)
     score_features = torch.randn(
         batch_size, num_tokens, SCORE_DIM, generator=generator
@@ -74,6 +83,7 @@ def _matched_metadata(
 
 
 def test_role_quota_selector_spends_unique_m_with_overlap() -> None:
+    """Charge an overlapping token once while exposing both eligible roles."""
     scores = torch.tensor(
         [
             [
@@ -110,6 +120,7 @@ def test_role_quota_selector_spends_unique_m_with_overlap() -> None:
 
 
 def test_role_shortfall_is_not_backfilled_by_other_roles() -> None:
+    """Leave a scarce role slot empty instead of spending it elsewhere."""
     scores = torch.randn(1, 4, 16)
     valid = torch.ones(1, 16, dtype=torch.bool)
     roles = torch.zeros(1, 4, 16, dtype=torch.bool)
@@ -135,6 +146,7 @@ def test_role_shortfall_is_not_backfilled_by_other_roles() -> None:
 
 
 def test_actor_projects_only_selected_width_and_shares_overlap() -> None:
+    """Project exactly M values and share an eligible overlapping token."""
     torch.manual_seed(5107)
     model = SharedUniqueSupportActorAdapter(
         SCORE_DIM,
@@ -183,6 +195,7 @@ def test_actor_projects_only_selected_width_and_shares_overlap() -> None:
 
 
 def test_actor_unselected_value_perturbation_changes_neither_action_nor_value() -> None:
+    """Prove that unselected terrain values have no action/value bypass."""
     torch.manual_seed(5113)
     model = SharedUniqueSupportActorAdapter(
         SCORE_DIM,
@@ -214,6 +227,7 @@ def test_actor_unselected_value_perturbation_changes_neither_action_nor_value() 
 
 
 def test_actor_reports_role_shortfall_without_cross_role_backfill() -> None:
+    """Expose actor-level per-role shortfall without cross-role replacement."""
     torch.manual_seed(5119)
     model = SharedUniqueSupportActorAdapter(
         SCORE_DIM,
@@ -241,6 +255,7 @@ def test_actor_reports_role_shortfall_without_cross_role_backfill() -> None:
 
 
 def test_actor_and_value_paths_are_trainable_through_selected_evidence() -> None:
+    """Retain finite gradients through selected values and their scores."""
     torch.manual_seed(5123)
     model = SharedUniqueSupportActorAdapter(
         SCORE_DIM,
@@ -267,6 +282,7 @@ def test_actor_and_value_paths_are_trainable_through_selected_evidence() -> None
 
 
 def test_explicit_native_is_bitwise_identical_to_legacy_default() -> None:
+    """Keep the explicit native intervention bitwise backward compatible."""
     torch.manual_seed(5127)
     model = SharedUniqueSupportActorAdapter(
         SCORE_DIM, VALUE_DIM, PROPRIO_DIM, ACTION_DIM, total_budget=8
@@ -303,6 +319,7 @@ def test_explicit_native_is_bitwise_identical_to_legacy_default() -> None:
 
 
 def test_all_interventions_preserve_clean_membership_bitwise() -> None:
+    """Freeze identical clean membership for every causal intervention."""
     torch.manual_seed(5131)
     model = SharedUniqueSupportActorAdapter(
         SCORE_DIM, VALUE_DIM, PROPRIO_DIM, ACTION_DIM, total_budget=8
@@ -360,6 +377,7 @@ def test_all_interventions_preserve_clean_membership_bitwise() -> None:
 
 
 def test_exact_matched_substitution_uses_registered_role_and_strata() -> None:
+    """Match substitutes on role signature plus range, angle, and age."""
     torch.manual_seed(5137)
     model = SharedUniqueSupportActorAdapter(
         SCORE_DIM, VALUE_DIM, PROPRIO_DIM, ACTION_DIM, total_budget=8
@@ -437,6 +455,7 @@ def test_exact_matched_substitution_uses_registered_role_and_strata() -> None:
 
 
 def test_zero_selected_is_exactly_the_zero_value_counterfactual() -> None:
+    """Zero selected values without changing selection or score weights."""
     torch.manual_seed(5139)
     model = SharedUniqueSupportActorAdapter(
         SCORE_DIM, VALUE_DIM, PROPRIO_DIM, ACTION_DIM, total_budget=8
@@ -470,6 +489,7 @@ def test_zero_selected_is_exactly_the_zero_value_counterfactual() -> None:
 
 
 def test_matched_substitution_shortfall_fails_with_frozen_audit() -> None:
+    """Fail closed with membership evidence when exact substitutes run out."""
     torch.manual_seed(5141)
     model = SharedUniqueSupportActorAdapter(
         SCORE_DIM, VALUE_DIM, PROPRIO_DIM, ACTION_DIM, total_budget=8
@@ -505,6 +525,7 @@ def test_matched_substitution_shortfall_fails_with_frozen_audit() -> None:
 
 
 def test_role_shuffle_only_reorders_clean_consumption_relationship() -> None:
+    """Shuffle role consumption while keeping token identities and values."""
     torch.manual_seed(5147)
     model = SharedUniqueSupportActorAdapter(
         SCORE_DIM, VALUE_DIM, PROPRIO_DIM, ACTION_DIM, total_budget=8
@@ -540,6 +561,7 @@ def test_role_shuffle_only_reorders_clean_consumption_relationship() -> None:
 
 
 def test_cell_shuffle_only_reorders_values_across_selected_cells() -> None:
+    """Shuffle selected values while preserving frozen cell identities."""
     torch.manual_seed(5153)
     model = SharedUniqueSupportActorAdapter(
         SCORE_DIM, VALUE_DIM, PROPRIO_DIM, ACTION_DIM, total_budget=8
@@ -587,6 +609,7 @@ def test_cell_shuffle_only_reorders_values_across_selected_cells() -> None:
 
 
 def test_intervention_metadata_contract_is_fail_closed() -> None:
+    """Reject missing, cross-mode, mutated, or invalid intervention metadata."""
     model = SharedUniqueSupportActorAdapter(
         SCORE_DIM, VALUE_DIM, PROPRIO_DIM, ACTION_DIM, total_budget=8
     ).eval()
@@ -608,7 +631,7 @@ def test_intervention_metadata_contract_is_fail_closed() -> None:
             matched_substitution=metadata,
         )
 
-    with pytest.raises(ValueError, match="permute 0..3"):
+    with pytest.raises(ValueError, match=r"permute 0\.\.3"):
         model.forward_with_diagnostics(
             *inputs,
             mask_provenance=_provenance(),
@@ -618,6 +641,7 @@ def test_intervention_metadata_contract_is_fail_closed() -> None:
 
 
 def test_provenance_is_mandatory_and_rejects_simulator_truth() -> None:
+    """Reject undeclared, privileged, or simulator-truth role geometry."""
     with pytest.raises(ValueError, match="contact truth"):
         SupportMaskProvenance(
             geometry_source="calibrated_lidar_ray_geometry",

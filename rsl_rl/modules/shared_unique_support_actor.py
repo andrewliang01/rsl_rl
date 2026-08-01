@@ -23,16 +23,14 @@ from __future__ import annotations
 
 import hashlib
 import math
+import torch
+import torch.nn as nn
 from dataclasses import asdict, dataclass
 from numbers import Integral
 from typing import Final
 
-import torch
-import torch.nn as nn
-
 from .sparse_support_evidence_bottleneck import NUM_QUERIES, QUERY_NAMES
 from .support_selection_ablation import FixedBudgetSupportSelector
-
 
 DEPLOYMENT_GEOMETRY_SOURCES: Final[tuple[str, ...]] = (
     "calibrated_lidar_ray_geometry",
@@ -80,6 +78,7 @@ class MatchedSubstitutionMetadata:
     schema: str = MATCHED_SUBSTITUTION_SCHEMA
 
     def __post_init__(self) -> None:
+        """Reject an altered matching schema or malformed registration hash."""
         if self.schema != MATCHED_SUBSTITUTION_SCHEMA:
             raise ValueError(
                 f"Unsupported matched-substitution schema {self.schema!r}."
@@ -152,6 +151,7 @@ class MatchedSubstitutionShortfallError(RuntimeError):
     """Fail-closed error carrying frozen-selection shortfall diagnostics."""
 
     def __init__(self, audit: dict[str, object]) -> None:
+        """Preserve frozen-selection evidence on an exact-match shortfall."""
         self.audit = audit
         shortfall = audit["matched_substitution_shortfall"]
         super().__init__(
@@ -172,6 +172,7 @@ class SupportMaskProvenance:
     schema: str = "deployment_observable_support_mask_v1"
 
     def __post_init__(self) -> None:
+        """Reject privileged or unsupported mask provenance declarations."""
         if self.schema != "deployment_observable_support_mask_v1":
             raise ValueError(
                 "Unsupported support-mask provenance schema "
@@ -250,6 +251,7 @@ class SharedUniqueSupportActorAdapter(nn.Module):
         value_embedding_dim: int = 32,
         hidden_dim: int = 128,
     ) -> None:
+        """Construct one selected-only actor/value adapter."""
         super().__init__()
         self.score_feature_dim = _positive_integer(
             "score_feature_dim", score_feature_dim
@@ -315,6 +317,7 @@ class SharedUniqueSupportActorAdapter(nn.Module):
         role_permutation: torch.Tensor | None = None,
         cell_permutation: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return deterministic action and value from selected evidence."""
         action, value, _ = self.forward_with_diagnostics(
             score_features,
             terrain_values,

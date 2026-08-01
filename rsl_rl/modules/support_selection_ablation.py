@@ -45,14 +45,12 @@ and exports enough tensors to audit exact membership.
 
 from __future__ import annotations
 
+import torch
+import torch.nn as nn
 from numbers import Integral
 from typing import Final
 
-import torch
-import torch.nn as nn
-
 from .sparse_support_evidence_bottleneck import NUM_QUERIES, QUERY_NAMES
-
 
 SUPPORTED_SHARED_TOTAL_BUDGETS: Final[tuple[int, ...]] = (8, 16, 32, 64)
 SUPPORTED_SUPPORT_SELECTION_STRATEGIES: Final[tuple[str, ...]] = (
@@ -82,6 +80,7 @@ class FixedBudgetSupportSelector(nn.Module):
         strategy: str = "role_shared_total_m",
         total_budget: int | str = 16,
     ) -> None:
+        """Freeze the selection strategy and shared unique-token budget."""
         super().__init__()
         self.strategy = self._normalize_strategy(strategy)
         self.total_budget = self._normalize_budget(total_budget)
@@ -346,6 +345,10 @@ class FixedBudgetSupportSelector(nn.Module):
                 slot: int,
                 seen_tokens: set[int],
                 seen_slots: set[int],
+                slot_roles: list[int] = slot_roles,
+                preferences: list[list[int]] = preferences,
+                token_to_slot: list[int] = token_to_slot,
+                slot_to_token: list[int] = slot_to_token,
             ) -> bool:
                 if slot in seen_slots:
                     return False
@@ -580,7 +583,7 @@ class FixedBudgetSupportSelector(nn.Module):
 
 
 __all__ = [
-    "FixedBudgetSupportSelector",
     "SUPPORTED_SHARED_TOTAL_BUDGETS",
     "SUPPORTED_SUPPORT_SELECTION_STRATEGIES",
+    "FixedBudgetSupportSelector",
 ]
