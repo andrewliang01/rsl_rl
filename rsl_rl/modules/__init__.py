@@ -24,6 +24,10 @@ from .causal_foot_support_projector import (
     CausalCommandFootSupportProjector,
     CausalFootSupportProjection,
 )
+from .causal_spherical_support_pipeline import (
+    CausalSphericalSupportEvidenceBatch,
+    CausalSphericalSupportEvidencePipeline,
+)
 from .cnn import CNN
 from .cteq_dual_event_hazard import (
     CteqAdministrativeSurvivalLoss,
@@ -62,6 +66,8 @@ __all__ = [
     "CalibratedSphericalSupportRoleGeometry",
     "CausalCommandFootSupportProjector",
     "CausalFootSupportProjection",
+    "CausalSphericalSupportEvidenceBatch",
+    "CausalSphericalSupportEvidencePipeline",
     "CteqAdministrativeSurvivalLoss",
     "CteqDualEventHazardHead",
     "CteqIndependentSurvivalLoss",
