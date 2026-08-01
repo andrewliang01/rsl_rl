@@ -101,6 +101,22 @@ def test_exact_union_k1_keeps_range_and_age_from_same_winner():
     assert output.packet_age_s.item() == pytest.approx(0.05)
 
 
+def test_exact_union_equal_range_and_age_uses_lowest_history_index():
+    range_m = torch.tensor([[[[1.5]], [[1.5]], [[2.0]]]])
+    valid = torch.ones_like(range_m, dtype=torch.bool)
+    age = torch.tensor([[[[0.2]], [[0.2]], [[0.1]]]])
+    packet_age = torch.tensor([[0.2, 0.2, 0.1]])
+    frame_valid = torch.ones(1, 3, dtype=torch.bool)
+    output = RayEventAblationRouter(
+        history_reduction="exact_union_k1",
+        temporal_baseline="age_zero",
+    )(range_m, valid, age, packet_age, frame_valid)
+    assert output.range_m.item() == pytest.approx(1.5)
+    assert output.return_age_s.item() == 0.0
+    assert output.packet_age_s.item() == 0.0
+    assert output.diagnostics["exact_union_winner_frame_index"].item() == 0
+
+
 def test_raster_latest_prototype_is_distinct_from_nearest_range_oracle():
     range_m = torch.tensor([[[[1.0]], [[3.0]], [[2.0]]]])
     valid = torch.ones_like(range_m, dtype=torch.bool)
