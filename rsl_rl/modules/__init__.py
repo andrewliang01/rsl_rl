@@ -14,6 +14,7 @@ from .r2plus1d_elevation_encoder import R2Plus1DBlock, R2Plus1DElevationEncoder
 from .ray_time_attention_encoder import RayTimeAttentionEncoder
 from .ray_return_event_time import RayReturnEventTimeEncoder
 from .cteq_dual_event_hazard import (
+    CteqAdministrativeSurvivalLoss,
     CteqDualEventHazardHead,
     CteqIndependentSurvivalLoss,
 )
@@ -31,6 +32,7 @@ __all__ = [
     "RayTimeAttentionEncoder",
     "RayReturnEventTimeEncoder",
     "CteqDualEventHazardHead",
+    "CteqAdministrativeSurvivalLoss",
     "CteqIndependentSurvivalLoss",
     "RayEventAblationOutput",
     "RayEventAblationRouter",

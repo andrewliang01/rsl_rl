@@ -6,13 +6,17 @@
 """Helper functions."""
 
 from .cteq_administrative_censor import (
+    CTEQ_ADMINISTRATIVE_LOSS_SCHEMA,
     CTEQ_ADMINISTRATIVE_CENSOR_RECEIPT_SCHEMA,
     CTEQ_ADMINISTRATIVE_CENSOR_SCHEMA,
     CTEQ_FOOT_EVENT_SOURCE_CONTRACT,
     CTEQ_OBSERVED_BIN_CONTRACT,
     CteqAdministrativeCensorBatch,
+    CteqAdministrativeHazardLoss,
     CteqCensorReason,
+    administrative_censor_survival_loss,
     build_cteq_administrative_censor_batch,
+    cteq_administrative_loss_status,
     validate_cteq_administrative_censor_receipt,
 )
 from .formal_training_io import (
@@ -130,6 +134,7 @@ __all__ = [
     "CHECKPOINT_SIDECAR_CONTRACT",
     "CTEQ_ADMINISTRATIVE_CENSOR_RECEIPT_SCHEMA",
     "CTEQ_ADMINISTRATIVE_CENSOR_SCHEMA",
+    "CTEQ_ADMINISTRATIVE_LOSS_SCHEMA",
     "CTEQ_FOOT_EVENT_SOURCE_CONTRACT",
     "CTEQ_OBSERVED_BIN_CONTRACT",
     "FORMAL_CHECKPOINT_RUN_INSPECTION_CONTRACT",
@@ -137,6 +142,7 @@ __all__ = [
     "H1AblationSpec",
     "H2AblationSpec",
     "CteqAdministrativeCensorBatch",
+    "CteqAdministrativeHazardLoss",
     "CteqCensorReason",
     "MID360_CAPTURE_END_ACQUISITION_WINDOW",
     "MID360_CAPTURE_END_LATEST_RETURN_LEGACY",
@@ -166,8 +172,10 @@ __all__ = [
     "TRAINING_RECEIPT_SCHEMA_VERSION",
     "StaleMid360PacketError",
     "TrainingReceiptError",
+    "administrative_censor_survival_loss",
     "build_checkpoint_sidecar",
     "build_cteq_administrative_censor_batch",
+    "cteq_administrative_loss_status",
     "build_h1_protocol",
     "build_h2_protocol",
     "build_ray_event_deployment_receipt",

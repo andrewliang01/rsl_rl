@@ -27,6 +27,8 @@ from .cteq_contact_timing import (
     CTEQ_BIN_WIDTH_S,
     CTEQ_NUM_BINS,
     CteqContractError,
+    DualEventHazardDistribution,
+    EventIndex,
     PrivilegedLabelLeakageError,
 )
 
@@ -42,6 +44,9 @@ CTEQ_FOOT_EVENT_SOURCE_CONTRACT: Final[str] = (
 )
 CTEQ_OBSERVED_BIN_CONTRACT: Final[str] = (
     "complete_post_anchor_bins_before_or_including_valid_terminal_sample_v1"
+)
+CTEQ_ADMINISTRATIVE_LOSS_SCHEMA: Final[str] = (
+    "cteq-administrative-censor-survival-loss-v1"
 )
 
 
@@ -145,6 +150,33 @@ class CteqAdministrativeCensorBatch:
 
     def receipt(self) -> dict[str, Any]:
         return copy.deepcopy(dict(self.audit_receipt))
+
+
+@dataclass(frozen=True)
+class CteqAdministrativeHazardLoss:
+    """NumPy loss and denominator audit for administrative censoring."""
+
+    mean_nll: float
+    mean_brier: float
+    per_target_nll: np.ndarray
+    per_target_brier: np.ndarray
+    eligible_mask: np.ndarray
+    eligible_target_count: int
+    excluded_target_count: int
+    per_role_eligible_count: np.ndarray
+    per_role_nll_sum: np.ndarray
+    per_role_brier_sum: np.ndarray
+    td_event_nll_sum: float
+    lo_event_nll_sum: float
+    td_censored_nll_sum: float
+    lo_censored_nll_sum: float
+    td_event_count: int
+    lo_event_count: int
+    td_censored_count: int
+    lo_censored_count: int
+    schema: str = CTEQ_ADMINISTRATIVE_LOSS_SCHEMA
+    target_weighting: str = "equal_per_loss_eligible_foot_event_target"
+    training_ready: bool = False
 
 
 def build_cteq_administrative_censor_batch(
@@ -321,8 +353,10 @@ def build_cteq_administrative_censor_batch(
             "survival_through_bins_[0,censor_after_bin)"
         ),
         "existing_full_horizon_loss_supports_early_censor": False,
+        "administrative_censor_loss_contract": CTEQ_ADMINISTRATIVE_LOSS_SCHEMA,
+        "administrative_censor_loss_interface_closed": True,
         "label_adapter_ready": True,
-        "loss_interface_closed": False,
+        "loss_interface_closed": True,
         "actor_integrated": False,
         "gym_task_registered": False,
         "training_ready": False,
@@ -343,6 +377,163 @@ def build_cteq_administrative_censor_batch(
         reason_counts=dict(reason_counts),
         audit_receipt=receipt,
     )
+
+
+def administrative_censor_survival_loss(
+    distribution: DualEventHazardDistribution,
+    labels: CteqAdministrativeCensorBatch,
+) -> CteqAdministrativeHazardLoss:
+    """Compute exact-event or boundary-survival loss over eligible targets.
+
+    For an observed event in bin ``j``, NLL is ``-log(S(j) * h_j)``.  For a
+    censored target with ``censor_after_bin=m``, NLL is ``-log(S(m))`` where
+    ``S(m)=prod_{k<m}(1-h_k)``.  Censored Brier uses the collapsed categorical
+    distribution ``[p_0,...,p_{m-1},S(m)]``.  At ``m=25`` this is identical to
+    the legacy full-horizon 26-category Brier score.
+    """
+    if not isinstance(distribution, DualEventHazardDistribution):
+        raise TypeError("distribution must be DualEventHazardDistribution.")
+    if not isinstance(labels, CteqAdministrativeCensorBatch):
+        raise TypeError("labels must be CteqAdministrativeCensorBatch.")
+    expected_shape = labels.event_bin.shape
+    if distribution.event_mass.shape != (*expected_shape, CTEQ_NUM_BINS):
+        raise CteqContractError(
+            "Hazard leading dimensions must equal administrative labels [B,2,2]."
+        )
+    observed = labels.event_observed
+    censored = labels.right_censored
+    eligible = labels.loss_eligible
+    event_bin = labels.event_bin
+    censor_after = labels.censor_after_bin
+    if not np.array_equal(censored, ~observed):
+        raise CteqContractError("Administrative censor flags must complement events.")
+    if np.any(observed & ((event_bin < 0) | (event_bin >= CTEQ_NUM_BINS))):
+        raise CteqContractError("Observed events require a bin in [0,24].")
+    if np.any(observed & (censor_after != -1)):
+        raise CteqContractError("Observed events require censor_after_bin=-1.")
+    if np.any(censored & (event_bin != -1)):
+        raise CteqContractError("Censored targets require event_bin=-1.")
+    if np.any(
+        censored
+        & ((censor_after < 0) | (censor_after > CTEQ_NUM_BINS))
+    ):
+        raise CteqContractError("Censored targets require boundary in [0,25].")
+    expected_eligible = observed | (censored & (censor_after > 0))
+    if not np.array_equal(eligible, expected_eligible):
+        raise CteqContractError(
+            "loss_eligible must include events and positive-exposure censors only."
+        )
+    denominator = int(np.count_nonzero(eligible))
+    if denominator == 0:
+        raise CteqContractError(
+            "Administrative-censor loss has zero eligible targets."
+        )
+
+    event_index = np.clip(event_bin, 0, CTEQ_NUM_BINS - 1)[..., None]
+    selected_event_log_mass = np.take_along_axis(
+        distribution.log_event_mass,
+        event_index,
+        axis=-1,
+    )[..., 0]
+    boundary_index = np.clip(censor_after, 0, CTEQ_NUM_BINS)[..., None]
+    selected_log_survival = np.take_along_axis(
+        distribution.log_survival_at_boundary,
+        boundary_index,
+        axis=-1,
+    )[..., 0]
+    raw_nll = -np.where(observed, selected_event_log_mass, selected_log_survival)
+
+    full_probability = np.concatenate(
+        (distribution.event_mass, distribution.censor_mass[..., None]),
+        axis=-1,
+    )
+    event_target = np.zeros_like(distribution.event_mass)
+    np.put_along_axis(event_target, event_index, observed[..., None], axis=-1)
+    full_target = np.concatenate(
+        (event_target, np.zeros_like(observed[..., None], dtype=np.float64)),
+        axis=-1,
+    )
+    event_brier = np.sum(np.square(full_probability - full_target), axis=-1)
+
+    prefix_mask = (
+        np.arange(CTEQ_NUM_BINS, dtype=np.int64)
+        < censor_after[..., None]
+    )
+    prefix_event_mass = distribution.event_mass * prefix_mask
+    selected_survival = np.take_along_axis(
+        distribution.survival_at_boundary,
+        boundary_index,
+        axis=-1,
+    )[..., 0]
+    censor_brier = np.sum(np.square(prefix_event_mass), axis=-1) + np.square(
+        selected_survival - 1.0
+    )
+    raw_brier = np.where(observed, event_brier, censor_brier)
+    per_target_nll = np.where(eligible, raw_nll, 0.0)
+    per_target_brier = np.where(eligible, raw_brier, 0.0)
+    if not np.isfinite(per_target_nll).all() or not np.isfinite(
+        per_target_brier
+    ).all():
+        raise CteqContractError("Administrative CTEQ loss must remain finite.")
+
+    td_event = eligible[..., EventIndex.TOUCHDOWN] & observed[..., EventIndex.TOUCHDOWN]
+    lo_event = eligible[..., EventIndex.LIFTOFF] & observed[..., EventIndex.LIFTOFF]
+    td_censored = eligible[..., EventIndex.TOUCHDOWN] & censored[..., EventIndex.TOUCHDOWN]
+    lo_censored = eligible[..., EventIndex.LIFTOFF] & censored[..., EventIndex.LIFTOFF]
+    return CteqAdministrativeHazardLoss(
+        mean_nll=float(np.sum(per_target_nll) / denominator),
+        mean_brier=float(np.sum(per_target_brier) / denominator),
+        per_target_nll=_readonly_copy(per_target_nll, dtype=np.float64),
+        per_target_brier=_readonly_copy(per_target_brier, dtype=np.float64),
+        eligible_mask=_readonly_copy(eligible, dtype=np.bool_),
+        eligible_target_count=denominator,
+        excluded_target_count=int(eligible.size - denominator),
+        per_role_eligible_count=_readonly_copy(
+            np.count_nonzero(eligible, axis=0), dtype=np.int64
+        ),
+        per_role_nll_sum=_readonly_copy(
+            np.sum(per_target_nll, axis=0), dtype=np.float64
+        ),
+        per_role_brier_sum=_readonly_copy(
+            np.sum(per_target_brier, axis=0), dtype=np.float64
+        ),
+        td_event_nll_sum=float(
+            np.sum(per_target_nll[..., EventIndex.TOUCHDOWN][td_event])
+        ),
+        lo_event_nll_sum=float(
+            np.sum(per_target_nll[..., EventIndex.LIFTOFF][lo_event])
+        ),
+        td_censored_nll_sum=float(
+            np.sum(per_target_nll[..., EventIndex.TOUCHDOWN][td_censored])
+        ),
+        lo_censored_nll_sum=float(
+            np.sum(per_target_nll[..., EventIndex.LIFTOFF][lo_censored])
+        ),
+        td_event_count=int(np.count_nonzero(td_event)),
+        lo_event_count=int(np.count_nonzero(lo_event)),
+        td_censored_count=int(np.count_nonzero(td_censored)),
+        lo_censored_count=int(np.count_nonzero(lo_censored)),
+    )
+
+
+def cteq_administrative_loss_status() -> Mapping[str, Any]:
+    """Return the math/interface receipt while real runner truth stays unbound."""
+    return {
+        "schema": "cteq-administrative-loss-status-v1",
+        "loss_schema": CTEQ_ADMINISTRATIVE_LOSS_SCHEMA,
+        "event_nll": "-log_hazard[j]-sum_log_one_minus_hazard[k<j]",
+        "censor_nll": "-sum_log_one_minus_hazard[k<censor_after_bin]",
+        "censor_brier": "collapsed_prefix_events_plus_survival_at_boundary",
+        "target_weighting": "equal_per_loss_eligible_foot_event_target",
+        "denominator": "count_nonzero(loss_eligible)",
+        "zero_exposure_excluded": True,
+        "numpy_torch_interfaces_closed": True,
+        "future_truth_consumers": list(CTEQ_ALLOWED_TRUTH_CONSUMERS),
+        "actor_integrated": False,
+        "gym_task_registered": False,
+        "runner_termination_provenance_authenticated": False,
+        "training_ready": False,
+    }
 
 
 def validate_cteq_administrative_censor_receipt(
@@ -386,14 +577,19 @@ def validate_cteq_administrative_censor_receipt(
         ("termination_is_event", False),
         ("actor_future_truth_access", False),
         ("existing_full_horizon_loss_supports_early_censor", False),
+        ("administrative_censor_loss_interface_closed", True),
         ("label_adapter_ready", True),
-        ("loss_interface_closed", False),
+        ("loss_interface_closed", True),
         ("actor_integrated", False),
         ("gym_task_registered", False),
         ("training_ready", False),
     ):
         if receipt.get(field) is not expected:
             raise CteqContractError(f"CTEQ censor receipt field {field} changed.")
+    if receipt.get("administrative_censor_loss_contract") != (
+        CTEQ_ADMINISTRATIVE_LOSS_SCHEMA
+    ):
+        raise CteqContractError("CTEQ administrative loss contract changed.")
     receipt_sha = receipt.get("receipt_sha256")
     if not _is_sha256(receipt_sha):
         raise CteqContractError("CTEQ censor receipt requires a SHA-256 digest.")
@@ -440,12 +636,16 @@ def validate_cteq_administrative_censor_receipt(
 
 
 __all__ = [
+    "CTEQ_ADMINISTRATIVE_LOSS_SCHEMA",
     "CTEQ_ADMINISTRATIVE_CENSOR_RECEIPT_SCHEMA",
     "CTEQ_ADMINISTRATIVE_CENSOR_SCHEMA",
     "CTEQ_FOOT_EVENT_SOURCE_CONTRACT",
     "CTEQ_OBSERVED_BIN_CONTRACT",
     "CteqAdministrativeCensorBatch",
+    "CteqAdministrativeHazardLoss",
     "CteqCensorReason",
+    "administrative_censor_survival_loss",
     "build_cteq_administrative_censor_batch",
+    "cteq_administrative_loss_status",
     "validate_cteq_administrative_censor_receipt",
 ]

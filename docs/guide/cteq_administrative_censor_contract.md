@@ -46,9 +46,19 @@ the label tensor hash, runner provenance state, and the invariant
 
 ## Current boundary
 
-This change is a CPU label-contract primitive only. It is not connected to the
-actor, Gym, PPO, or GPU execution. The existing full-horizon CTEQ loss does not
-consume `censor_after_bin`; an administrative-censor-aware survival loss is a
-separate required step. Training remains disabled until the real runner proves
+The NumPy `administrative_censor_survival_loss` and Torch
+`CteqAdministrativeSurvivalLoss` consume the same four label tensors. For an
+event in bin `j`, they score the prior survival and hazard at `j`. For a censor
+boundary `m`, they score survival only through `[0,m)`. Their censored Brier
+diagnostic collapses all probability at and after `m` into `S(m)`; at `m=25`
+it is exactly the original full-horizon 26-class Brier score.
+
+Every eligible foot/event target keeps equal weight. Zero-exposure targets are
+zeroed and excluded from both numerator and denominator; an all-zero eligible
+batch is rejected because its mean loss is undefined. Per-role counts and
+NLL/Brier sums make the denominator auditable.
+
+This remains a CPU contract primitive. It is not connected to the actor, Gym,
+PPO, or GPU execution. Training remains disabled until the real runner proves
 the exact `done`/`time_outs`/base-contact mapping and whether the terminal
 contact sample is valid and included in `fully_observed_bins`.

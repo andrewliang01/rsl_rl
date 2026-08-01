@@ -168,7 +168,8 @@ def test_receipt_is_counted_hashed_unready_and_runner_unprovenance_is_visible():
     assert receipt["runner_termination_provenance_receipted"] is False
     assert receipt["runner_termination_provenance_authenticated"] is False
     assert receipt["existing_full_horizon_loss_supports_early_censor"] is False
-    assert receipt["loss_interface_closed"] is False
+    assert receipt["administrative_censor_loss_interface_closed"] is True
+    assert receipt["loss_interface_closed"] is True
     assert receipt["actor_integrated"] is False
     assert receipt["gym_task_registered"] is False
     assert receipt["training_ready"] is False
@@ -218,5 +219,5 @@ def test_administrative_truth_cannot_enter_actor_observation():
 
     status = cteq_pr01_status()
     assert "administrative_censor_label_adapter" in status["implemented"]
-    assert "administrative_censor_aware_survival_loss" in status["blocked_next_steps"]
+    assert "administrative_censor_numpy_torch_survival_loss" in status["implemented"]
     assert status["training_ready"] is False

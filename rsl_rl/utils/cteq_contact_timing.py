@@ -343,8 +343,10 @@ def _hazard_shape(value: np.ndarray, name: str) -> np.ndarray:
 class DualEventHazardDistribution:
     hazard: np.ndarray
     survival_before: np.ndarray
+    survival_at_boundary: np.ndarray
     event_mass: np.ndarray
     censor_mass: np.ndarray
+    log_survival_at_boundary: np.ndarray
     log_event_mass: np.ndarray
     log_censor_mass: np.ndarray
     schema: str = CTEQ_HAZARD_SCHEMA
@@ -366,7 +368,15 @@ def _distribution_from_log_hazards(
     )
     log_event_mass = log_survival_before + log_hazard
     log_censor_mass = np.sum(log_one_minus_hazard, axis=-1)
+    log_survival_at_boundary = np.concatenate(
+        (
+            np.zeros_like(log_one_minus_hazard[..., :1]),
+            np.cumsum(log_one_minus_hazard, axis=-1),
+        ),
+        axis=-1,
+    )
     survival = np.exp(log_survival_before)
+    survival_at_boundary = np.exp(log_survival_at_boundary)
     event_mass = np.exp(log_event_mass)
     censor_mass = np.exp(log_censor_mass)
     total = np.sum(event_mass, axis=-1) + censor_mass
@@ -375,8 +385,14 @@ def _distribution_from_log_hazards(
     return DualEventHazardDistribution(
         hazard=_readonly_copy(hazard, dtype=np.float64),
         survival_before=_readonly_copy(survival, dtype=np.float64),
+        survival_at_boundary=_readonly_copy(
+            survival_at_boundary, dtype=np.float64
+        ),
         event_mass=_readonly_copy(event_mass, dtype=np.float64),
         censor_mass=_readonly_copy(censor_mass, dtype=np.float64),
+        log_survival_at_boundary=_readonly_copy(
+            log_survival_at_boundary, dtype=np.float64
+        ),
         log_event_mass=_readonly_copy(log_event_mass, dtype=np.float64),
         log_censor_mass=_readonly_copy(log_censor_mass, dtype=np.float64),
     )
@@ -685,6 +701,9 @@ def cteq_pr01_status() -> Mapping[str, Any]:
             "torch_dual_event_hazard_head",
             "torch_survival_loss",
             "administrative_censor_label_adapter",
+            "administrative_censor_numpy_torch_survival_loss",
+            "administrative_censor_truncated_brier",
+            "loss_eligible_denominator_audit",
             "termination_reason_audit_receipt",
         ),
         "training_ready": False,
@@ -694,7 +713,6 @@ def cteq_pr01_status() -> Mapping[str, Any]:
         "future_truth_allowed_consumers": CTEQ_ALLOWED_TRUTH_CONSUMERS,
         "blocked_next_steps": (
             "real_runner_termination_and_terminal_sample_provenance",
-            "administrative_censor_aware_survival_loss",
             "actor_query_integration",
             "ppo_training",
             "export_resume_validation",
