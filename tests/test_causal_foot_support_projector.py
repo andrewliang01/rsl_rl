@@ -1,9 +1,26 @@
 import math
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
+from typing import Any
 
 import pytest
 
 from rsl_rl.modules import CausalCommandFootSupportProjector
+
+
+class _RejectLocalScalarMode(TorchDispatchMode):
+    """Reject implicit tensor-to-Python scalar extraction in a fast path."""
+
+    def __torch_dispatch__(
+        self,
+        func: Any,
+        _types: tuple[type, ...],
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        if func == torch.ops.aten._local_scalar_dense.default:
+            raise AssertionError("Tensor-to-host scalar extraction detected")
+        return func(*args, **({} if kwargs is None else kwargs))
 
 
 def _projector() -> CausalCommandFootSupportProjector:
@@ -28,6 +45,7 @@ def test_phase_anchors_produce_left_full_and_right_half_cycle() -> None:
         rtol=0.0,
         atol=1.0e-6,
     )
+    assert output.finite_gate.all()
     torch.testing.assert_close(
         output.future_centres_body,
         torch.tensor([[[0.8, 0.1, -0.8], [0.4, -0.1, -0.8]]]),
@@ -89,6 +107,37 @@ def test_receipt_rejects_terrain_planning_and_real_accuracy_claims() -> None:
     assert receipt["predicted_touchdown_accuracy_validated"] is False
     assert receipt["training_ready"] is False
     assert receipt["g1_closed_loop_validated"] is False
+
+
+def test_native_training_has_no_host_scalar_and_matches_audited_path() -> None:
+    """Return identical projection and a tensor gate without host extraction."""
+    projector = _projector()
+    feet = torch.tensor([[[0.1, 0.1, -0.8], [0.1, -0.1, -0.8]]])
+    command = torch.tensor([[0.5, -0.2, 0.3]])
+    phase = torch.tensor([[1.0, 0.0]])
+    audited = projector(feet, command, phase)
+
+    with _RejectLocalScalarMode():
+        fast = projector.forward_native_training(feet, command, phase)
+
+    assert torch.equal(fast.future_centres_body, audited.future_centres_body)
+    assert torch.equal(fast.support_horizon_s, audited.support_horizon_s)
+    assert torch.equal(fast.finite_gate, audited.finite_gate)
+    assert fast.finite_gate.all()
+
+
+def test_native_training_reports_zero_phase_with_tensor_gate() -> None:
+    """Keep an undefined phase on device and mark its row invalid."""
+    projector = _projector()
+    with _RejectLocalScalarMode():
+        output = projector.forward_native_training(
+            torch.zeros(1, 2, 3),
+            torch.zeros(1, 3),
+            torch.zeros(1, 2),
+        )
+
+    assert torch.equal(output.finite_gate, torch.tensor([False]))
+    assert torch.isfinite(output.future_centres_body).all()
 
 
 def test_rejects_zero_phase_vector_and_mixed_horizon_order() -> None:

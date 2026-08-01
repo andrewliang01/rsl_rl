@@ -30,6 +30,7 @@ class CausalFootSupportProjection:
 
     future_centres_body: torch.Tensor
     support_horizon_s: torch.Tensor
+    finite_gate: torch.Tensor
 
 
 class CausalCommandFootSupportProjector(nn.Module):
@@ -98,35 +99,55 @@ class CausalCommandFootSupportProjector(nn.Module):
         gait_phase_sin_cos: torch.Tensor,
     ) -> CausalFootSupportProjection:
         """Return future support-query centres using only causal inputs."""
-        if current_foot_centres_body.ndim != 3 or tuple(
-            current_foot_centres_body.shape[1:]
-        ) != (2, 3):
-            raise ValueError("current_foot_centres_body must have shape [B,2,3].")
-        batch_size = current_foot_centres_body.shape[0]
-        if commanded_planar_twist_body.shape != (batch_size, 3):
-            raise ValueError("commanded_planar_twist_body must have shape [B,3].")
-        if gait_phase_sin_cos.shape != (batch_size, 2):
-            raise ValueError("gait_phase_sin_cos must have shape [B,2].")
-        values = (
+        self._validate_inputs(
+            current_foot_centres_body,
+            commanded_planar_twist_body,
+            gait_phase_sin_cos,
+            validate_values=True,
+        )
+        return self._forward_impl(
             current_foot_centres_body,
             commanded_planar_twist_body,
             gait_phase_sin_cos,
         )
-        if len({value.device for value in values}) != 1:
-            raise ValueError("All support-projector inputs must share one device.")
-        if current_foot_centres_body.device != self.phase_anchors_rad.device:
-            raise ValueError("Projector inputs and parameters must share one device.")
-        if any(not value.dtype.is_floating_point for value in values):
-            raise TypeError("All support-projector inputs must be floating point.")
-        if any(not bool(torch.isfinite(value).all()) for value in values):
-            raise ValueError("All support-projector inputs must be finite.")
-        phase_norm = torch.linalg.vector_norm(gait_phase_sin_cos, dim=-1)
-        if bool((phase_norm < 1.0e-6).any()):
-            raise ValueError("gait_phase_sin_cos must encode a nonzero phase vector.")
 
+    def forward_native_training(
+        self,
+        current_foot_centres_body: torch.Tensor,
+        commanded_planar_twist_body: torch.Tensor,
+        gait_phase_sin_cos: torch.Tensor,
+    ) -> CausalFootSupportProjection:
+        """Project without host-value checks and return a per-row tensor gate."""
+        self._validate_inputs(
+            current_foot_centres_body,
+            commanded_planar_twist_body,
+            gait_phase_sin_cos,
+            validate_values=False,
+        )
+        return self._forward_impl(
+            current_foot_centres_body,
+            commanded_planar_twist_body,
+            gait_phase_sin_cos,
+        )
+
+    def _forward_impl(
+        self,
+        current_foot_centres_body: torch.Tensor,
+        commanded_planar_twist_body: torch.Tensor,
+        gait_phase_sin_cos: torch.Tensor,
+    ) -> CausalFootSupportProjection:
+        """Run the common tensor-only command projection."""
+        input_finite = (
+            torch.isfinite(current_foot_centres_body).all(dim=(-1, -2))
+            & torch.isfinite(commanded_planar_twist_body).all(dim=-1)
+            & torch.isfinite(gait_phase_sin_cos).all(dim=-1)
+        )
+        phase_norm = torch.linalg.vector_norm(gait_phase_sin_cos, dim=-1)
+        phase_gate = phase_norm >= 1.0e-6
+        safe_phase_norm = phase_norm.clamp_min(1.0e-6)
         phase = torch.atan2(
-            gait_phase_sin_cos[:, 0] / phase_norm,
-            gait_phase_sin_cos[:, 1] / phase_norm,
+            gait_phase_sin_cos[:, 0] / safe_phase_norm,
+            gait_phase_sin_cos[:, 1] / safe_phase_norm,
         )
         phase_delta = torch.remainder(
             self.phase_anchors_rad[None, :] - phase[:, None],
@@ -163,10 +184,54 @@ class CausalCommandFootSupportProjector(nn.Module):
             (projected_x, projected_y, current_foot_centres_body[..., 2]),
             dim=-1,
         )
+        finite_gate = (
+            input_finite
+            & phase_gate
+            & torch.isfinite(future_centres).all(dim=(-1, -2))
+            & torch.isfinite(horizon).all(dim=-1)
+        )
         return CausalFootSupportProjection(
             future_centres_body=future_centres,
             support_horizon_s=horizon,
+            finite_gate=finite_gate,
         )
+
+    def _validate_inputs(
+        self,
+        current_foot_centres_body: torch.Tensor,
+        commanded_planar_twist_body: torch.Tensor,
+        gait_phase_sin_cos: torch.Tensor,
+        *,
+        validate_values: bool,
+    ) -> None:
+        """Validate static structure and optionally synchronize value checks."""
+        if current_foot_centres_body.ndim != 3 or tuple(
+            current_foot_centres_body.shape[1:]
+        ) != (2, 3):
+            raise ValueError("current_foot_centres_body must have shape [B,2,3].")
+        batch_size = current_foot_centres_body.shape[0]
+        if commanded_planar_twist_body.shape != (batch_size, 3):
+            raise ValueError("commanded_planar_twist_body must have shape [B,3].")
+        if gait_phase_sin_cos.shape != (batch_size, 2):
+            raise ValueError("gait_phase_sin_cos must have shape [B,2].")
+        values = (
+            current_foot_centres_body,
+            commanded_planar_twist_body,
+            gait_phase_sin_cos,
+        )
+        if len({value.device for value in values}) != 1:
+            raise ValueError("All support-projector inputs must share one device.")
+        if current_foot_centres_body.device != self.phase_anchors_rad.device:
+            raise ValueError("Projector inputs and parameters must share one device.")
+        if any(not value.dtype.is_floating_point for value in values):
+            raise TypeError("All support-projector inputs must be floating point.")
+        if not validate_values:
+            return
+        if any(not bool(torch.isfinite(value).all()) for value in values):
+            raise ValueError("All support-projector inputs must be finite.")
+        phase_norm = torch.linalg.vector_norm(gait_phase_sin_cos, dim=-1)
+        if bool((phase_norm < 1.0e-6).any()):
+            raise ValueError("gait_phase_sin_cos must encode a nonzero phase vector.")
 
 
 __all__ = [

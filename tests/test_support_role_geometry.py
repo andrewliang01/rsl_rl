@@ -1,4 +1,6 @@
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
+from typing import Any
 
 import pytest
 
@@ -6,6 +8,21 @@ from rsl_rl.modules import (
     CalibratedSphericalSupportRoleGeometry,
     SharedUniqueSupportActorAdapter,
 )
+
+
+class _RejectLocalScalarMode(TorchDispatchMode):
+    """Reject implicit tensor-to-Python scalar extraction in a fast path."""
+
+    def __torch_dispatch__(
+        self,
+        func: Any,
+        _types: tuple[type, ...],
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        if func == torch.ops.aten._local_scalar_dense.default:
+            raise AssertionError("Tensor-to-host scalar extraction detected")
+        return func(*args, **({} if kwargs is None else kwargs))
 
 
 def _geometry() -> CalibratedSphericalSupportRoleGeometry:
@@ -72,6 +89,7 @@ def test_four_physical_support_roles_and_actor_wiring() -> None:
     assert batch.terrain_values.shape == (1, 4, 5)
     assert torch.equal(batch.role_eligibility[0], torch.eye(4, dtype=torch.bool))
     assert batch.candidate_mask.all()
+    assert batch.finite_gate.all()
     assert torch.equal(batch.body_points[0], torch.cat((current[0], landing[0]))[[0, 2, 1, 3]])
 
     actor = SharedUniqueSupportActorAdapter(
@@ -204,6 +222,62 @@ def test_packet_age_is_effective_age_when_raycaster_has_no_return_time() -> None
     assert torch.allclose(batch.score_features[..., 8], torch.full((1, 4), 0.1))
     assert torch.allclose(batch.terrain_values[..., 4], torch.full((1, 4), 0.1))
     assert torch.equal(batch.age_stratum, torch.full((1, 4), 2))
+
+
+def test_native_training_geometry_has_no_host_scalar_and_matches_audit() -> None:
+    """Match audited geometry while rejecting host scalar extraction."""
+    geometry = _geometry()
+    current, landing = _centres()
+    rotation, translation = _transforms()
+    inputs = (
+        torch.ones(1, 1, 1, 4),
+        torch.ones(1, 1, 1, 4, dtype=torch.bool),
+        torch.zeros(1, 1, 1, 4),
+        torch.zeros(1, 1),
+        rotation,
+        translation,
+        current,
+        landing,
+    )
+    audited = geometry(*inputs)
+    with _RejectLocalScalarMode():
+        fast = geometry.forward_native_training(*inputs)
+
+    for name in (
+        "score_features",
+        "terrain_values",
+        "token_valid",
+        "role_eligibility",
+        "body_points",
+        "finite_gate",
+    ):
+        assert torch.equal(getattr(fast, name), getattr(audited, name)), name
+    assert fast.finite_gate.all()
+
+
+def test_native_training_geometry_reports_invalid_rows_as_tensor_gate() -> None:
+    """Flag malformed event and rotation rows without a host-side exception."""
+    geometry = _geometry()
+    current, landing = _centres()
+    rotation, translation = _transforms()
+    ranges = torch.ones(1, 1, 1, 4)
+    valid = torch.ones_like(ranges, dtype=torch.bool)
+    valid[..., -1] = False
+    rotation[..., 0, 0] = 2.0
+
+    with _RejectLocalScalarMode():
+        batch = geometry.forward_native_training(
+            ranges,
+            valid,
+            torch.zeros_like(ranges),
+            torch.zeros(1, 1),
+            rotation,
+            translation,
+            current,
+            landing,
+        )
+
+    assert torch.equal(batch.finite_gate, torch.tensor([False]))
 
 
 def test_receipt_does_not_overclaim_external_calibration_or_training() -> None:

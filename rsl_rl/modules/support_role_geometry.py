@@ -94,6 +94,7 @@ class SupportRoleGeometryBatch:
     body_points: torch.Tensor
     history_slot: torch.Tensor
     cell_index: torch.Tensor
+    finite_gate: torch.Tensor
 
     def register_matched_substitution(self) -> MatchedSubstitutionMetadata:
         """Freeze exact role/range/angle/age matching metadata by SHA-256."""
@@ -294,7 +295,65 @@ class CalibratedSphericalSupportRoleGeometry(nn.Module):
             history_body_to_current_translation,
             current_foot_centres_body,
             landing_foot_centres_body,
+            validate_values=True,
         )
+        return self._forward_impl(
+            range_history,
+            return_valid_history,
+            return_age_history,
+            packet_age,
+            history_body_to_current_rotation,
+            history_body_to_current_translation,
+            current_foot_centres_body,
+            landing_foot_centres_body,
+        )
+
+    def forward_native_training(
+        self,
+        range_history: torch.Tensor,
+        return_valid_history: torch.Tensor,
+        return_age_history: torch.Tensor,
+        packet_age: torch.Tensor,
+        history_body_to_current_rotation: torch.Tensor,
+        history_body_to_current_translation: torch.Tensor,
+        current_foot_centres_body: torch.Tensor,
+        landing_foot_centres_body: torch.Tensor,
+    ) -> SupportRoleGeometryBatch:
+        """Build geometry without tensor-to-host checks and return a tensor gate."""
+        self._validate_inputs(
+            range_history,
+            return_valid_history,
+            return_age_history,
+            packet_age,
+            history_body_to_current_rotation,
+            history_body_to_current_translation,
+            current_foot_centres_body,
+            landing_foot_centres_body,
+            validate_values=False,
+        )
+        return self._forward_impl(
+            range_history,
+            return_valid_history,
+            return_age_history,
+            packet_age,
+            history_body_to_current_rotation,
+            history_body_to_current_translation,
+            current_foot_centres_body,
+            landing_foot_centres_body,
+        )
+
+    def _forward_impl(
+        self,
+        range_history: torch.Tensor,
+        return_valid_history: torch.Tensor,
+        return_age_history: torch.Tensor,
+        packet_age: torch.Tensor,
+        history_body_to_current_rotation: torch.Tensor,
+        history_body_to_current_translation: torch.Tensor,
+        current_foot_centres_body: torch.Tensor,
+        landing_foot_centres_body: torch.Tensor,
+    ) -> SupportRoleGeometryBatch:
+        """Run the shared tensor-only geometry implementation."""
         batch_size, history_length = range_history.shape[:2]
         compute_dtype = self.body_ray_directions.dtype
         ranges = range_history.to(dtype=compute_dtype)
@@ -315,6 +374,45 @@ class CalibratedSphericalSupportRoleGeometry(nn.Module):
         age_admissible = return_age >= 0.0
         token_valid_grid = (
             return_valid_history & finite & range_admissible & age_admissible
+        )
+        valid_event_gate = (
+            ~return_valid_history
+            | (finite & range_admissible & age_admissible)
+        ).all(dim=(-1, -2, -3))
+        invalid_event_gate = (
+            return_valid_history
+            | ((ranges == 0.0) & (return_age == 0.0))
+        ).all(dim=(-1, -2, -3))
+        packet_gate = (
+            torch.isfinite(packet_age_value) & (packet_age_value >= 0.0)
+        ).all(dim=-1)
+        body_gate = (
+            torch.isfinite(history_rotation).all(dim=(-1, -2, -3))
+            & torch.isfinite(history_translation).all(dim=(-1, -2))
+            & torch.isfinite(current_centres).all(dim=(-1, -2))
+            & torch.isfinite(landing_centres).all(dim=(-1, -2))
+        )
+        rotation_identity = torch.matmul(
+            history_rotation,
+            history_rotation.transpose(-1, -2),
+        )
+        expected_identity = torch.eye(
+            3,
+            device=history_rotation.device,
+            dtype=history_rotation.dtype,
+        )
+        rotation_gate = (
+            (rotation_identity - expected_identity).abs().amax(dim=(-1, -2))
+            <= 1.0e-4
+        ).all(dim=-1) & (
+            (torch.linalg.det(history_rotation) - 1.0).abs() <= 1.0e-4
+        ).all(dim=-1)
+        finite_gate = (
+            valid_event_gate
+            & invalid_event_gate
+            & packet_gate
+            & body_gate
+            & rotation_gate
         )
         safe_ranges = torch.where(token_valid_grid, ranges, torch.zeros_like(ranges))
         acquisition_rays = self.body_ray_directions[None, None, :, :, :]
@@ -446,6 +544,7 @@ class CalibratedSphericalSupportRoleGeometry(nn.Module):
             ),
             history_slot=history_slot,
             cell_index=cell_index,
+            finite_gate=finite_gate,
         )
 
     def _validate_inputs(
@@ -458,6 +557,8 @@ class CalibratedSphericalSupportRoleGeometry(nn.Module):
         history_body_to_current_translation: torch.Tensor,
         current_foot_centres_body: torch.Tensor,
         landing_foot_centres_body: torch.Tensor,
+        *,
+        validate_values: bool,
     ) -> None:
         expected_tail = (self.height, self.width)
         if range_history.ndim != 4 or tuple(range_history.shape[-2:]) != expected_tail:
@@ -507,6 +608,22 @@ class CalibratedSphericalSupportRoleGeometry(nn.Module):
         ):
             if not value.dtype.is_floating_point:
                 raise TypeError(f"{name} must have floating-point dtype.")
+        tensors = (
+            range_history,
+            return_valid_history,
+            return_age_history,
+            packet_age,
+            history_body_to_current_rotation,
+            history_body_to_current_translation,
+            current_foot_centres_body,
+            landing_foot_centres_body,
+        )
+        if any(value.device != range_history.device for value in tensors):
+            raise ValueError("All support-role geometry inputs must share one device.")
+        if range_history.device != self.body_ray_directions.device:
+            raise ValueError("Geometry inputs and calibrated buffers must share one device.")
+        if not validate_values:
+            return
         if not bool(torch.isfinite(packet_age).all()) or bool((packet_age < 0).any()):
             raise ValueError("packet_age must be finite and non-negative.")
         if not bool(torch.isfinite(history_body_to_current_rotation).all()) or not bool(
