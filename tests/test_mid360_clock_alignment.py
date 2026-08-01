@@ -15,6 +15,7 @@ from rsl_rl.utils.mid360_clock_alignment import (
 from rsl_rl.utils.mid360_ray_time_builder import (
     MID360_TIMESTAMP_LIVOX_CUSTOM_MSG_ACTION_CLOCK,
     Mid360PointPacket,
+    Mid360RayTimeBuilderError,
     Mid360RayTimeTensorBuilder,
 )
 from rsl_rl.utils.mid360_ros_adapter import (
@@ -61,6 +62,7 @@ def _sensor_packet() -> Mid360PointPacket:
 
 
 def _builder(tmp_path: Path) -> Mid360RayTimeTensorBuilder:
+    tmp_path.mkdir(parents=True, exist_ok=True)
     checkpoint = tmp_path / "model.pt"
     checkpoint.write_bytes(b"clock-contract-checkpoint")
     manifest = _manifest(checkpoint, history_length=1, variant="Global")
@@ -107,6 +109,10 @@ def test_mapping_is_deterministic_and_builder_consumes_action_clock_packet(
     assert aligned.frame_valid.tolist() == [True]
     assert aligned.return_valid.any()
     assert aligned.return_age_s[aligned.return_valid].min() > 0.0
+
+    without_receive = replace(packet, received_time_s=None)
+    with pytest.raises(Mid360RayTimeBuilderError, match="transport-latency"):
+        _builder(tmp_path / "missing-receive").ingest_point_packet(without_receive)
 
 
 def test_mapping_rejects_extrapolation_cross_domain_and_receive_time_mix() -> None:
