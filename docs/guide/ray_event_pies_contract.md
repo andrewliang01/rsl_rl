@@ -34,6 +34,12 @@ range/age/acquisition-delta-proprio 同 winner，输出 bitwise 相等且 SHA-25
 这只证明 reducer 对同一原始事件集合的分包不变性；当前 RayCaster 接线仍处于
 `post_packet_raster`，不得借用这份证明把它标成可训练或逐回波时间。
 
+`pack_same_winner_pies_age_control_pair` 从同一个不可变 PIES raster 同时构造
+`correct_age` 与 `age_zero`。两臂的 range、return-valid、packet-age 和 frame-valid
+逐 bit 相等，winner event id 只保留在 proof sidecar，actor 唯一允许变化的是
+return-age 通道。该合同用于把“事件时间作用”与“换了 range winner”分离；它同样
+不认证实机时钟、不注册训练任务，也不是闭环结果。
+
 ## 自回波边界
 
 仿真 RayCaster 只 cast `/World/ground`，机器人自身不在 mesh 列表中。这是

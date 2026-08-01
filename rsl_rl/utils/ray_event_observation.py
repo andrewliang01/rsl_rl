@@ -13,13 +13,13 @@ values are checked by the actor and deployment receipt.
 
 from __future__ import annotations
 
-from typing import Final
-
 import numpy as np
 import torch
+from dataclasses import dataclass
+from typing import Final
 
 from .mid360_ray_time_builder import Mid360AlignedRayTimeHistory
-
+from .raw_event_pies import LatestEventRaster
 
 RAY_EVENT_CHANNELS: Final[tuple[str, ...]] = (
     "range_m",
@@ -39,6 +39,92 @@ RAY_EVENT_TEMPORAL_BASELINES: Final[tuple[str, ...]] = (
     "packet_age",
     "age_zero",
 )
+
+
+@dataclass(frozen=True)
+class SameWinnerAgeControlPair:
+    """Two actor tensors that differ only in the return-age channel.
+
+    ``winner_event_id`` is retained as a proof sidecar and is never an actor
+    input.  Constructing both arms from one immutable PIES raster prevents a
+    winner-range change from being mistaken for an event-time effect.
+    """
+
+    correct_age_observation: torch.Tensor
+    age_zero_observation: torch.Tensor
+    winner_event_id: torch.Tensor
+
+
+def pack_same_winner_pies_age_control_pair(
+    raster: LatestEventRaster,
+    *,
+    frame_valid: torch.Tensor,
+) -> SameWinnerAgeControlPair:
+    """Pack a causal PIES age arm and its exact same-winner age-zero arm.
+
+    The input must already be a one-surface PIES raster.  Packet age is fixed
+    to zero in both arms, so channel 2 (``return_age_s``) is the only actor
+    value allowed to differ.  This helper proves a paired tensor contract; it
+    does not authenticate a Livox clock, promote a Gym task, or make training
+    evidence.
+    """
+    shape = tuple(raster.range_m.shape)
+    if len(shape) != 4 or shape[1] != 1:
+        raise ValueError("PIES same-winner controls require shape [B,1,H,W].")
+    expected = shape
+    fields = (
+        raster.return_valid,
+        raster.return_age_s,
+        raster.event_id,
+    )
+    if any(tuple(field.shape) != expected for field in fields):
+        raise ValueError("PIES range, valid, age, and event id must share shape.")
+    if raster.event_id.dtype != torch.long:
+        raise ValueError("PIES winner event id must be torch.long.")
+    if any(field.device != raster.range_m.device for field in fields):
+        raise ValueError("PIES range, valid, age, and event id must share one device.")
+    if bool((raster.return_valid & (raster.event_id < 0)).any()):
+        raise ValueError("Valid PIES cells require a non-negative winner id.")
+    if bool((~raster.return_valid & (raster.event_id != -1)).any()):
+        raise ValueError("Invalid PIES cells require winner id -1.")
+    if tuple(frame_valid.shape) != shape[:2] or frame_valid.dtype != torch.bool:
+        raise ValueError("frame_valid must be boolean with shape [B,1].")
+    if frame_valid.device != raster.range_m.device:
+        raise ValueError("frame_valid and the PIES raster must share one device.")
+
+    packet_age_s = torch.zeros(
+        shape[:2],
+        dtype=raster.return_age_s.dtype,
+        device=raster.return_age_s.device,
+    )
+    correct_age = pack_ray_event_observation(
+        raster.range_m,
+        raster.return_valid,
+        raster.return_age_s,
+        packet_age_s,
+        frame_valid,
+        source="livox_per_return",
+        temporal_baseline="per_return_age",
+    )
+    age_zero = pack_ray_event_observation(
+        raster.range_m,
+        raster.return_valid,
+        raster.return_age_s,
+        packet_age_s,
+        frame_valid,
+        source="livox_per_return",
+        temporal_baseline="age_zero",
+    )
+    invariant_channels = (0, 1, 3, 4)
+    if not all(torch.equal(correct_age[:, :, channel], age_zero[:, :, channel]) for channel in invariant_channels):
+        raise RuntimeError("Same-winner PIES controls changed a non-age channel.")
+    if not bool((age_zero[:, :, 2] == 0.0).all()):
+        raise RuntimeError("PIES age-zero control leaked return age.")
+    return SameWinnerAgeControlPair(
+        correct_age_observation=correct_age,
+        age_zero_observation=age_zero,
+        winner_event_id=raster.event_id.detach().clone(),
+    )
 
 
 def pack_ray_event_observation(
@@ -241,7 +327,9 @@ __all__ = [
     "RAY_EVENT_CHANNELS",
     "RAY_EVENT_SOURCES",
     "RAY_EVENT_TEMPORAL_BASELINES",
+    "SameWinnerAgeControlPair",
     "aligned_history_to_ray_event_observation",
     "pack_acquisition_delta_proprio_observation",
     "pack_ray_event_observation",
+    "pack_same_winner_pies_age_control_pair",
 ]
