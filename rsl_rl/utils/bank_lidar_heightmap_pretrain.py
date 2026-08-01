@@ -886,6 +886,7 @@ class H0bOfflinePretrainer:
             "freeze_audit": freeze_audit,
             "autoencoder_head_in_deploy_checkpoint": False,
         }
+        bound_payload["receipt_payload_sha256"] = _canonical_json_sha256(bound_payload)
         receipt_receipt = _atomic_create_json(receipt_path, bound_payload)
         return {
             "checkpoint": checkpoint_receipt,

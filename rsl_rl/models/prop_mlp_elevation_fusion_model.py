@@ -16,6 +16,7 @@ from tensordict import TensorDict
 from rsl_rl.modules import MLP, EmpiricalNormalization, HiddenState
 from rsl_rl.modules.ame2_encoder import AME2Encoder
 from rsl_rl.modules.bank_lidar_heightmap import (
+    load_frozen_reconstructor_artifact,
     load_frozen_reconstructor_checkpoint,
     normalize_heightmap_target_contract,
     preflight_validate_lidar_history,
@@ -120,7 +121,10 @@ class PropMLPElevationFusionModel(nn.Module):
         r2plus1d_spatial_strides: tuple[int, ...] | list[int] = (2, 2, 2),
         bank_heightmap_target_contract: dict | None = None,
         bank_downstream_heightmap_contract: dict | None = None,
-        bank_reconstructor_checkpoint: Mapping | None = None,
+        bank_reconstructor_checkpoint_path: str | None = None,
+        bank_reconstructor_checkpoint_expected_file_sha256: str | None = None,
+        bank_reconstructor_receipt_path: str | None = None,
+        _bank_reconstructor_checkpoint_for_testing: Mapping | None = None,
     ) -> None:
         """Initialize the proprio-elevation fusion model.
 
@@ -194,10 +198,16 @@ class PropMLPElevationFusionModel(nn.Module):
             bank_downstream_heightmap_contract: Independently supplied input
                 contract for the downstream height encoder. It must exactly
                 match the reconstructed target contract.
-            bank_reconstructor_checkpoint: Required strict frozen Bank
-                checkpoint for the explicit H0b-primary branch. Pretraining is
-                performed only through the independent Bank module; PropMLP
-                intentionally exposes no implicit joint-training path.
+            bank_reconstructor_checkpoint_path: Production frozen Bank
+                checkpoint path. It is accepted only as part of the complete
+                checkpoint path / expected file SHA-256 / receipt path triplet.
+            bank_reconstructor_checkpoint_expected_file_sha256: Explicit trust
+                root for the selected production checkpoint bytes.
+            bank_reconstructor_receipt_path: Independent production export
+                receipt bound to the checkpoint, target, source, and freeze audit.
+            _bank_reconstructor_checkpoint_for_testing: Internal in-memory
+                compatibility hook for unit tests. Production configuration must
+                use the three receipt-backed fields above.
         """
         super().__init__()
 
@@ -253,95 +263,76 @@ class PropMLPElevationFusionModel(nn.Module):
         self.prop_feature_dim = prop_feature_dim
         self.elevation_history_length = elevation_history_length
         self.use_prop_encoder = use_prop_encoder
-        self.ray_input_channels = (
-            5 if self.elevation_encoder_type in ray_event_encoder_types else 2
-        )
+        self.ray_input_channels = 5 if self.elevation_encoder_type in ray_event_encoder_types else 2
         self.ray_event_delta_proprio_set = ray_event_delta_proprio_set
         self.ray_event_delta_proprio_dim = int(ray_event_delta_proprio_dim)
         self.ray_event_training_ready = bool(ray_event_training_ready)
-        if (
-            self.elevation_encoder_type not in ray_event_encoder_types
-            and (
-                ray_event_time_mode is not None
-                or ray_event_time_source != "none"
-                or ray_event_delta_proprio_set is not None
-                or ray_event_delta_proprio_dim != 0
-                or ray_event_training_ready
-            )
+        if self.elevation_encoder_type not in ray_event_encoder_types and (
+            ray_event_time_mode is not None
+            or ray_event_time_source != "none"
+            or ray_event_delta_proprio_set is not None
+            or ray_event_delta_proprio_dim != 0
+            or ray_event_training_ready
         ):
-            raise ValueError(
-                "Non-event encoders reject ray-event fields."
-            )
+            raise ValueError("Non-event encoders reject ray-event fields.")
         if self.elevation_encoder_type in ray_event_encoder_types:
             if ray_event_time_mode is None:
                 raise ValueError("Ray-event encoders require ray_event_time_mode.")
             if self.ray_event_training_ready:
                 raise ValueError(
-                    "ray_event_training_ready remains false until the formal "
-                    "64-environment smoke receipt is validated."
+                    "ray_event_training_ready remains false until the formal 64-environment smoke receipt is validated."
                 )
         if self.elevation_encoder_type == "ray_event_time_delta":
-            if (
-                not isinstance(ray_event_delta_proprio_set, str)
-                or not ray_event_delta_proprio_set
-            ):
-                raise ValueError(
-                    "ray_event_time_delta requires a delta-proprio observation set."
-                )
+            if not isinstance(ray_event_delta_proprio_set, str) or not ray_event_delta_proprio_set:
+                raise ValueError("ray_event_time_delta requires a delta-proprio observation set.")
             if (
                 isinstance(ray_event_delta_proprio_dim, bool)
                 or not isinstance(ray_event_delta_proprio_dim, int)
                 or ray_event_delta_proprio_dim <= 0
             ):
-                raise ValueError(
-                    "ray_event_time_delta requires a positive integer delta dimension."
-                )
-            if (
-                ray_event_time_mode != "per_return_age"
-                or ray_event_time_source != "livox_per_return"
-            ):
-                raise ValueError(
-                    "ray_event_time_delta requires Livox per-return timing."
-                )
-        elif (
-            ray_event_delta_proprio_set is not None
-            or ray_event_delta_proprio_dim != 0
-        ):
-            raise ValueError(
-                "Only ray_event_time_delta accepts acquisition delta-proprio."
-            )
+                raise ValueError("ray_event_time_delta requires a positive integer delta dimension.")
+            if ray_event_time_mode != "per_return_age" or ray_event_time_source != "livox_per_return":
+                raise ValueError("ray_event_time_delta requires Livox per-return timing.")
+        elif ray_event_delta_proprio_set is not None or ray_event_delta_proprio_dim != 0:
+            raise ValueError("Only ray_event_time_delta accepts acquisition delta-proprio.")
         self.bank_heightmap_contract: dict | None = None
         self.bank_ray_input_contract: dict | None = None
         self.bank_heightmap_spatial_size: tuple[int, int] | None = None
         self.bank_reconstructor_loaded_frozen = False
+        self.bank_reconstructor_artifact_receipt: dict | None = None
+        production_artifact_fields = (
+            bank_reconstructor_checkpoint_path,
+            bank_reconstructor_checkpoint_expected_file_sha256,
+            bank_reconstructor_receipt_path,
+        )
+        production_artifact_field_count = sum(field is not None for field in production_artifact_fields)
         if self.elevation_encoder_type == "bank_lidar_heightmap":
-            if (
-                bank_heightmap_target_contract is None
-                or bank_downstream_heightmap_contract is None
-            ):
+            if bank_heightmap_target_contract is None or bank_downstream_heightmap_contract is None:
                 raise ValueError(
                     "bank_lidar_heightmap fails closed without both reconstructed "
                     "target and downstream heightmap contracts."
                 )
-            if bank_reconstructor_checkpoint is None:
+            if production_artifact_field_count not in (0, 3):
+                raise ValueError(
+                    "bank_lidar_heightmap production artifact requires the complete "
+                    "checkpoint path / expected file SHA-256 / receipt path triplet."
+                )
+            if production_artifact_field_count == 3 and _bank_reconstructor_checkpoint_for_testing is not None:
+                raise ValueError(
+                    "bank_lidar_heightmap rejects mixed production and internal in-memory checkpoint sources."
+                )
+            if production_artifact_field_count == 0 and _bank_reconstructor_checkpoint_for_testing is None:
                 raise ValueError(
                     "bank_lidar_heightmap requires a strict frozen reconstructor "
-                    "checkpoint; implicit joint training is forbidden."
+                    "artifact; implicit joint training and receipt-free production "
+                    "loading are forbidden."
                 )
-            reconstructed_contract = normalize_heightmap_target_contract(
-                bank_heightmap_target_contract
-            )
-            downstream_contract = normalize_heightmap_target_contract(
-                bank_downstream_heightmap_contract
-            )
+            reconstructed_contract = normalize_heightmap_target_contract(bank_heightmap_target_contract)
+            downstream_contract = normalize_heightmap_target_contract(bank_downstream_heightmap_contract)
             if reconstructed_contract != downstream_contract:
-                raise ValueError(
-                    "Bank reconstructed and downstream heightmap contracts differ."
-                )
+                raise ValueError("Bank reconstructed and downstream heightmap contracts differ.")
             if self.cnn_observation_type != "elevationmap":
-                raise ValueError(
-                    "bank_lidar_heightmap only supports elevationmap normalization."
-                )
+                raise ValueError("bank_lidar_heightmap only supports elevationmap normalization.")
             self.bank_heightmap_contract = reconstructed_contract
             self.bank_heightmap_spatial_size = (28, 20)
             self.bank_ray_input_contract = {
@@ -356,11 +347,10 @@ class PropMLPElevationFusionModel(nn.Module):
         elif (
             bank_heightmap_target_contract is not None
             or bank_downstream_heightmap_contract is not None
-            or bank_reconstructor_checkpoint is not None
+            or production_artifact_field_count != 0
+            or _bank_reconstructor_checkpoint_for_testing is not None
         ):
-            raise ValueError(
-                "Bank heightmap fields are only accepted by bank_lidar_heightmap."
-            )
+            raise ValueError("Bank heightmap fields are only accepted by bank_lidar_heightmap.")
         self._cnn_use_single_frame = cnn_history_index is not None
         self._cnn_history_index = 0
         if self._cnn_use_single_frame:
@@ -388,13 +378,9 @@ class PropMLPElevationFusionModel(nn.Module):
             obs_groups,
             obs_set,
             self.elevation_set,
-            expected_perception_ndim=(
-                5 if self.elevation_encoder_type in ray_encoder_types else 4
-            ),
+            expected_perception_ndim=(5 if self.elevation_encoder_type in ray_encoder_types else 4),
             additional_perception_sets=(
-                (ray_event_delta_proprio_set,)
-                if self.elevation_encoder_type == "ray_event_time_delta"
-                else ()
+                (ray_event_delta_proprio_set,) if self.elevation_encoder_type == "ray_event_time_delta" else ()
             ),
         )
 
@@ -462,8 +448,7 @@ class PropMLPElevationFusionModel(nn.Module):
         elif self.elevation_encoder_type == "ame2":
             if self.cnn_observation_type != "elevationmap":
                 raise ValueError(
-                    "The AME2 encoder only supports cnn_observation_type='elevationmap', "
-                    f"got '{cnn_observation_type}'."
+                    f"The AME2 encoder only supports cnn_observation_type='elevationmap', got '{cnn_observation_type}'."
                 )
             elevation_shape = obs[elevation_set].shape
             if elevation_shape[1] != elevation_history_length:
@@ -506,23 +491,28 @@ class PropMLPElevationFusionModel(nn.Module):
                     f"got {tuple(ray_shape)}."
                 )
             if self.vision_spatial_size != (16, 96):
-                raise ValueError(
-                    "bank_lidar_heightmap input spatial size must be (16,96)."
+                raise ValueError("bank_lidar_heightmap input spatial size must be (16,96).")
+            if production_artifact_field_count == 3:
+                assert bank_reconstructor_checkpoint_path is not None
+                assert bank_reconstructor_checkpoint_expected_file_sha256 is not None
+                assert bank_reconstructor_receipt_path is not None
+                (
+                    self.heightmap_reconstructor,
+                    self.bank_reconstructor_artifact_receipt,
+                ) = load_frozen_reconstructor_artifact(
+                    bank_reconstructor_checkpoint_path,
+                    expected_file_sha256=(bank_reconstructor_checkpoint_expected_file_sha256),
+                    receipt_path=bank_reconstructor_receipt_path,
                 )
-            self.heightmap_reconstructor = (
-                load_frozen_reconstructor_checkpoint(
-                    bank_reconstructor_checkpoint
+            else:
+                self.heightmap_reconstructor = load_frozen_reconstructor_checkpoint(
+                    _bank_reconstructor_checkpoint_for_testing
                 )
-            )
             if (
-                self.heightmap_reconstructor.history_length
-                != elevation_history_length
-                or self.heightmap_reconstructor.target_contract
-                != self.bank_heightmap_contract
+                self.heightmap_reconstructor.history_length != elevation_history_length
+                or self.heightmap_reconstructor.target_contract != self.bank_heightmap_contract
             ):
-                raise ValueError(
-                    "Frozen Bank reconstructor history/target contract mismatch."
-                )
+                raise ValueError("Frozen Bank reconstructor history/target contract mismatch.")
             self.bank_reconstructor_loaded_frozen = True
             self.elevation_encoder = Elevation2DCNNEncoder(
                 in_channels=1,
@@ -572,20 +562,14 @@ class PropMLPElevationFusionModel(nn.Module):
                 use_query_attention=ray_time_use_query_attention,
                 fusion_mode=ray_time_fusion_mode,
                 event_time_mode=(
-                    ray_event_time_mode
-                    if self.elevation_encoder_type in ray_event_encoder_types
-                    else None
+                    ray_event_time_mode if self.elevation_encoder_type in ray_event_encoder_types else None
                 ),
                 event_time_source=(
-                    ray_event_time_source
-                    if self.elevation_encoder_type in ray_event_encoder_types
-                    else "none"
+                    ray_event_time_source if self.elevation_encoder_type in ray_event_encoder_types else "none"
                 ),
                 event_time_scale_s=ray_event_time_scale_s,
                 acquisition_delta_proprio_dim=(
-                    ray_event_delta_proprio_dim
-                    if self.elevation_encoder_type == "ray_event_time_delta"
-                    else 0
+                    ray_event_delta_proprio_dim if self.elevation_encoder_type == "ray_event_time_delta" else 0
                 ),
             )
 
@@ -630,9 +614,7 @@ class PropMLPElevationFusionModel(nn.Module):
             elevation_features = self.elevation_encoder(elevation_obs)
         elif self.elevation_encoder_type == "bank_lidar_heightmap":
             reconstructed_height_m = self.heightmap_reconstructor(elevation_obs)
-            normalized_height = self._normalize_cnn_observation(
-                reconstructed_height_m
-            )
+            normalized_height = self._normalize_cnn_observation(reconstructed_height_m)
             elevation_features = self.elevation_encoder(normalized_height)
         elif self.elevation_encoder_type == "ray_event_time_delta":
             elevation_features = self.elevation_encoder(
@@ -740,9 +722,7 @@ class PropMLPElevationFusionModel(nn.Module):
     ) -> dict:
         """Run explicit synchronized Bank source validation outside collection."""
         if self.elevation_encoder_type != "bank_lidar_heightmap":
-            raise RuntimeError(
-                "Bank observation preflight requires bank_lidar_heightmap."
-            )
+            raise RuntimeError("Bank observation preflight requires bank_lidar_heightmap.")
         audit = preflight_validate_lidar_history(
             obs[self.elevation_set],
             history_length=self.elevation_history_length,
@@ -756,44 +736,30 @@ class PropMLPElevationFusionModel(nn.Module):
     def bank_heightmap_parameter_audit(self) -> dict:
         """Return an offline parameter/schema audit for the explicit H0b branch."""
         if self.elevation_encoder_type != "bank_lidar_heightmap":
-            raise RuntimeError(
-                "Bank parameter audit requires bank_lidar_heightmap."
-            )
+            raise RuntimeError("Bank parameter audit requires bank_lidar_heightmap.")
 
         def count(module: nn.Module, *, trainable_only: bool = False) -> int:
             return sum(
-                parameter.numel()
-                for parameter in module.parameters()
-                if not trainable_only or parameter.requires_grad
+                parameter.numel() for parameter in module.parameters() if not trainable_only or parameter.requires_grad
             )
 
         return {
-            "reconstructor_parameter_count": count(
-                self.heightmap_reconstructor
-            ),
+            "reconstructor_parameter_count": count(self.heightmap_reconstructor),
             "reconstructor_trainable_parameter_count": count(
                 self.heightmap_reconstructor,
                 trainable_only=True,
             ),
             "reconstructor_training": self.heightmap_reconstructor.training,
-            "reconstructor_loaded_frozen": (
-                self.bank_reconstructor_loaded_frozen
-            ),
+            "reconstructor_loaded_frozen": (self.bank_reconstructor_loaded_frozen),
             "primary_contract": "strict_frozen_reconstructor",
             "joint_training_authorized": False,
-            "downstream_elevation_encoder_parameter_count": count(
-                self.elevation_encoder
-            ),
+            "downstream_elevation_encoder_parameter_count": count(self.elevation_encoder),
             "total_model_parameter_count": count(self),
             "total_model_trainable_parameter_count": count(
                 self,
                 trainable_only=True,
             ),
-            "reconstructor_checkpoint_schema": (
-                reconstructor_checkpoint_schema(
-                    self.heightmap_reconstructor
-                )
-            ),
+            "reconstructor_checkpoint_schema": (reconstructor_checkpoint_schema(self.heightmap_reconstructor)),
             "heightmap_contract": dict(self.bank_heightmap_contract),
         }
 
@@ -810,10 +776,7 @@ class PropMLPElevationFusionModel(nn.Module):
         active_obs_groups = []
         obs_dim = 0
         for obs_group in obs_groups[obs_set]:
-            if (
-                obs_group == elevation_set
-                or obs_group in additional_perception_sets
-            ):
+            if obs_group == elevation_set or obs_group in additional_perception_sets:
                 continue
             if len(obs[obs_group].shape) != 2:
                 raise ValueError(
@@ -824,11 +787,7 @@ class PropMLPElevationFusionModel(nn.Module):
             obs_dim += obs[obs_group].shape[-1]
 
         if len(obs[elevation_set].shape) != expected_perception_ndim:
-            expected_layout = (
-                "[B, T, C, H, W]"
-                if expected_perception_ndim == 5
-                else "[B, T, H, W]"
-            )
+            expected_layout = "[B, T, C, H, W]" if expected_perception_ndim == 5 else "[B, T, H, W]"
             raise ValueError(
                 f"The perception branch expects a {expected_perception_ndim}D tensor "
                 f"{expected_layout}, got shape {obs[elevation_set].shape} "
@@ -853,9 +812,7 @@ class PropMLPElevationFusionModel(nn.Module):
             cnn_observation,
         )
         cnn_observation = torch.clamp(cnn_observation, self.depth_camera_near, self.depth_camera_far)
-        cnn_observation = (cnn_observation - self.depth_camera_near) / (
-            self.depth_camera_far - self.depth_camera_near
-        )
+        cnn_observation = (cnn_observation - self.depth_camera_near) / (self.depth_camera_far - self.depth_camera_near)
         return cnn_observation * 2.0 - 1.0
 
 
@@ -907,9 +864,7 @@ class _TorchPropMLPElevationFusionModel(nn.Module):
             cnn_observation,
         )
         cnn_observation = torch.clamp(cnn_observation, self.depth_camera_near, self.depth_camera_far)
-        cnn_observation = (cnn_observation - self.depth_camera_near) / (
-            self.depth_camera_far - self.depth_camera_near
-        )
+        cnn_observation = (cnn_observation - self.depth_camera_near) / (self.depth_camera_far - self.depth_camera_near)
         return cnn_observation * 2.0 - 1.0
 
     @torch.jit.export
@@ -990,9 +945,7 @@ class _TorchRayEventDeltaPropMLPElevationFusionModel(nn.Module):
         self.elevation_encoder = copy.deepcopy(model.elevation_encoder)
         self.mlp = copy.deepcopy(model.mlp)
         if model.distribution is not None:
-            self.deterministic_output = (
-                model.distribution.as_deterministic_output_module()
-            )
+            self.deterministic_output = model.distribution.as_deterministic_output_module()
         else:
             self.deterministic_output = nn.Identity()
 
@@ -1052,8 +1005,8 @@ class _OnnxPropMLPElevationFusionModel(nn.Module):
         if self.input_mode == "single":
             obs = proprio_obs
             elevation_size = self.elevation_history_length * self.vision_spatial_size[0] * self.vision_spatial_size[1]
-            proprio_obs = obs[:, :self.proprio_input_size]
-            elevation_obs = obs[:, self.proprio_input_size:self.proprio_input_size + elevation_size]
+            proprio_obs = obs[:, : self.proprio_input_size]
+            elevation_obs = obs[:, self.proprio_input_size : self.proprio_input_size + elevation_size]
             if torch.compiler.is_compiling():
                 # The Dynamo ONNX exporter preserves the symbolic batch through unflatten.
                 elevation_obs = elevation_obs.unflatten(
@@ -1101,9 +1054,7 @@ class _OnnxPropMLPElevationFusionModel(nn.Module):
             cnn_observation,
         )
         cnn_observation = torch.clamp(cnn_observation, self.depth_camera_near, self.depth_camera_far)
-        cnn_observation = (cnn_observation - self.depth_camera_near) / (
-            self.depth_camera_far - self.depth_camera_near
-        )
+        cnn_observation = (cnn_observation - self.depth_camera_near) / (self.depth_camera_far - self.depth_camera_near)
         return cnn_observation * 2.0 - 1.0
 
     def get_dummy_inputs(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1163,8 +1114,8 @@ class _OnnxAME2PropMLPElevationFusionModel(nn.Module):
         if self.input_mode == "single":
             obs = proprio_obs
             elevation_size = self.elevation_history_length * self.vision_spatial_size[0] * self.vision_spatial_size[1]
-            proprio_obs = obs[:, :self.proprio_input_size]
-            elevation_obs = obs[:, self.proprio_input_size:self.proprio_input_size + elevation_size]
+            proprio_obs = obs[:, : self.proprio_input_size]
+            elevation_obs = obs[:, self.proprio_input_size : self.proprio_input_size + elevation_size]
             if torch.compiler.is_compiling():
                 # The Dynamo ONNX exporter preserves the symbolic batch through unflatten.
                 elevation_obs = elevation_obs.unflatten(
@@ -1279,8 +1230,8 @@ class _OnnxRayTimePropMLPElevationFusionModel(nn.Module):
                 * self.vision_spatial_size[0]
                 * self.vision_spatial_size[1]
             )
-            proprio_obs = obs[:, :self.proprio_input_size]
-            ray_history = obs[:, self.proprio_input_size:self.proprio_input_size + ray_size]
+            proprio_obs = obs[:, : self.proprio_input_size]
+            ray_history = obs[:, self.proprio_input_size : self.proprio_input_size + ray_size]
             if torch.compiler.is_compiling():
                 ray_history = ray_history.unflatten(
                     1,
@@ -1364,9 +1315,7 @@ class _OnnxRayEventDeltaPropMLPElevationFusionModel(nn.Module):
         self.elevation_encoder = copy.deepcopy(model.elevation_encoder)
         self.mlp = copy.deepcopy(model.mlp)
         if model.distribution is not None:
-            self.deterministic_output = (
-                model.distribution.as_deterministic_output_module()
-            )
+            self.deterministic_output = model.distribution.as_deterministic_output_module()
         else:
             self.deterministic_output = nn.Identity()
         self.proprio_input_size = model.obs_dim
@@ -1381,14 +1330,9 @@ class _OnnxRayEventDeltaPropMLPElevationFusionModel(nn.Module):
             * self.vision_spatial_size[1]
         )
         self.delta_size = (
-            self.ray_history_length
-            * self.delta_proprio_dim
-            * self.vision_spatial_size[0]
-            * self.vision_spatial_size[1]
+            self.ray_history_length * self.delta_proprio_dim * self.vision_spatial_size[0] * self.vision_spatial_size[1]
         )
-        self.single_input_size = (
-            self.proprio_input_size + self.ray_size + self.delta_size
-        )
+        self.single_input_size = self.proprio_input_size + self.ray_size + self.delta_size
 
     def forward(
         self,
@@ -1403,16 +1347,12 @@ class _OnnxRayEventDeltaPropMLPElevationFusionModel(nn.Module):
                 and not torch.compiler.is_compiling()
                 and (obs.ndim != 2 or obs.shape[1] != self.single_input_size)
             ):
-                raise ValueError(
-                    "Single-input Ray-Event-Delta observations have the wrong shape."
-                )
+                raise ValueError("Single-input Ray-Event-Delta observations have the wrong shape.")
             proprio_obs = obs[:, : self.proprio_input_size]
             ray_start = self.proprio_input_size
             delta_start = ray_start + self.ray_size
             ray_history = obs[:, ray_start:delta_start]
-            acquisition_delta_proprio = obs[
-                :, delta_start : delta_start + self.delta_size
-            ]
+            acquisition_delta_proprio = obs[:, delta_start : delta_start + self.delta_size]
             ray_shape = (
                 self.ray_history_length,
                 self.ray_input_channels,
@@ -1427,19 +1367,12 @@ class _OnnxRayEventDeltaPropMLPElevationFusionModel(nn.Module):
             )
             if torch.compiler.is_compiling():
                 ray_history = ray_history.unflatten(1, ray_shape)
-                acquisition_delta_proprio = (
-                    acquisition_delta_proprio.unflatten(1, delta_shape)
-                )
+                acquisition_delta_proprio = acquisition_delta_proprio.unflatten(1, delta_shape)
             else:
                 ray_history = ray_history.reshape(-1, *ray_shape)
-                acquisition_delta_proprio = (
-                    acquisition_delta_proprio.reshape(-1, *delta_shape)
-                )
+                acquisition_delta_proprio = acquisition_delta_proprio.reshape(-1, *delta_shape)
         elif ray_history is None or acquisition_delta_proprio is None:
-            raise ValueError(
-                "Split Ray-Event-Delta export requires ray history and "
-                "acquisition delta-proprio."
-            )
+            raise ValueError("Split Ray-Event-Delta export requires ray history and acquisition delta-proprio.")
 
         proprio_obs = self.obs_normalizer(proprio_obs)
         proprio_features = self.prop_mlp(proprio_obs)

@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from rsl_rl.modules.bank_lidar_heightmap import (
+    load_frozen_reconstructor_artifact,
     load_frozen_reconstructor_checkpoint,
     normalize_heightmap_target_contract,
 )
@@ -323,7 +324,14 @@ def test_complete_export_is_loadable_create_only_and_has_separate_receipt(
     export = trainer.export_frozen_reconstructor(export_path, receipt_path=receipt_path)
     loaded_payload = torch.load(export_path, map_location="cpu", weights_only=True)
     restored = load_frozen_reconstructor_checkpoint(loaded_payload)
+    production_restored, production_receipt = load_frozen_reconstructor_artifact(
+        export_path,
+        expected_file_sha256=export["checkpoint"]["file_sha256"],
+        receipt_path=receipt_path,
+    )
     assert restored.history_length == 1
+    assert production_restored.history_length == 1
+    assert production_receipt == export["receipt_payload"]
     assert set(loaded_payload) == {
         "schema",
         "schema_sha256",
@@ -334,6 +342,9 @@ def test_complete_export_is_loadable_create_only_and_has_separate_receipt(
     assert export["receipt_payload"]["checkpoint_schema_sha256"] == (loaded_payload["schema_sha256"])
     assert export["receipt_payload"]["checkpoint_state_sha256"] == (loaded_payload["state_sha256"])
     assert export["receipt_payload"]["autoencoder_head_in_deploy_checkpoint"] is False
+    receipt_without_digest = dict(export["receipt_payload"])
+    receipt_digest = receipt_without_digest.pop("receipt_payload_sha256")
+    assert receipt_digest == _canonical_sha(receipt_without_digest)
     assert json.loads(receipt_path.read_text()) == export["receipt_payload"]
     with pytest.raises(FileExistsError, match="overwrite"):
         trainer.export_frozen_reconstructor(export_path, receipt_path=tmp_path / "deploy/second.json")

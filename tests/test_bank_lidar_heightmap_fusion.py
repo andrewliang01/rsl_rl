@@ -88,11 +88,7 @@ def _model(
     checkpoint: dict | None | object = _AUTO_CHECKPOINT,
 ) -> PropMLPElevationFusionModel:
     target_contract = _contract() if target_contract is None else target_contract
-    downstream_contract = (
-        copy.deepcopy(target_contract)
-        if downstream_contract is None
-        else downstream_contract
-    )
+    downstream_contract = copy.deepcopy(target_contract) if downstream_contract is None else downstream_contract
     if checkpoint is _AUTO_CHECKPOINT:
         reconstructor = BankLidarHeightmapReconstructor(
             history_length=history_length,
@@ -118,7 +114,7 @@ def _model(
         prop_hidden_dims=[64],
         bank_heightmap_target_contract=target_contract,
         bank_downstream_heightmap_contract=downstream_contract,
-        bank_reconstructor_checkpoint=checkpoint,
+        _bank_reconstructor_checkpoint_for_testing=checkpoint,
     )
 
 
@@ -238,10 +234,7 @@ def test_frozen_bank_branch_backpropagates_only_to_inputs_and_downstream(
         parameter.grad is None and not parameter.requires_grad
         for parameter in model.heightmap_reconstructor.parameters()
     )
-    assert all(
-        parameter.grad is not None
-        for parameter in model.elevation_encoder.parameters()
-    )
+    assert all(parameter.grad is not None for parameter in model.elevation_encoder.parameters())
 
 
 @pytest.mark.parametrize("history_length", [1, 5])
@@ -296,23 +289,15 @@ def test_frozen_reconstructor_checkpoint_and_parameter_audit(
     assert audit["downstream_elevation_encoder_parameter_count"] == sum(
         parameter.numel() for parameter in model.elevation_encoder.parameters()
     )
-    assert audit["total_model_parameter_count"] == sum(
-        parameter.numel() for parameter in model.parameters()
-    )
+    assert audit["total_model_parameter_count"] == sum(parameter.numel() for parameter in model.parameters())
     assert audit["reconstructor_checkpoint_schema"] == checkpoint["schema"]
     assert checkpoint["schema"]["schema_version"] == 2
     assert checkpoint["schema"]["target_contract"] == contract
     assert len(checkpoint["schema_sha256"]) == 64
 
     model(observations).sum().backward()
-    assert all(
-        parameter.grad is None
-        for parameter in model.heightmap_reconstructor.parameters()
-    )
-    assert all(
-        parameter.grad is not None
-        for parameter in model.elevation_encoder.parameters()
-    )
+    assert all(parameter.grad is None for parameter in model.heightmap_reconstructor.parameters())
+    assert all(parameter.grad is not None for parameter in model.elevation_encoder.parameters())
     model.train()
     assert model.training is True
     assert model.heightmap_reconstructor.training is False
@@ -327,9 +312,7 @@ def test_frozen_reconstructor_checkpoint_and_parameter_audit(
         )
 
     tampered_contract = copy.deepcopy(checkpoint)
-    tampered_contract["schema"]["target_contract"][
-        "target_definition"
-    ] = "tampered_definition"
+    tampered_contract["schema"]["target_contract"]["target_definition"] = "tampered_definition"
     with pytest.raises(ValueError, match="schema mismatch"):
         _model(
             observations,
@@ -363,7 +346,10 @@ def test_default_cnn_path_state_and_forward_remain_identical() -> None:
         elevation_encoder_type="cnn",
         bank_heightmap_target_contract=None,
         bank_downstream_heightmap_contract=None,
-        bank_reconstructor_checkpoint=None,
+        bank_reconstructor_checkpoint_path=None,
+        bank_reconstructor_checkpoint_expected_file_sha256=None,
+        bank_reconstructor_receipt_path=None,
+        _bank_reconstructor_checkpoint_for_testing=None,
     ).eval()
 
     assert set(default_model.state_dict()) == set(explicit_model.state_dict())
