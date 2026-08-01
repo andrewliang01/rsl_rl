@@ -31,6 +31,13 @@ _ENCODED_SPATIAL_SIZE = (2, 12)
 _GRU_HIDDEN_SIZE = 128
 _MAX_RANGE_M = 6.0
 _CHECKPOINT_SCHEMA_VERSION = 1
+_DEPLOY_VALIDATION_MODE = "trusted_no_sync"
+_SOURCE_CONTRACT = {
+    "range_channel": "range_m; ignored and zeroed where valid=0",
+    "valid_channel": "finite exact binary {0,1}",
+    "valid_range_m": "finite and in (0,6]",
+    "content_preflight": "preflight_validate_lidar_history",
+}
 
 
 def _group_count(num_channels: int, maximum: int = 8) -> int:
@@ -38,6 +45,93 @@ def _group_count(num_channels: int, maximum: int = 8) -> int:
         if num_channels % num_groups == 0:
             return num_groups
     return 1
+
+
+def _validate_history_structure(
+    ray_history: torch.Tensor,
+    *,
+    history_length: int,
+    expected_device: torch.device | None = None,
+) -> None:
+    """Validate metadata without reading or scalarizing tensor contents."""
+    if not isinstance(ray_history, torch.Tensor):
+        raise TypeError("ray_history must be a torch.Tensor.")
+    expected_tail = (history_length, 2, *_INPUT_SPATIAL_SIZE)
+    if ray_history.ndim != 5 or tuple(ray_history.shape[1:]) != expected_tail:
+        raise ValueError(
+            "LiDAR history must have exact shape "
+            f"[B,{history_length},2,16,96]."
+        )
+    if ray_history.dtype not in (torch.float16, torch.float32):
+        raise TypeError("LiDAR history dtype must be torch.float16 or torch.float32.")
+    if ray_history.shape[0] <= 0:
+        raise ValueError("LiDAR history batch dimension must be non-empty.")
+    if expected_device is not None and ray_history.device != expected_device:
+        raise ValueError(
+            "LiDAR history and reconstructor parameters must share one device."
+        )
+
+
+def preflight_validate_lidar_history(
+    ray_history: torch.Tensor,
+    *,
+    history_length: int,
+) -> dict[str, Any]:
+    """Synchronously validate the trusted source contract before actor use.
+
+    This explicit preflight is content-strict and may synchronize an accelerator.
+    It must be run outside collection/deploy forward loops.
+    """
+    if history_length not in (1, 5):
+        raise ValueError("history_length must be exactly 1 or 5.")
+    _validate_history_structure(
+        ray_history,
+        history_length=history_length,
+    )
+    value = ray_history.to(dtype=torch.float32)
+    range_m = value[:, :, 0]
+    valid_value = value[:, :, 1]
+    if not bool(torch.isfinite(valid_value).all()):
+        raise ValueError("LiDAR valid channel must be finite.")
+    if not bool(((valid_value == 0.0) | (valid_value == 1.0)).all()):
+        raise ValueError("LiDAR valid channel must be exactly binary.")
+    valid = valid_value == 1.0
+    bad_valid_range = valid & (
+        ~torch.isfinite(range_m)
+        | (range_m <= 0.0)
+        | (range_m > _MAX_RANGE_M)
+    )
+    if bool(bad_valid_range.any()):
+        raise ValueError(
+            "Every valid LiDAR return must be finite and in (0, 6] metres."
+        )
+    valid_return_count = int(valid.sum().item())
+    unknown = ~valid
+    unknown_nonfinite_count = int(
+        (unknown & ~torch.isfinite(range_m)).sum().item()
+    )
+    valid_ranges = range_m[valid]
+    return {
+        "validation_mode": "strict_content_preflight_sync",
+        "deploy_validation_mode": _DEPLOY_VALIDATION_MODE,
+        "source_contract": dict(_SOURCE_CONTRACT),
+        "shape": list(ray_history.shape),
+        "dtype": str(ray_history.dtype),
+        "device": str(ray_history.device),
+        "valid_return_count": valid_return_count,
+        "unknown_count": int(unknown.sum().item()),
+        "unknown_nonfinite_range_count": unknown_nonfinite_count,
+        "valid_range_min_m": (
+            float(valid_ranges.amin().item())
+            if valid_return_count > 0
+            else None
+        ),
+        "valid_range_max_m": (
+            float(valid_ranges.amax().item())
+            if valid_return_count > 0
+            else None
+        ),
+    }
 
 
 class _CircularFrameBlock(nn.Module):
@@ -214,39 +308,25 @@ class BankLidarHeightmapReconstructor(nn.Module):
         )
         self.heightmap_decoder = _HeightmapDecoder()
 
-    @staticmethod
-    def _sanitize(ray_history: torch.Tensor, history_length: int) -> torch.Tensor:
-        if not isinstance(ray_history, torch.Tensor):
-            raise TypeError("ray_history must be a torch.Tensor.")
-        expected_tail = (history_length, 2, *_INPUT_SPATIAL_SIZE)
-        if ray_history.ndim != 5 or tuple(ray_history.shape[1:]) != expected_tail:
-            raise ValueError(
-                "LiDAR history must have exact shape "
-                f"[B,{history_length},2,16,96]."
-            )
-        if ray_history.dtype not in (torch.float16, torch.float32):
-            raise TypeError("LiDAR history dtype must be torch.float16 or torch.float32.")
-        if ray_history.shape[0] <= 0:
-            raise ValueError("LiDAR history batch dimension must be non-empty.")
-
+    def _trusted_no_sync_sanitize(
+        self,
+        ray_history: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply the frozen upstream mask contract without content syncs."""
+        encoder_weight = self.frame_encoder.blocks[0].conv.conv.weight
+        if encoder_weight.dtype != torch.float32:
+            raise RuntimeError("Reconstructor parameters must remain torch.float32.")
+        _validate_history_structure(
+            ray_history,
+            history_length=self.history_length,
+            expected_device=encoder_weight.device,
+        )
         value = ray_history.to(dtype=torch.float32)
         range_m = value[:, :, 0]
         valid_value = value[:, :, 1]
-        if not bool(torch.isfinite(valid_value).all()):
-            raise ValueError("LiDAR valid channel must be finite.")
-        if not bool(((valid_value == 0.0) | (valid_value == 1.0)).all()):
-            raise ValueError("LiDAR valid channel must be exactly binary.")
+        # Preflight owns content validation. The actor hot path trusts the
+        # frozen binary-mask source contract and performs tensor operations only.
         valid = valid_value == 1.0
-        bad_valid_range = valid & (
-            ~torch.isfinite(range_m)
-            | (range_m <= 0.0)
-            | (range_m > _MAX_RANGE_M)
-        )
-        if bool(bad_valid_range.any()):
-            raise ValueError(
-                "Every valid LiDAR return must be finite and in (0, 6] metres."
-            )
-        # Unknown range bytes are frozen to zero before any learned operation.
         safe_range_m = torch.where(valid, range_m, torch.zeros_like(range_m))
         return torch.stack(
             (safe_range_m / _MAX_RANGE_M, valid.to(torch.float32)),
@@ -254,7 +334,7 @@ class BankLidarHeightmapReconstructor(nn.Module):
         )
 
     def encode_frame_history(self, ray_history: torch.Tensor) -> torch.Tensor:
-        sanitized = self._sanitize(ray_history, self.history_length)
+        sanitized = self._trusted_no_sync_sanitize(ray_history)
         batch_size = sanitized.shape[0]
         encoded = self.frame_encoder(sanitized.flatten(0, 1))
         return encoded.reshape(
@@ -284,6 +364,7 @@ def _validate_masked_loss_inputs(
     *,
     expected_tail: tuple[int, ...],
 ) -> torch.Tensor:
+    """Strict synchronous validation for offline supervised losses only."""
     if (
         not isinstance(prediction, torch.Tensor)
         or not isinstance(target, torch.Tensor)
@@ -318,7 +399,7 @@ def valid_masked_range_mse(
     target_range_m: torch.Tensor,
     target_valid: torch.Tensor,
 ) -> torch.Tensor:
-    """Range reconstruction MSE over valid target returns only."""
+    """Offline range reconstruction MSE over valid target returns only."""
     if not isinstance(predicted_range_m, torch.Tensor):
         raise TypeError("predicted_range_m must be a tensor.")
     if predicted_range_m.ndim != 4:
@@ -338,7 +419,7 @@ def spherical_valid_bce(
     valid_logits: torch.Tensor,
     target_valid: torch.Tensor,
 ) -> torch.Tensor:
-    """Dense binary-validity reconstruction loss over every spherical cell."""
+    """Offline binary-validity reconstruction loss over every spherical cell."""
     if not isinstance(valid_logits, torch.Tensor) or not isinstance(
         target_valid, torch.Tensor
     ):
@@ -369,7 +450,7 @@ def supervised_height_valid_mse(
     target_height_m: torch.Tensor,
     target_valid: torch.Tensor,
 ) -> torch.Tensor:
-    """Supervised local-height MSE over valid target map cells only."""
+    """Offline supervised height MSE over valid target map cells only."""
     return _validate_masked_loss_inputs(
         predicted_height_m,
         target_height_m,
@@ -412,6 +493,10 @@ def reconstructor_checkpoint_schema(
         "output_tail": [1, *_OUTPUT_SPATIAL_SIZE],
         "accepted_input_dtypes": ["torch.float16", "torch.float32"],
         "internal_dtype": "torch.float32",
+        "deploy_validation_mode": _DEPLOY_VALIDATION_MODE,
+        "source_contract": dict(_SOURCE_CONTRACT),
+        "strict_preflight_helper": "preflight_validate_lidar_history",
+        "offline_losses_in_deploy_forward": False,
         "max_range_m": _MAX_RANGE_M,
         "frame_channels": list(_FRAME_CHANNELS),
         "encoded_spatial_size": list(_ENCODED_SPATIAL_SIZE),
@@ -524,6 +609,7 @@ __all__ = [
     "create_frozen_reconstructor_checkpoint",
     "freeze_reconstructor",
     "load_frozen_reconstructor_checkpoint",
+    "preflight_validate_lidar_history",
     "reconstructor_checkpoint_schema",
     "spherical_valid_bce",
     "supervised_height_valid_mse",

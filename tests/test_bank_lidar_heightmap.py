@@ -18,6 +18,7 @@ from rsl_rl.modules.bank_lidar_heightmap import (
     create_frozen_reconstructor_checkpoint,
     freeze_reconstructor,
     load_frozen_reconstructor_checkpoint,
+    preflight_validate_lidar_history,
     reconstructor_checkpoint_schema,
     spherical_valid_bce,
     supervised_height_valid_mse,
@@ -57,6 +58,14 @@ def test_strict_input_and_output_contract(
     assert schema["input_tail"] == [history_length, 2, 16, 96]
     assert schema["output_tail"] == [1, 28, 20]
     assert schema["internal_dtype"] == "torch.float32"
+    assert schema["deploy_validation_mode"] == "trusted_no_sync"
+    assert schema["strict_preflight_helper"] == (
+        "preflight_validate_lidar_history"
+    )
+    assert schema["source_contract"]["valid_channel"] == (
+        "finite exact binary {0,1}"
+    )
+    assert schema["offline_losses_in_deploy_forward"] is False
     assert schema["deploy_inputs"] == ["ray_history"]
     assert schema["fixed_window_zero_hidden"] is True
     assert schema["persistent_recurrent_state"] is False
@@ -113,8 +122,15 @@ def test_unknown_range_is_sanitized_without_value_or_gradient_leakage() -> None:
     ] = float("inf")
 
     reference = model(reference_input)
+    preflight = preflight_validate_lidar_history(
+        changed_input,
+        history_length=5,
+    )
     changed = model(changed_input)
     torch.testing.assert_close(changed, reference, rtol=0.0, atol=0.0)
+    assert preflight["validation_mode"] == "strict_content_preflight_sync"
+    assert preflight["deploy_validation_mode"] == "trusted_no_sync"
+    assert preflight["unknown_nonfinite_range_count"] > 0
 
     reference.sum().backward()
     assert reference_input.grad is not None
@@ -126,12 +142,15 @@ def test_unknown_range_is_sanitized_without_value_or_gradient_leakage() -> None:
         valid_id[0], valid_id[1], 0, valid_id[2], valid_id[3]
     ] = float("nan")
     with pytest.raises(ValueError, match="valid LiDAR return"):
-        model(invalid_valid_range)
+        preflight_validate_lidar_history(
+            invalid_valid_range,
+            history_length=5,
+        )
 
     invalid_mask = changed_input.clone()
     invalid_mask[0, 0, 1, 0, 0] = float("nan")
     with pytest.raises(ValueError, match="valid channel must be finite"):
-        model(invalid_mask)
+        preflight_validate_lidar_history(invalid_mask, history_length=5)
 
 
 @pytest.mark.parametrize("bad_range", [0.0, -0.1, 6.1, float("inf")])
@@ -143,12 +162,43 @@ def test_valid_return_and_binary_mask_contract_fails_closed(
     history[0, 0, 1, 0, 0] = 1.0
     history[0, 0, 0, 0, 0] = bad_range
     with pytest.raises(ValueError, match="valid LiDAR return"):
-        model(history)
+        preflight_validate_lidar_history(history, history_length=1)
 
     non_binary = _history(1)
     non_binary[0, 0, 1, 0, 0] = 0.25
     with pytest.raises(ValueError, match="exactly binary"):
-        model(non_binary)
+        preflight_validate_lidar_history(non_binary, history_length=1)
+
+
+@pytest.mark.parametrize("history_length", [1, 5])
+def test_deploy_forward_never_scalarizes_or_copies_to_host(
+    history_length: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = BankLidarHeightmapReconstructor(
+        history_length=history_length
+    ).eval()
+    history = _history(history_length, dtype=torch.float16)
+    preflight_validate_lidar_history(
+        history,
+        history_length=history_length,
+    )
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError(
+            "Deploy forward attempted tensor scalarization or host copy."
+        )
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.Tensor, "__bool__", forbidden)
+        patch.setattr(torch.Tensor, "item", forbidden)
+        patch.setattr(torch.Tensor, "cpu", forbidden)
+        patch.setattr(torch.Tensor, "numpy", forbidden)
+        output = model(history)
+
+    assert output.shape == (2, 1, 28, 20)
+    assert output.dtype == torch.float32
+    assert torch.isfinite(output).all()
 
 
 def test_every_spherical_path_uses_circular_azimuth_and_wraps_seam() -> None:
