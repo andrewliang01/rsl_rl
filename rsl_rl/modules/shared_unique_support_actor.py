@@ -537,6 +537,111 @@ class SharedUniqueSupportActorAdapter(nn.Module):
         diagnostics.update(intervention_diagnostics)
         return action, value, diagnostics
 
+    def forward_native_training(
+        self,
+        score_features: torch.Tensor,
+        terrain_values: torch.Tensor,
+        proprio: torch.Tensor,
+        token_valid: torch.Tensor,
+        role_eligibility: torch.Tensor,
+        *,
+        mask_provenance: SupportMaskProvenance,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run native selected-only training without tensor-to-host audit work.
+
+        The returned boolean ``finite_gate`` has shape ``[B]``.  A production
+        runner must reject or quarantine every row for which it is false.  The
+        method deliberately omits membership SHA, causal interventions, and
+        Python exceptions based on tensor values.  GPU latency remains
+        unmeasured and no performance claim follows from this API.
+        """
+        self._validate_provenance(mask_provenance)
+        self._validate_input_structure(
+            score_features,
+            terrain_values,
+            proprio,
+            token_valid,
+            role_eligibility,
+        )
+        compute_dtype = self.query_embedding.dtype
+        score_features = score_features.to(dtype=compute_dtype)
+        terrain_values = terrain_values.to(dtype=compute_dtype)
+        proprio = proprio.to(dtype=compute_dtype)
+        input_finite = (
+            torch.isfinite(score_features).all(dim=(-1, -2))
+            & torch.isfinite(terrain_values).all(dim=(-1, -2))
+            & torch.isfinite(proprio).all(dim=-1)
+        )
+        role_contract_valid = ~(
+            role_eligibility & ~token_valid[:, None, :]
+        ).any(dim=(-1, -2))
+
+        keys = self.score_key_projection(score_features)
+        queries = self.score_query_projection(proprio).reshape(
+            proprio.shape[0], NUM_QUERIES, self.score_dim
+        )
+        scores = torch.einsum(
+            "bqd,bnd->bqn",
+            queries + self.query_embedding,
+            keys,
+        ) * self.score_scale
+        _, selector_diagnostics = self.selector(
+            scores,
+            token_valid,
+            role_eligibility,
+        )
+        indices = selector_diagnostics["selection_indices"]
+        slot_valid = selector_diagnostics["selection_slot_valid"]
+        safe_indices = torch.where(
+            slot_valid,
+            indices,
+            torch.zeros_like(indices),
+        )
+        selected_values = torch.gather(
+            terrain_values,
+            1,
+            safe_indices[:, :, None].expand(
+                -1, -1, self.terrain_value_dim
+            ),
+        )
+        selected_values = torch.where(
+            slot_valid[:, :, None],
+            selected_values,
+            torch.zeros_like(selected_values),
+        )
+        selected_role_eligibility = torch.gather(
+            role_eligibility,
+            2,
+            safe_indices[:, None, :].expand(-1, NUM_QUERIES, -1),
+        )
+        consumption_mask = (
+            selected_role_eligibility & slot_valid[:, None, :]
+        )
+        selected_embeddings = self.selected_value_projection(selected_values)
+        selected_scores = torch.gather(
+            scores,
+            2,
+            safe_indices[:, None, :].expand(-1, NUM_QUERIES, -1),
+        )
+        consumption_count = consumption_mask.sum(dim=-1, keepdim=True)
+        weights = (
+            consumption_mask.to(scores.dtype) * torch.sigmoid(selected_scores)
+        ) / consumption_count.clamp_min(1).to(scores.dtype)
+        role_values = torch.einsum(
+            "bqm,bmd->bqd", weights, selected_embeddings
+        )
+        fused = torch.cat((proprio, role_values.flatten(start_dim=1)), dim=-1)
+        action = self.action_head(self.actor_backbone(fused))
+        value = self.value_head(self.critic_backbone(fused))
+        finite_gate = (
+            input_finite
+            & role_contract_valid
+            & selector_diagnostics["valid_scores_finite"]
+            & torch.isfinite(action).all(dim=-1)
+            & torch.isfinite(value).all(dim=-1)
+        )
+        return action, value, finite_gate
+
     def _apply_intervention(
         self,
         *,
@@ -977,7 +1082,7 @@ class SharedUniqueSupportActorAdapter(nn.Module):
         # unusual serialization paths that bypassed dataclass construction.
         SupportMaskProvenance(**asdict(provenance))
 
-    def _validate_inputs(
+    def _validate_input_structure(
         self,
         score_features: torch.Tensor,
         terrain_values: torch.Tensor,
@@ -1030,7 +1135,30 @@ class SharedUniqueSupportActorAdapter(nn.Module):
             ("terrain_values", terrain_values),
             ("proprio", proprio),
         ):
-            if not tensor.is_floating_point() or not bool(torch.isfinite(tensor).all()):
+            if not tensor.is_floating_point():
+                raise ValueError(f"{name} must be floating point.")
+
+    def _validate_inputs(
+        self,
+        score_features: torch.Tensor,
+        terrain_values: torch.Tensor,
+        proprio: torch.Tensor,
+        token_valid: torch.Tensor,
+        role_eligibility: torch.Tensor,
+    ) -> None:
+        self._validate_input_structure(
+            score_features,
+            terrain_values,
+            proprio,
+            token_valid,
+            role_eligibility,
+        )
+        for name, tensor in (
+            ("score_features", score_features),
+            ("terrain_values", terrain_values),
+            ("proprio", proprio),
+        ):
+            if not bool(torch.isfinite(tensor).all()):
                 raise ValueError(f"{name} must be finite floating point.")
         if bool((role_eligibility & ~token_valid[:, None, :]).any()):
             raise ValueError("role_eligibility cannot contain invalid tokens.")
