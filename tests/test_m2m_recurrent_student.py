@@ -2,21 +2,22 @@
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
+# ruff: noqa: D103, N802
 
 from __future__ import annotations
 
 import copy
 import hashlib
+import json
+import torch
 from pathlib import Path
+from tensordict import TensorDict
 from typing import Any
 
 import pytest
-import torch
-from tensordict import TensorDict
 
 from rsl_rl.models import M2MMapFreeRecurrentStudent, PropMLPElevationFusionModel
 from rsl_rl.utils import resolve_callable, split_and_pad_trajectories
-
 
 _PROPRIO_DIM = 96
 _ACTION_DIM = 29
@@ -207,6 +208,76 @@ def test_deployment_contract_freezes_B_C_distribution_and_exports_model(tmp_path
         audit["components"][name]["trainable"] > 0
         for name in ("frame_tokenizer", "gru", "latent_head")
     )
+
+
+def test_architecture_receipt_binds_all_same_shape_semantics_without_checkpoint_path(
+    tmp_path: Path,
+) -> None:
+    obs = _observations()
+    checkpoint, digest = _checkpoint(tmp_path)
+    actor_cfg = _actor_cfg()
+    model = M2MMapFreeRecurrentStudent(
+        obs,
+        {"actor": ["policy", _STRICT_SET]},
+        "actor",
+        _ACTION_DIM,
+        strict_frame_set=_STRICT_SET,
+        proprio_sets=["policy"],
+        frozen_ecmm_checkpoint_path=str(checkpoint),
+        frozen_ecmm_expected_sha256=digest,
+        frozen_ecmm_actor_cfg=actor_cfg,
+        frame_near_range_m=0.1,
+        frame_far_range_m=6.0,
+        frame_message_period_s=0.1,
+        frame_max_age_s=0.5,
+        tokenizer_hidden_channels=[4, 8],
+        tokenizer_dim=24,
+        tokenizer_pooled_spatial_size=(2, 4),
+        temporal_mode="gru",
+        gru_hidden_dim=20,
+        gru_num_layers=1,
+        latent_hidden_dim=24,
+    )
+
+    receipt = model.architecture_receipt()
+    assert receipt["actor_interface"]["ordered_groups"] == ["policy", _STRICT_SET]
+    assert receipt["actor_interface"]["proprio_group_dims"] == {"policy": 96}
+    assert receipt["strict_frame"] == {
+        "shape_without_batch": [1, 4, 16, 96],
+        "channels": ["range_m", "valid", "message_age_s", "new_frame"],
+        "near_range_m": 0.1,
+        "far_range_m": 6.0,
+        "message_period_s": 0.1,
+        "max_age_s": 0.5,
+        "accepted_storage_dtypes": ["float16", "bfloat16", "float32"],
+        "compute_dtype": "float32",
+    }
+    assert receipt["tokenizer"]["hidden_channels"] == [4, 8]
+    assert receipt["tokenizer"]["token_dim"] == 24
+    assert receipt["tokenizer"]["pooled_spatial_size"] == [2, 4]
+    assert receipt["temporal"] == {
+        "mode": "gru",
+        "input_dim": 88,
+        "gru_hidden_dim": 20,
+        "gru_num_layers": 1,
+        "latent_hidden_dim": 24,
+        "proprio_feature_in_temporal_input": True,
+    }
+    assert receipt["frozen_ecmm_actor_cfg"]["activation"] == "elu"
+    assert receipt["frozen_ecmm_actor_cfg"]["distribution_cfg"]["class_name"] == (
+        "GaussianDistribution"
+    )
+    assert receipt["frozen_ecmm_actor_cfg"]["ray_time_vertical_fov_degrees"] == [-52.0, 7.0]
+    assert not [
+        key
+        for key in receipt["frozen_ecmm_actor_cfg"]
+        if "path" in key.lower()
+    ]
+    assert receipt["artifact_binding"]["checkpoint_path_embedded"] is False
+    assert str(checkpoint.resolve()) not in json.dumps(receipt, sort_keys=True, allow_nan=False)
+
+    receipt["strict_frame"]["near_range_m"] = 999.0
+    assert model.architecture_receipt()["strict_frame"]["near_range_m"] == 0.1
 
 
 def test_forward_uses_predicted_A_with_exact_frozen_B_C_and_runner_distribution_api(tmp_path: Path) -> None:

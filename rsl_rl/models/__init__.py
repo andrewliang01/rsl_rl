@@ -16,6 +16,7 @@ from .m2m_observed_history_formal_teacher import (
 from .m2m_observed_history_teacher import M2MObservedHistoryProxyTeacher, ObservedHistoryMapContract
 from .m2m_recurrent_student import M2MMapFreeRecurrentStudent, M2MStrictFrameTokenizer
 from .m2m_sequence_compatible_critic import M2MSequenceCompatibleCritic
+from .m2m_student_only import M2MStudentOnlyPolicy, normalize_m2m_student_network_config
 from .rnn_model import RNNModel
 from .prop_mlp_elevation_fusion_model import PropMLPElevationFusionModel
 from .shared_prop_mlp_elevation_multi_head_critic import SharedPropMLPElevationMultiHeadCritic
@@ -33,6 +34,8 @@ __all__ = [
     "M2MMapFreeRecurrentStudent",
     "M2MStrictFrameTokenizer",
     "M2MSequenceCompatibleCritic",
+    "M2MStudentOnlyPolicy",
+    "normalize_m2m_student_network_config",
     "RNNModel",
     "PropMLPElevationFusionModel",
     "SharedPropMLPElevationMultiHeadCritic",

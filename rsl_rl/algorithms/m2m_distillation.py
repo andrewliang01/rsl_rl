@@ -18,13 +18,12 @@ import copy
 import json
 import math
 import re
-from collections.abc import Mapping
-from dataclasses import dataclass
-from typing import Any
-
 import torch
 import torch.nn as nn
+from collections.abc import Mapping
+from dataclasses import dataclass
 from tensordict import TensorDict
+from typing import Any
 
 from rsl_rl.algorithms.m2m_distillation_loss import (
     M2MDistillationLossConfig,
@@ -32,7 +31,6 @@ from rsl_rl.algorithms.m2m_distillation_loss import (
 )
 from rsl_rl.storage import M2MSequenceBatch, M2MSequenceRolloutStorage, M2MSequenceTransition
 from rsl_rl.utils import resolve_optimizer
-
 
 _CHECKPOINT_SCHEMA = "m2m_latent_action_distillation_v1"
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -103,6 +101,7 @@ class M2MLatentActionDistillation:
         symmetry_cfg: None = None,
         multi_gpu_cfg: dict[str, Any] | None = None,
     ) -> None:
+        """Initialize the strict sequence-distillation training core."""
         if not isinstance(student, nn.Module) or not isinstance(teacher, nn.Module):
             raise TypeError("student and teacher must be torch modules.")
         if not isinstance(storage, M2MSequenceRolloutStorage):
@@ -128,8 +127,10 @@ class M2MLatentActionDistillation:
             raise NotImplementedError("C11 distributed gradient synchronization is not implemented or claimed.")
 
         self.device = torch.device(device)
-        self.student = student.to(self.device)
-        self.teacher = teacher.to(self.device)
+        # Runtime interface checks below are stricter than nn.Module's static
+        # surface; keep dynamic runner-compatible actor methods type-visible.
+        self.student: Any = student.to(self.device)
+        self.teacher: Any = teacher.to(self.device)
         self.storage = storage
         if self.storage.device != self.device:
             raise ValueError(
@@ -150,13 +151,15 @@ class M2MLatentActionDistillation:
         self.optimizer_name = optimizer
 
         self._validate_student_interface()
+        self.student_architecture_receipt = self._resolve_student_architecture_receipt()
         # A C06 formal teacher becomes immutable for C11.  A shared ECMM core
         # is already frozen; freezing the whole teacher also closes the map
         # encoder gradient path during student distillation.
         self.teacher.requires_grad_(False)
         self.teacher.eval()
         self._trainable_parameters = self._validate_gradient_boundary()
-        self.optimizer = resolve_optimizer(optimizer)(self._trainable_parameters, lr=learning_rate)
+        optimizer_factory: Any = resolve_optimizer(optimizer)
+        self.optimizer = optimizer_factory(self._trainable_parameters, lr=learning_rate)
         self.frozen_artifact_receipt = self._resolve_frozen_artifact_receipt(frozen_artifact_receipt)
 
         self._student_key_by_path = {
@@ -181,6 +184,7 @@ class M2MLatentActionDistillation:
             "get_hidden_state",
             "reset",
             "detach_hidden_state",
+            "architecture_receipt",
         )
         missing = [name for name in required if not callable(getattr(self.student, name, None))]
         if missing:
@@ -191,6 +195,16 @@ class M2MLatentActionDistillation:
             raise ValueError(
                 "C11 currently requires GRU-compatible C10 hidden_state_shape=(num_layers,hidden_size)."
             )
+
+    def _resolve_student_architecture_receipt(self) -> dict[str, Any]:
+        receipt = self.student.architecture_receipt()
+        if type(receipt) is not dict:
+            raise TypeError("C07 architecture_receipt() must return an exact dictionary.")
+        try:
+            json.dumps(receipt, sort_keys=True, allow_nan=False)
+        except (TypeError, ValueError) as error:
+            raise ValueError("C07 architecture receipt must be finite JSON-compatible metadata.") from error
+        return copy.deepcopy(receipt)
 
     def _validate_gradient_boundary(self) -> tuple[nn.Parameter, ...]:
         trainable_names = [name for name, value in self.student.named_parameters() if value.requires_grad]
@@ -336,6 +350,8 @@ class M2MLatentActionDistillation:
             raise RuntimeError("act() called twice without process_env_step(); pending transition would be lost.")
         student_observations = self._student_observation_subset(obs)
         reference = next(iter(student_observations.values()))
+        if not isinstance(reference, torch.Tensor):
+            raise TypeError("C11 deployment observations must have tensor leaves.")
         hidden_before = self._hidden_before_rollout(reference)
         teacher_latent, teacher_action_mean = self._teacher_labels(obs)
 
@@ -491,18 +507,22 @@ class M2MLatentActionDistillation:
         return metrics
 
     def train_mode(self) -> None:
+        """Enable student training while keeping the teacher frozen in eval mode."""
         self.student.train()
         self.teacher.eval()
 
     def eval_mode(self) -> None:
+        """Put both student and teacher into evaluation mode."""
         self.student.eval()
         self.teacher.eval()
 
     def get_policy(self) -> nn.Module:
+        """Return the deployable student policy used by the runner."""
         return self.student
 
     @property
     def trainable_parameter_names(self) -> tuple[str, ...]:
+        """Return the exact C11 gradient whitelist in module traversal order."""
         return tuple(name for name, value in self.student.named_parameters() if value.requires_grad)
 
     def _configuration_receipt(self) -> dict[str, Any]:
@@ -532,6 +552,7 @@ class M2MLatentActionDistillation:
                 "trainable_parameter_names": list(self.trainable_parameter_names),
                 "allowed_observation_keys": list(self.storage.allowed_student_keys),
                 "hidden_state_shape": list(self.storage.hidden_state_shape),
+                "architecture_receipt": copy.deepcopy(self.student_architecture_receipt),
             },
             "storage": {
                 "class": type(self.storage).__name__,
@@ -619,7 +640,8 @@ class M2MLatentActionDistillation:
         """Return the C11 gradient, storage and artifact contract."""
         return {
             "phase": "C11_m2m_latent_action_distillation_core",
-            "runner_factory_integrated": False,
+            "runner_integration_owner": "M2MDistillationRunner",
+            "algorithm_core_runner_agnostic": True,
             "configuration": self._configuration_receipt(),
             "frozen_artifact": copy.deepcopy(self.frozen_artifact_receipt),
             "gradient_boundary": {

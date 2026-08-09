@@ -22,19 +22,96 @@ the deployable action path.
 from __future__ import annotations
 
 import copy
+import inspect
+import json
 import math
-from collections.abc import Mapping, Sequence
-from typing import Any
-
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.nn.functional as F  # noqa: N812 - conventional PyTorch alias
+from collections.abc import Mapping, Sequence
+from pathlib import Path
 from tensordict import TensorDict
+from typing import Any
 
 from rsl_rl.models.m2m_frozen_ecmm import M2MFrozenECMMCore
 from rsl_rl.models.prop_mlp_elevation_fusion_model import PropMLPElevationFusionModel
 from rsl_rl.modules.distribution import Distribution
 from rsl_rl.utils import unpad_trajectories
+
+_ARCHITECTURE_RECEIPT_SCHEMA = "m2m_map_free_student_architecture_v1"
+
+
+def _json_safe_architecture_value(value: object, *, field: str) -> Any:
+    """Normalize constructor metadata without admitting paths or opaque objects."""
+    if isinstance(value, Mapping):
+        normalized: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str) or not key:
+                raise ValueError(f"{field} architecture config keys must be non-empty strings.")
+            if "path" in key.lower():
+                if item is not None:
+                    raise ValueError(f"{field}.{key} must not contain a filesystem path.")
+                # Even a null path key is deliberately absent from the receipt:
+                # C11/C13 bind architecture, while checkpoint provenance is a
+                # separate explicit path + SHA-256 receipt.
+                continue
+            normalized[key] = _json_safe_architecture_value(item, field=f"{field}.{key}")
+        return normalized
+    if isinstance(value, (list, tuple)):
+        return [
+            _json_safe_architecture_value(item, field=f"{field}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    if type(value) is str:
+        if Path(value).is_absolute():
+            raise ValueError(f"{field} must not contain an absolute filesystem path.")
+        return value
+    if value is None or type(value) in (bool, int):
+        return value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError(f"{field} must not contain NaN or Infinity.")
+        return value
+    raise ValueError(f"{field} must contain only finite JSON-compatible architecture metadata.")
+
+
+def _resolved_frozen_actor_cfg_receipt(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Expand every actor constructor default and strip checkpoint path fields."""
+    raw = copy.deepcopy(dict(config))
+    reserved = {"obs", "obs_groups", "obs_set", "output_dim"}
+    conflicts = sorted(reserved.intersection(raw))
+    if conflicts:
+        raise ValueError(
+            "frozen_ecmm_actor_cfg cannot override constructor-owned fields: "
+            f"{conflicts}."
+        )
+
+    signature = inspect.signature(PropMLPElevationFusionModel.__init__)
+    actor_fields = {
+        name: parameter
+        for name, parameter in signature.parameters.items()
+        if name not in {"self", *reserved}
+    }
+    unexpected = sorted(set(raw).difference(actor_fields))
+    if unexpected:
+        raise ValueError(f"frozen_ecmm_actor_cfg contains unknown fields: {unexpected}.")
+
+    resolved: dict[str, Any] = {}
+    for name, parameter in actor_fields.items():
+        value = raw.get(name, parameter.default)
+        if value is inspect.Parameter.empty:
+            raise RuntimeError(f"Frozen actor constructor field {name!r} has no resolvable default.")
+        if "path" in name.lower():
+            if value is not None:
+                raise ValueError(f"frozen_ecmm_actor_cfg.{name} must not contain a filesystem path.")
+            continue
+        resolved[name] = value
+
+    receipt = _json_safe_architecture_value(resolved, field="frozen_ecmm_actor_cfg")
+    if not isinstance(receipt, dict):  # Guarded by construction above.
+        raise RuntimeError("Frozen ECMM actor architecture receipt normalization failed.")
+    json.dumps(receipt, sort_keys=True, allow_nan=False)
+    return receipt
 
 
 class _SphericalConvBlock(nn.Module):
@@ -95,6 +172,7 @@ class M2MStrictFrameTokenizer(nn.Module):
         token_dim: int = 128,
         pooled_spatial_size: tuple[int, int] = (2, 6),
     ) -> None:
+        """Construct the strict-frame circular CNN tokenizer."""
         super().__init__()
         for name, value in (
             ("near_range_m", near_range_m),
@@ -135,7 +213,8 @@ class M2MStrictFrameTokenizer(nn.Module):
         self.message_period_s = float(message_period_s)
         self.max_age_s = float(max_age_s)
         self.token_dim = token_dim
-        self.pooled_spatial_size = pooled_spatial_size
+        self.hidden_channels = channels_tuple
+        self.pooled_spatial_size = tuple(pooled_spatial_size)
 
         blocks: list[nn.Module] = []
         in_channels = len(self.channels)
@@ -199,6 +278,7 @@ class M2MStrictFrameTokenizer(nn.Module):
         return torch.cat((range_normalized, valid, age_normalized, new_frame), dim=-3)
 
     def forward(self, frame: torch.Tensor) -> torch.Tensor:
+        """Normalize and encode strict frames into fixed-width tokens."""
         normalized = self._normalize(frame)
         leading_shape = normalized.shape[:-3]
         flattened = normalized.reshape(-1, len(self.channels), *self.frame_shape[-2:])
@@ -239,6 +319,7 @@ class M2MMapFreeRecurrentStudent(nn.Module):
         gru_num_layers: int = 1,
         latent_hidden_dim: int = 128,
     ) -> None:
+        """Construct the map-free student around a verified frozen M90 core."""
         super().__init__()
         if not isinstance(obs, TensorDict):
             raise TypeError(f"obs must be a TensorDict, got {type(obs).__name__}.")
@@ -295,14 +376,8 @@ class M2MMapFreeRecurrentStudent(nn.Module):
 
         if not isinstance(frozen_ecmm_actor_cfg, Mapping):
             raise TypeError("frozen_ecmm_actor_cfg must be a mapping.")
-        actor_cfg = copy.deepcopy(dict(frozen_ecmm_actor_cfg))
-        reserved = {"obs", "obs_groups", "obs_set", "output_dim"}
-        conflicts = sorted(reserved.intersection(actor_cfg))
-        if conflicts:
-            raise ValueError(
-                "frozen_ecmm_actor_cfg cannot override constructor-owned fields: "
-                f"{conflicts}."
-            )
+        actor_cfg_receipt = _resolved_frozen_actor_cfg_receipt(frozen_ecmm_actor_cfg)
+        actor_cfg = copy.deepcopy(actor_cfg_receipt)
         elevation_set = actor_cfg.get("elevation_set", "height_scan_actor")
         if not isinstance(elevation_set, str) or not elevation_set:
             raise ValueError("Frozen actor elevation_set must be a non-empty string.")
@@ -393,7 +468,9 @@ class M2MMapFreeRecurrentStudent(nn.Module):
         )
         self.gru_hidden_dim = gru_hidden_dim
         self.gru_num_layers = gru_num_layers
+        self.latent_hidden_dim = latent_hidden_dim
         self.temporal_input_dim = temporal_input_dim
+        self._frozen_ecmm_actor_cfg_receipt = actor_cfg_receipt
         self._hidden_state: torch.Tensor | None = None
 
     @property
@@ -556,7 +633,7 @@ class M2MMapFreeRecurrentStudent(nn.Module):
             raise RuntimeError(f"Temporal input has invalid shape {tuple(temporal_input.shape)}.")
         return temporal_input, proprio_features
 
-    def predict_latent_A(
+    def predict_latent_A(  # noqa: N802 - A is the paper's named latent variable
         self,
         obs: TensorDict,
         masks: torch.Tensor | None = None,
@@ -770,21 +847,26 @@ class M2MMapFreeRecurrentStudent(nn.Module):
 
     @property
     def output_mean(self) -> torch.Tensor:
+        """Return the current action-distribution mean."""
         return self.distribution.mean
 
     @property
     def output_std(self) -> torch.Tensor:
+        """Return the current action-distribution standard deviation."""
         return self.distribution.std
 
     @property
     def output_entropy(self) -> torch.Tensor:
+        """Return the current action-distribution entropy."""
         return self.distribution.entropy
 
     @property
     def output_distribution_params(self) -> tuple[torch.Tensor, ...]:
+        """Return parameters needed by PPO distribution snapshots."""
         return self.distribution.params
 
     def get_output_log_prob(self, outputs: torch.Tensor) -> torch.Tensor:
+        """Evaluate action log probability under the current distribution."""
         return self.distribution.log_prob(outputs)
 
     def get_kl_divergence(
@@ -792,7 +874,59 @@ class M2MMapFreeRecurrentStudent(nn.Module):
         old_params: tuple[torch.Tensor, ...],
         new_params: tuple[torch.Tensor, ...],
     ) -> torch.Tensor:
+        """Return KL divergence between two saved distribution states."""
         return self.distribution.kl_divergence(old_params, new_params)
+
+    def architecture_receipt(self) -> dict[str, Any]:
+        """Return the exact path-free constructor semantics bound by C11/C13."""
+        receipt = {
+            "schema": _ARCHITECTURE_RECEIPT_SCHEMA,
+            "model_class": f"{type(self).__module__}.{type(self).__qualname__}",
+            "actor_interface": {
+                "obs_set": self.obs_set,
+                "ordered_groups": list(self.obs_groups),
+                "proprio_sets": list(self.proprio_sets),
+                "proprio_group_dims": dict(self.proprio_group_dims),
+                "proprio_dim": self.proprio_dim,
+                "strict_frame_set": self.strict_frame_set,
+                "output_dim": self.action_dim,
+                "latent_A_dim": self.latent_dim,
+            },
+            "strict_frame": {
+                "shape_without_batch": list(M2MStrictFrameTokenizer.frame_shape),
+                "channels": list(M2MStrictFrameTokenizer.channels),
+                "near_range_m": self.frame_tokenizer.near_range_m,
+                "far_range_m": self.frame_tokenizer.far_range_m,
+                "message_period_s": self.frame_tokenizer.message_period_s,
+                "max_age_s": self.frame_tokenizer.max_age_s,
+                "accepted_storage_dtypes": ["float16", "bfloat16", "float32"],
+                "compute_dtype": "float32",
+            },
+            "tokenizer": {
+                "hidden_channels": list(self.frame_tokenizer.hidden_channels),
+                "token_dim": self.frame_tokenizer.token_dim,
+                "pooled_spatial_size": list(self.frame_tokenizer.pooled_spatial_size),
+                "azimuth_padding": "circular",
+                "elevation_padding": "zero",
+            },
+            "temporal": {
+                "mode": self.temporal_mode,
+                "input_dim": self.temporal_input_dim,
+                "gru_hidden_dim": self.gru_hidden_dim,
+                "gru_num_layers": self.gru_num_layers,
+                "latent_hidden_dim": self.latent_hidden_dim,
+                "proprio_feature_in_temporal_input": True,
+            },
+            "frozen_ecmm_actor_cfg": copy.deepcopy(self._frozen_ecmm_actor_cfg_receipt),
+            "artifact_binding": {
+                "checkpoint_path_embedded": False,
+                "checkpoint_sha256_embedded": False,
+                "checkpoint_binding_owner": "C11_frozen_artifact_receipt",
+            },
+        }
+        # Keep this method safe to embed directly in torch/JSON receipts.
+        json.dumps(receipt, sort_keys=True, allow_nan=False)
+        return receipt
 
     def parameter_audit(self) -> dict[str, Any]:
         """Return a machine-readable deployment/freeze receipt."""
@@ -860,6 +994,7 @@ class M2MMapFreeRecurrentStudent(nn.Module):
                 "frozen_ecmm": counts(self.ecmm_core),
             },
             "frozen_ecmm": self.ecmm_core.parameter_audit(),
+            "architecture_receipt": self.architecture_receipt(),
         }
 
 

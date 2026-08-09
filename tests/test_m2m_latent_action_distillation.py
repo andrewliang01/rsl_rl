@@ -2,17 +2,18 @@
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
+# ruff: noqa: D103
 
 from __future__ import annotations
 
 import copy
+import torch
+import torch.nn as nn
 from collections.abc import Mapping
+from tensordict import TensorDict
 from typing import Any
 
 import pytest
-import torch
-import torch.nn as nn
-from tensordict import TensorDict
 
 from rsl_rl.algorithms import (
     M2MDistillationLossConfig,
@@ -117,6 +118,15 @@ class _DummyC07Student(nn.Module):
         del dones
         if self._hidden_state is not None:
             self._hidden_state = self._hidden_state.detach()
+
+    def architecture_receipt(self) -> dict[str, Any]:
+        return {
+            "schema": "test_c07_architecture_v1",
+            "ordered_inputs": ["policy", "strict_frame"],
+            "input_dims": {"policy": 2, "strict_frame": 3},
+            "temporal": {"mode": "gru", "hidden_dim": 6, "num_layers": 1},
+            "checkpoint_path_embedded": False,
+        }
 
     @property
     def output_std(self) -> torch.Tensor:
@@ -476,6 +486,9 @@ def test_checkpoint_roundtrip_saves_only_trainable_student_and_rejects_mismatch(
     assert payload["frozen_artifact_receipt"]["checkpoint_bytes_saved"] is False
     assert set(payload["student_trainable_state_dict"]) == set(source.trainable_parameter_names)
     assert all(not key.startswith("ecmm_core.") for key in payload["student_trainable_state_dict"])
+    assert payload["config_receipt"]["student"]["architecture_receipt"] == (
+        source.student.architecture_receipt()
+    )
 
     torch.manual_seed(99)
     restored = _algorithm(rollout_length=3)
@@ -492,6 +505,12 @@ def test_checkpoint_roundtrip_saves_only_trainable_student_and_rejects_mismatch(
     strict_label_config = _algorithm(rollout_length=3, strict_teacher_label_checks=True)
     with pytest.raises(ValueError, match="configuration receipt"):
         strict_label_config.load(copy.deepcopy(payload))
+    tampered_architecture = copy.deepcopy(payload)
+    tampered_architecture["config_receipt"]["student"]["architecture_receipt"]["temporal"][
+        "hidden_dim"
+    ] = 999
+    with pytest.raises(ValueError, match="configuration receipt"):
+        restored.load(tampered_architecture)
     wrong_artifact = _algorithm(
         rollout_length=3,
         frozen_artifact_receipt={
@@ -531,7 +550,9 @@ def test_constructor_rejects_legacy_storage_and_unexpected_trainable_core() -> N
 
 def test_audit_marks_runner_factory_boundary_and_checkpoint_exclusions() -> None:
     audit = _algorithm().audit()
-    assert audit["runner_factory_integrated"] is False
+    assert "runner_factory_integrated" not in audit
+    assert audit["runner_integration_owner"] == "M2MDistillationRunner"
+    assert audit["algorithm_core_runner_agnostic"] is True
     assert audit["rollout_storage"]["stores_teacher_map"] is False
     assert audit["rollout_storage"]["stores_next_observation"] is False
     assert audit["checkpoint"]["teacher_state_saved"] is False
