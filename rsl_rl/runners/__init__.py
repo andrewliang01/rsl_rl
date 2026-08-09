@@ -7,5 +7,13 @@
 
 from .on_policy_runner import OnPolicyRunner  # noqa: I001
 from .distillation_runner import DistillationRunner
+from .m2m_distillation_runner import M2MDistillationRunner
+from .factory import make_runner, resolve_runner_class
 
-__all__ = ["DistillationRunner", "OnPolicyRunner"]
+__all__ = [
+    "DistillationRunner",
+    "M2MDistillationRunner",
+    "OnPolicyRunner",
+    "make_runner",
+    "resolve_runner_class",
+]
