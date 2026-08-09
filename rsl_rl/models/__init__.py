@@ -10,6 +10,7 @@ from .cnn_model import CNNModel
 from .mlp_model import MLPModel
 from .m2m_frozen_ecmm import M2MFrozenECMMCore, load_frozen_m90_ecmm_core
 from .m2m_observed_history_teacher import M2MObservedHistoryProxyTeacher, ObservedHistoryMapContract
+from .m2m_recurrent_student import M2MMapFreeRecurrentStudent, M2MStrictFrameTokenizer
 from .rnn_model import RNNModel
 from .prop_mlp_elevation_fusion_model import PropMLPElevationFusionModel
 from .shared_prop_mlp_elevation_multi_head_critic import SharedPropMLPElevationMultiHeadCritic
@@ -22,6 +23,8 @@ __all__ = [
     "load_frozen_m90_ecmm_core",
     "M2MObservedHistoryProxyTeacher",
     "ObservedHistoryMapContract",
+    "M2MMapFreeRecurrentStudent",
+    "M2MStrictFrameTokenizer",
     "RNNModel",
     "PropMLPElevationFusionModel",
     "SharedPropMLPElevationMultiHeadCritic",
