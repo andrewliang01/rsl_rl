@@ -324,11 +324,18 @@ class PPO:
                 )
                 # Compute number of augmentations per sample
                 num_aug = int(batch.observations.batch_size[0] / original_batch_size)
-                # Repeat the rest of the batch
-                batch.old_actions_log_prob = batch.old_actions_log_prob.repeat(num_aug, 1)
-                batch.values = batch.values.repeat(num_aug, 1)
-                batch.advantages = batch.advantages.repeat(num_aug, 1)
-                batch.returns = batch.returns.repeat(num_aug, 1)
+                # Repeat the rest of the batch along the batch dimension.
+                # Advantages/returns may be 1D [B] after single-critic squeeze; using
+                # `.repeat(num_aug, 1)` on 1D would wrongly yield [num_aug, B].
+                def _repeat_batch_dim(tensor: torch.Tensor, n: int) -> torch.Tensor:
+                    if tensor.ndim == 1:
+                        return tensor.repeat(n)
+                    return tensor.repeat(n, *([1] * (tensor.ndim - 1)))
+
+                batch.old_actions_log_prob = _repeat_batch_dim(batch.old_actions_log_prob, num_aug)  # type: ignore
+                batch.values = _repeat_batch_dim(batch.values, num_aug)  # type: ignore
+                batch.advantages = _repeat_batch_dim(batch.advantages, num_aug)  # type: ignore
+                batch.returns = _repeat_batch_dim(batch.returns, num_aug)  # type: ignore
 
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: We need to do this because we updated the policy with the new parameters
