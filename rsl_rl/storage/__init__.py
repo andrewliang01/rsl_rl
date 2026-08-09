@@ -5,7 +5,22 @@
 
 """Storage for the learning algorithms."""
 
+from .m2m_sequence_storage import (
+    M2MSequenceBatch,
+    M2MSequenceRolloutStorage,
+    M2MSequenceTransition,
+    M2MStorageMemoryComparison,
+    M2MStorageMemoryEstimate,
+)
 from .replay_buffer import ReplayBuffer
 from .rollout_storage import RolloutStorage
 
-__all__ = ["ReplayBuffer", "RolloutStorage"]
+__all__ = [
+    "M2MSequenceBatch",
+    "M2MSequenceRolloutStorage",
+    "M2MSequenceTransition",
+    "M2MStorageMemoryComparison",
+    "M2MStorageMemoryEstimate",
+    "ReplayBuffer",
+    "RolloutStorage",
+]
