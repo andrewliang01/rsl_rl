@@ -153,6 +153,61 @@ class _RunnerStudent(nn.Module):
         }
 
 
+class _RunnerCurrentStudent(_RunnerStudent):
+    """Synthetic C07-compatible current student for the F08 C12 branch."""
+
+    is_recurrent = False
+    temporal_mode = "current"
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.gru = None
+        self.current_encoder = nn.Linear(8, self.gru_hidden_dim)
+        self._hidden_state = None
+
+    def _current_prediction(self, obs: TensorDict) -> tuple[torch.Tensor, torch.Tensor]:
+        token = self.frame_tokenizer(self._input(obs))
+        latent = self.latent_head(torch.tanh(self.current_encoder(token)))
+        return latent, self.ecmm_core.action_mean(latent)
+
+    def forward_with_latent(
+        self,
+        obs: TensorDict,
+        masks: torch.Tensor | None = None,
+        hidden_state: torch.Tensor | None = None,
+        stochastic_output: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del masks, hidden_state, stochastic_output
+        self.rollout_calls += 1
+        latent, action = self._current_prediction(obs)
+        return action, latent
+
+    def predict_latent_and_action_mean(
+        self,
+        obs: TensorDict,
+        masks: torch.Tensor | None = None,
+        hidden_state: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del masks, hidden_state
+        return self._current_prediction(obs)
+
+    def get_hidden_state(self) -> None:
+        return None
+
+    def reset(self, dones: torch.Tensor | None = None, hidden_state: torch.Tensor | None = None) -> None:
+        del dones, hidden_state
+
+    def detach_hidden_state(self, dones: torch.Tensor | None = None) -> None:
+        del dones
+
+    def architecture_receipt(self) -> dict[str, Any]:
+        receipt = super().architecture_receipt()
+        receipt["schema"] = "test_c07_runner_current_student_v1"
+        receipt["temporal_mode"] = "current"
+        receipt["recurrent_state"] = None
+        return receipt
+
+
 class _RunnerTeacher(nn.Module):
     def __init__(
         self,
@@ -356,6 +411,45 @@ def test_factory_runs_64_env_update_with_c10_storage_and_logger_contract(tmp_pat
     assert runner.alg.student.rollout_calls == 2
     assert runner.audit()["runner_factory_integrated"] is True
     assert runner.audit()["storage"]["legacy_rollout_storage"] is False
+
+
+def test_factory_runs_current_student_with_one_by_one_hidden_placeholder_and_resume(
+    tmp_path: Path,
+) -> None:
+    """F08 uses C12's native current branch, not a fake one-step GRU."""
+    config = _config(tmp_path)
+    config["student"]["class_name"] = f"{__name__}:_RunnerCurrentStudent"
+    config["storage"]["hidden_state_shape"] = [1, 1]
+    source = make_runner("M2MDistillationRunner", _RunnerEnv(), config, device="cpu")
+
+    assert source.alg.student.temporal_mode == "current"
+    assert source.alg.student.is_recurrent is False
+    assert source.alg.student.gru is None
+    assert source.alg.student.current_encoder is not None
+    assert source.alg.storage.hidden_state_shape == (1, 1)
+    assert source.alg.storage.student_hidden_states.shape == (2, 64, 1, 1)
+    assert not hasattr(source.alg.storage, "teacher_map")
+
+    source.learn(num_learning_iterations=1, init_at_random_ep_len=False)
+    assert source.alg.student.rollout_calls == 2
+    assert source.alg.num_updates == 1
+    checkpoint = tmp_path / "current-student-resume.pt"
+    source.save(str(checkpoint))
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    assert payload["config_receipt"]["student"]["is_recurrent"] is False
+    assert payload["config_receipt"]["student"]["temporal_mode"] == "current"
+    assert payload["config_receipt"]["student"]["hidden_state_shape"] == [1, 1]
+    assert "teacher_state_dict" not in payload and "teacher_map" not in payload
+
+    restored = make_runner(
+        "M2MDistillationRunner",
+        _RunnerEnv(),
+        copy.deepcopy(config),
+        device="cpu",
+    )
+    restored.load(str(checkpoint))
+    assert restored.current_learning_iteration == 1
+    assert restored.alg.num_updates == 1
 
 
 def test_runner_checkpoint_roundtrip_binds_both_artifacts_and_rejects_artifact_as_resume(
