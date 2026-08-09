@@ -56,12 +56,32 @@ class AMPLoader:
         all_body_names: Sequence[str] = (),
         preload_transitions: bool = True,
         num_preload_transitions: int = 100000,
+        motion_quat_convention: str = "xyzw",
+        expert_sampling_mode: str = "continuous",
+        expert_trajectory_sampling_mode: str = "weighted_random",
     ) -> None:
         self.device = device
         self.time_between_frames = time_between_frames
         self.preload_transitions = preload_transitions
         self.num_preload_transitions = num_preload_transitions
         self.loader_type = self._normalize_loader_type(loader_type)
+        if expert_sampling_mode not in ("continuous", "adjacent"):
+            raise ValueError(
+                "[AMPLoader] expert_sampling_mode must be 'continuous' or 'adjacent', "
+                f"got {expert_sampling_mode!r}"
+            )
+        self.expert_sampling_mode = expert_sampling_mode
+        if expert_trajectory_sampling_mode not in ("weighted_random", "round_robin"):
+            raise ValueError(
+                "[AMPLoader] expert_trajectory_sampling_mode must be 'weighted_random' or "
+                f"'round_robin', got {expert_trajectory_sampling_mode!r}"
+            )
+        if expert_trajectory_sampling_mode == "round_robin" and preload_transitions:
+            raise ValueError(
+                "[AMPLoader] round_robin trajectory sampling requires preload_transitions=False "
+                "so each minibatch can be sampled from one selected motion clip."
+            )
+        self.expert_trajectory_sampling_mode = expert_trajectory_sampling_mode
         self._amp_obs_dim = 0
 
         # Load trajectories from motion files
@@ -75,7 +95,14 @@ class AMPLoader:
         self.trajectory_num_frames = []
 
         if self.loader_type == self.BODY_KINEMATICS_LOADER_TYPE:
-            self._load_body_kinematics_npz(motion_files, body_names, anchor_name, motion_body_names, all_body_names)
+            self._load_body_kinematics_npz(
+                motion_files,
+                body_names,
+                anchor_name,
+                motion_body_names,
+                all_body_names,
+                motion_quat_convention,
+            )
         else:
             self._load_joint_ee_json(motion_files)
 
@@ -169,6 +196,7 @@ class AMPLoader:
         anchor_name: str,
         motion_body_names: Sequence[str],
         all_body_names: Sequence[str],
+        motion_quat_convention: str,
     ) -> None:
         if not body_names:
             raise ValueError("[AMPLoader] body_kinematics_npz requires non-empty body_names")
@@ -198,7 +226,7 @@ class AMPLoader:
         num_bodies = len(body_indexes)
         self._amp_obs_dim = num_bodies * (3 + 6 + 3 + 3)
 
-        for i, motion_file in enumerate(self._expand_motion_files(motion_files, (".npz",))):
+        for motion_file in self._expand_motion_files(motion_files, (".npz",)):
             data = np.load(motion_file)
             required_keys = (
                 "fps",
@@ -213,6 +241,13 @@ class AMPLoader:
 
             body_pos_w = torch.tensor(data["body_pos_w"], dtype=torch.float32, device=self.device)
             body_quat_w = torch.tensor(data["body_quat_w"], dtype=torch.float32, device=self.device)
+            if motion_quat_convention == "wxyz":
+                body_quat_w = math_utils.convert_quat(body_quat_w, to="xyzw")
+            elif motion_quat_convention != "xyzw":
+                raise ValueError(
+                    "[AMPLoader] motion_quat_convention must be 'xyzw' or 'wxyz', "
+                    f"got {motion_quat_convention!r}"
+                )
             body_lin_vel_w = torch.tensor(data["body_lin_vel_w"], dtype=torch.float32, device=self.device)
             body_ang_vel_w = torch.tensor(data["body_ang_vel_w"], dtype=torch.float32, device=self.device)
 
@@ -256,33 +291,99 @@ class AMPLoader:
                 dim=-1,
             )
 
-            self.trajectory_names.append(os.path.splitext(motion_file)[0])
-            self.trajectories.append(trajectory)
-            self.trajectories_full.append(trajectory)
-            self.trajectory_idxs.append(i)
-            self.trajectory_weights.append(1.0)
+            default_fps = float(np.asarray(data["fps"]).reshape(-1)[0])
+            if "clip_lengths" in data.files:
+                clip_lengths = np.asarray(data["clip_lengths"], dtype=np.int64).reshape(-1)
+                if clip_lengths.size == 0 or np.any(clip_lengths <= 0):
+                    raise ValueError(f"[AMPLoader] {motion_file} has invalid clip_lengths: {clip_lengths}")
+                if int(clip_lengths.sum()) != int(trajectory.shape[0]):
+                    raise ValueError(
+                        f"[AMPLoader] {motion_file} clip_lengths sum to {clip_lengths.sum()}, "
+                        f"but the concatenated arrays contain {trajectory.shape[0]} frames"
+                    )
+                clip_fps = (
+                    np.asarray(data["clip_fps"], dtype=np.float64).reshape(-1)
+                    if "clip_fps" in data.files
+                    else np.full(clip_lengths.shape, default_fps, dtype=np.float64)
+                )
+                clip_names = (
+                    np.asarray(data["clip_names"]).astype(str).reshape(-1)
+                    if "clip_names" in data.files
+                    else np.asarray([f"clip_{clip_idx:04d}" for clip_idx in range(len(clip_lengths))])
+                )
+                if len(clip_fps) != len(clip_lengths) or len(clip_names) != len(clip_lengths):
+                    raise ValueError(
+                        f"[AMPLoader] {motion_file} clip metadata lengths do not match: "
+                        f"lengths={len(clip_lengths)}, fps={len(clip_fps)}, names={len(clip_names)}"
+                    )
+            else:
+                clip_lengths = np.asarray([trajectory.shape[0]], dtype=np.int64)
+                clip_fps = np.asarray([default_fps], dtype=np.float64)
+                clip_names = np.asarray([os.path.basename(os.path.splitext(motion_file)[0])])
 
-            fps = float(np.asarray(data["fps"]).reshape(-1)[0])
-            frame_duration = 1.0 / fps
-            self.trajectory_frame_durations.append(frame_duration)
-            traj_len = max(0.0, (trajectory.shape[0] - 1) * frame_duration)
-            self.trajectory_lens.append(traj_len)
-            self.trajectory_num_frames.append(float(trajectory.shape[0]))
+            frame_start = 0
+            for clip_name, clip_length, fps in zip(clip_names, clip_lengths, clip_fps):
+                clip_name = str(clip_name)
+                frame_end = frame_start + int(clip_length)
+                clip_trajectory = trajectory[frame_start:frame_end]
+                trajectory_name = os.path.splitext(motion_file)[0]
+                if len(clip_lengths) > 1:
+                    trajectory_name = f"{trajectory_name}::{clip_name}"
 
-            print(
-                f"[AMPLoader] Loaded {traj_len:.2f}s {self.loader_type} motion "
-                f"from {motion_file} with amp_obs_dim={self._amp_obs_dim}"
-            )
+                self.trajectory_names.append(trajectory_name)
+                self.trajectories.append(clip_trajectory)
+                self.trajectories_full.append(clip_trajectory)
+                self.trajectory_idxs.append(len(self.trajectory_idxs))
+                self.trajectory_weights.append(1.0)
+
+                frame_duration = 1.0 / float(fps)
+                self.trajectory_frame_durations.append(frame_duration)
+                traj_len = max(0.0, (clip_trajectory.shape[0] - 1) * frame_duration)
+                self.trajectory_lens.append(traj_len)
+                self.trajectory_num_frames.append(float(clip_trajectory.shape[0]))
+
+                print(
+                    f"[AMPLoader] Loaded {traj_len:.2f}s {self.loader_type} motion "
+                    f"{clip_name!r} from {motion_file} with amp_obs_dim={self._amp_obs_dim}"
+                )
+                frame_start = frame_end
 
     def _preload_transitions(self) -> None:
         """Preload transitions into memory for faster sampling."""
         traj_idxs = self.weighted_traj_idx_sample_batch(self.num_preload_transitions)
-        times = self.traj_time_sample_batch(traj_idxs)
+        if self.expert_sampling_mode == "adjacent":
+            self.preloaded_s, self.preloaded_s_next = self.get_adjacent_frame_batch(traj_idxs)
+        else:
+            times = self.traj_time_sample_batch(traj_idxs)
+            self.preloaded_s = self.get_full_frame_at_time_batch(traj_idxs, times)
+            self.preloaded_s_next = self.get_full_frame_at_time_batch(
+                traj_idxs, times + self.time_between_frames
+            )
 
-        self.preloaded_s = self.get_full_frame_at_time_batch(traj_idxs, times)
-        self.preloaded_s_next = self.get_full_frame_at_time_batch(
-            traj_idxs, times + self.time_between_frames
-        )
+    def get_adjacent_frame_batch(self, traj_idxs: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample exact ``frame[i] -> frame[i + 1]`` transitions from each selected trajectory."""
+        traj_idxs = np.asarray(traj_idxs, dtype=np.int64)
+        frame_idxs = np.zeros(len(traj_idxs), dtype=np.int64)
+
+        for traj_idx in np.unique(traj_idxs):
+            traj_mask = traj_idxs == traj_idx
+            num_frames = int(self.trajectory_num_frames[traj_idx])
+            if num_frames > 1:
+                # The exclusive upper bound keeps frame + 1 inside the trajectory
+                # and avoids introducing a duplicated final-frame transition.
+                frame_idxs[traj_mask] = np.random.randint(0, num_frames - 1, size=int(traj_mask.sum()))
+
+        states = torch.zeros(len(traj_idxs), self.amp_obs_dim, device=self.device)
+        next_states = torch.zeros_like(states)
+        for traj_idx in np.unique(traj_idxs):
+            traj_mask = traj_idxs == traj_idx
+            trajectory = self.trajectories_full[int(traj_idx)]
+            current_idxs = frame_idxs[traj_mask]
+            next_idxs = np.minimum(current_idxs + 1, trajectory.shape[0] - 1)
+            states[traj_mask] = trajectory[current_idxs]
+            next_states[traj_mask] = trajectory[next_idxs]
+
+        return states, next_states
 
     def weighted_traj_idx_sample(self) -> int:
         """Sample a trajectory index based on weights."""
@@ -310,21 +411,21 @@ class AMPLoader:
 
     def get_frame_at_time(self, traj_idx: int, time: float) -> torch.Tensor:
         """Get a single frame at a specific time from a trajectory."""
-        p = float(time) / self.trajectory_lens[traj_idx]
         n = self.trajectories[traj_idx].shape[0]
-        idx_low = min(int(np.floor(p * n)), n - 1)
-        idx_high = min(int(np.ceil(p * n)), n - 1)
+        frame = np.clip(float(time) / float(self.trajectory_frame_durations[traj_idx]), 0.0, n - 1)
+        idx_low = int(np.floor(frame))
+        idx_high = min(idx_low + 1, n - 1)
         frame_start = self.trajectories[traj_idx][idx_low]
         frame_end = self.trajectories[traj_idx][idx_high]
-        blend = p * n - idx_low
+        blend = frame - idx_low
         return self.slerp(frame_start, frame_end, blend)
 
     def get_frame_at_time_batch(self, traj_idxs: np.ndarray, times: np.ndarray) -> torch.Tensor:
         """Get frames at specific times for multiple trajectories."""
-        p = times / self.trajectory_lens[traj_idxs]
-        n = self.trajectory_num_frames[traj_idxs]
-        idx_low = np.minimum(np.floor(p * n).astype(np.int64), n.astype(np.int64) - 1)
-        idx_high = np.minimum(np.ceil(p * n).astype(np.int64), n.astype(np.int64) - 1)
+        n = self.trajectory_num_frames[traj_idxs].astype(np.int64)
+        frame = np.clip(times / self.trajectory_frame_durations[traj_idxs], 0.0, n - 1)
+        idx_low = np.floor(frame).astype(np.int64)
+        idx_high = np.minimum(idx_low + 1, n - 1)
 
         all_frame_starts = torch.zeros(len(traj_idxs), self.observation_dim, device=self.device)
         all_frame_ends = torch.zeros(len(traj_idxs), self.observation_dim, device=self.device)
@@ -335,26 +436,26 @@ class AMPLoader:
             all_frame_starts[traj_mask] = trajectory[idx_low[traj_mask]]
             all_frame_ends[traj_mask] = trajectory[idx_high[traj_mask]]
 
-        blend = torch.tensor(p * n - idx_low, device=self.device, dtype=torch.float32).unsqueeze(-1)
+        blend = torch.tensor(frame - idx_low, device=self.device, dtype=torch.float32).unsqueeze(-1)
         return self.slerp(all_frame_starts, all_frame_ends, blend)
 
     def get_full_frame_at_time(self, traj_idx: int, time: float) -> torch.Tensor:
         """Get full AMP frame at a specific time."""
-        p = float(time) / self.trajectory_lens[traj_idx]
         n = self.trajectories_full[traj_idx].shape[0]
-        idx_low = min(int(np.floor(p * n)), n - 1)
-        idx_high = min(int(np.ceil(p * n)), n - 1)
+        frame = np.clip(float(time) / float(self.trajectory_frame_durations[traj_idx]), 0.0, n - 1)
+        idx_low = int(np.floor(frame))
+        idx_high = min(idx_low + 1, n - 1)
         frame_start = self.trajectories_full[traj_idx][idx_low]
         frame_end = self.trajectories_full[traj_idx][idx_high]
-        blend = p * n - idx_low
+        blend = frame - idx_low
         return self.slerp(frame_start, frame_end, blend)
 
     def get_full_frame_at_time_batch(self, traj_idxs: np.ndarray, times: np.ndarray) -> torch.Tensor:
         """Get full AMP frames at specific times for multiple trajectories."""
-        p = times / self.trajectory_lens[traj_idxs]
-        n = self.trajectory_num_frames[traj_idxs]
-        idx_low = np.minimum(np.floor(p * n).astype(np.int64), n.astype(np.int64) - 1)
-        idx_high = np.minimum(np.ceil(p * n).astype(np.int64), n.astype(np.int64) - 1)
+        n = self.trajectory_num_frames[traj_idxs].astype(np.int64)
+        frame = np.clip(times / self.trajectory_frame_durations[traj_idxs], 0.0, n - 1)
+        idx_low = np.floor(frame).astype(np.int64)
+        idx_high = np.minimum(idx_low + 1, n - 1)
 
         amp_obs_dim = self.amp_obs_dim
         all_frame_starts = torch.zeros(len(traj_idxs), amp_obs_dim, device=self.device)
@@ -366,7 +467,7 @@ class AMPLoader:
             all_frame_starts[traj_mask] = trajectory[idx_low[traj_mask]]
             all_frame_ends[traj_mask] = trajectory[idx_high[traj_mask]]
 
-        blend = torch.tensor(p * n - idx_low, device=self.device, dtype=torch.float32).unsqueeze(-1)
+        blend = torch.tensor(frame - idx_low, device=self.device, dtype=torch.float32).unsqueeze(-1)
         return self.slerp(all_frame_starts, all_frame_ends, blend)
 
     def feed_forward_generator(self, num_mini_batch: int, mini_batch_size: int):
@@ -375,16 +476,25 @@ class AMPLoader:
         Yields:
             Tuple of (state, next_state) tensors.
         """
-        for _ in range(num_mini_batch):
+        for batch_idx in range(num_mini_batch):
             if self.preload_transitions:
                 idxs = np.random.choice(self.preloaded_s.shape[0], size=mini_batch_size)
                 s = self.preloaded_s[idxs]
                 s_next = self.preloaded_s_next[idxs]
             else:
-                traj_idxs = self.weighted_traj_idx_sample_batch(mini_batch_size)
-                times = self.traj_time_sample_batch(traj_idxs)
-                s = self.get_full_frame_at_time_batch(traj_idxs, times)
-                s_next = self.get_full_frame_at_time_batch(traj_idxs, times + self.time_between_frames)
+                if self.expert_trajectory_sampling_mode == "round_robin":
+                    # Match AMP_mjlab: each discriminator expert minibatch comes
+                    # from one clip, and clips are traversed deterministically.
+                    traj_idx = self.trajectory_idxs[batch_idx % len(self.trajectory_idxs)]
+                    traj_idxs = np.full(mini_batch_size, traj_idx, dtype=np.int64)
+                else:
+                    traj_idxs = self.weighted_traj_idx_sample_batch(mini_batch_size)
+                if self.expert_sampling_mode == "adjacent":
+                    s, s_next = self.get_adjacent_frame_batch(traj_idxs)
+                else:
+                    times = self.traj_time_sample_batch(traj_idxs)
+                    s = self.get_full_frame_at_time_batch(traj_idxs, times)
+                    s_next = self.get_full_frame_at_time_batch(traj_idxs, times + self.time_between_frames)
 
             yield s, s_next
 

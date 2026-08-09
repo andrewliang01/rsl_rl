@@ -9,6 +9,7 @@ RSL-RL Documentation
    guide/overview
    guide/installation
    guide/configuration
+   guide/cteq_administrative_censor_contract
    guide/contribution
 
 .. toctree::
@@ -69,4 +70,3 @@ If you use RSL-RL in your research, please cite the `paper <https://arxiv.org/ab
      journal={arXiv preprint arXiv:2509.10771},
      year={2025}
    }
-
