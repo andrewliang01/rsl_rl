@@ -42,6 +42,10 @@ class ObservedHistoryMapContract:
     near_range_m: float
     far_range_m: float
     max_age_s: float
+    storage_backend: str = "frame_ring"
+    voxel_size_m: float | None = None
+    hash_capacity: int | None = None
+    hash_max_probes: int | None = None
 
     SOURCE: ClassVar[str] = "observed_m52_history"
     ALIGNMENT: ClassVar[str] = "gt_pose_training_only"
@@ -89,6 +93,32 @@ class ObservedHistoryMapContract:
             )
         if self.max_age_s <= 0.0:
             raise ValueError(f"max_age_s must be positive, got {self.max_age_s}.")
+        if self.storage_backend not in ("frame_ring", "voxel_hash_2p5d"):
+            raise ValueError(
+                "storage_backend must be 'frame_ring' or 'voxel_hash_2p5d', got "
+                f"{self.storage_backend!r}."
+            )
+        spatial_values = (self.voxel_size_m, self.hash_capacity, self.hash_max_probes)
+        if self.storage_backend == "frame_ring":
+            if any(value is not None for value in spatial_values):
+                raise ValueError("frame_ring contract cannot declare voxel-hash parameters.")
+        else:
+            if (
+                not isinstance(self.voxel_size_m, (int, float))
+                or not math.isfinite(float(self.voxel_size_m))
+                or self.voxel_size_m <= 0.0
+            ):
+                raise ValueError("voxel_size_m must be finite and positive for voxel_hash_2p5d.")
+            if type(self.hash_capacity) is not int or self.hash_capacity < 2:
+                raise ValueError("hash_capacity must be an integer >= 2 for voxel_hash_2p5d.")
+            if self.hash_capacity & (self.hash_capacity - 1):
+                raise ValueError("hash_capacity must be a power of two.")
+            if (
+                type(self.hash_max_probes) is not int
+                or self.hash_max_probes < 1
+                or self.hash_max_probes > self.hash_capacity
+            ):
+                raise ValueError("hash_max_probes must be in [1, hash_capacity].")
 
     def audit(self) -> dict[str, Any]:
         """Return a serializable description of the causal map contract."""

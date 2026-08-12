@@ -47,6 +47,27 @@ def _contract(**overrides: Any) -> ObservedHistoryMapContract:
     return ObservedHistoryMapContract(**values)
 
 
+def test_map_contract_binds_spatial_backend_and_keeps_legacy_default() -> None:
+    legacy = _contract()
+    assert legacy.storage_backend == "frame_ring"
+    assert legacy.audit()["voxel_size_m"] is None
+
+    spatial = _contract(
+        storage_backend="voxel_hash_2p5d",
+        voxel_size_m=0.05,
+        hash_capacity=32768,
+        hash_max_probes=8,
+    )
+    audit = spatial.audit()
+    assert audit["storage_backend"] == "voxel_hash_2p5d"
+    assert audit["voxel_size_m"] == 0.05
+    assert audit["hash_capacity"] == 32768
+    assert audit["hash_max_probes"] == 8
+
+    with pytest.raises(ValueError, match="cannot declare voxel-hash"):
+        _contract(voxel_size_m=0.05)
+
+
 def _teacher_map(
     *,
     batch_size: int = _BATCH,
