@@ -17,14 +17,15 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Mapping, Sequence
-from typing import Any
+from dataclasses import asdict, dataclass
+import math
+from typing import Any, ClassVar
 
 import torch
 import torch.nn as nn
 from tensordict import TensorDict
 
 from rsl_rl.models.m2m_observed_history_formal_teacher import M2MObservedHistoryMapEncoder
-from rsl_rl.models.m2m_observed_history_teacher import ObservedHistoryMapContract
 from rsl_rl.modules import EmpiricalNormalization, MLP
 from rsl_rl.modules.distribution import Distribution
 from rsl_rl.utils import resolve_callable, unpad_trajectories
@@ -39,6 +40,70 @@ _FORBIDDEN_INPUT_TOKENS = (
     "terrain_id",
     "height_scan",
 )
+
+
+@dataclass(frozen=True)
+class M2MScratchTeacherMapContract:
+    """Two-channel, episode-retained map contract used only by scratch F07."""
+
+    source: str
+    alignment: str
+    target_grid: str
+    uses_future_frames: bool
+    uses_privileged_terrain_mesh: bool
+    uses_synthetic_fill: bool
+    near_range_m: float
+    far_range_m: float
+    storage_backend: str
+    retention_mode: str
+    voxel_size_m: float
+    hash_capacity: int
+    hash_max_probes: int
+
+    SHAPE: ClassVar[tuple[int, int, int, int]] = (1, 2, 16, 96)
+    CHANNELS: ClassVar[tuple[str, str]] = ("range_m", "valid")
+
+    def __post_init__(self) -> None:
+        if self.source != "observed_m52_history":
+            raise ValueError("Scratch teacher source must be observed M52 history.")
+        if self.alignment != "gt_pose_training_only":
+            raise ValueError("Scratch teacher alignment must be training-only GT pose.")
+        if self.target_grid != "m90_spherical_16x96":
+            raise ValueError("Scratch teacher target grid must be m90_spherical_16x96.")
+        for name in ("uses_future_frames", "uses_privileged_terrain_mesh", "uses_synthetic_fill"):
+            if type(getattr(self, name)) is not bool:
+                raise TypeError(f"{name} must be an explicit bool.")
+            if getattr(self, name):
+                if name == "uses_future_frames":
+                    raise ValueError("Future-frame leakage is forbidden for the scratch teacher.")
+                raise ValueError(f"{name} must be false for the causal scratch teacher.")
+        if not math.isfinite(self.near_range_m) or self.near_range_m < 0.0:
+            raise ValueError("near_range_m must be finite and non-negative.")
+        if not math.isfinite(self.far_range_m) or self.far_range_m <= self.near_range_m:
+            raise ValueError("far_range_m must be finite and greater than near_range_m.")
+        if self.storage_backend != "voxel_hash_2p5d":
+            raise ValueError("Scratch F07 requires voxel_hash_2p5d storage.")
+        if self.retention_mode != "episode":
+            raise ValueError("Scratch F07 points must persist until episode reset.")
+        if not math.isfinite(self.voxel_size_m) or self.voxel_size_m <= 0.0:
+            raise ValueError("voxel_size_m must be finite and positive.")
+        if self.hash_capacity < 2 or self.hash_capacity & (self.hash_capacity - 1):
+            raise ValueError("hash_capacity must be a power of two >= 2.")
+        if not 1 <= self.hash_max_probes <= self.hash_capacity:
+            raise ValueError("hash_max_probes must be within hash capacity.")
+
+    def audit(self) -> dict[str, Any]:
+        result = asdict(self)
+        result.update(
+            {
+                "history_layout": "current_and_past_until_episode_reset",
+                "tensor_layout": "B_K_C_H_W",
+                "shape_without_batch": list(self.SHAPE),
+                "channels": list(self.CHANNELS),
+                "timestamp_visibility": "mapper_internal_only",
+            }
+        )
+        return result
 
 
 def _positive_int(name: str, value: object) -> int:
@@ -58,7 +123,7 @@ class M2MObservedHistoryScratchTeacher(nn.Module):
     latent_dim: int = 64
     proprio_dim: int = 96
     action_dim: int = 29
-    map_shape: tuple[int, int, int, int] = ObservedHistoryMapContract.SHAPE
+    map_shape: tuple[int, int, int, int] = M2MScratchTeacherMapContract.SHAPE
 
     def __init__(
         self,
@@ -69,7 +134,7 @@ class M2MObservedHistoryScratchTeacher(nn.Module):
         *,
         teacher_map_set: str,
         proprio_sets: Sequence[str],
-        map_contract: ObservedHistoryMapContract | Mapping[str, Any],
+        map_contract: M2MScratchTeacherMapContract | Mapping[str, Any],
         encoder_hidden_channels: Sequence[int] = (16, 32, 64),
         encoder_pooled_spatial_size: tuple[int, int] = (2, 6),
         encoder_mlp_hidden_dim: int = 128,
@@ -106,16 +171,16 @@ class M2MObservedHistoryScratchTeacher(nn.Module):
         map_sample = obs[teacher_map_set]
         if map_sample.dtype not in _SUPPORTED_MAP_DTYPES or tuple(map_sample.shape[1:]) != self.map_shape:
             raise ValueError(
-                f"{teacher_map_set!r} must be float [B,1,3,16,96], got "
+                f"{teacher_map_set!r} must be float [B,1,2,16,96], got "
                 f"dtype={map_sample.dtype}, shape={tuple(map_sample.shape)}."
             )
 
         if isinstance(map_contract, Mapping):
-            contract = ObservedHistoryMapContract(**copy.deepcopy(dict(map_contract)))
-        elif isinstance(map_contract, ObservedHistoryMapContract):
+            contract = M2MScratchTeacherMapContract(**copy.deepcopy(dict(map_contract)))
+        elif isinstance(map_contract, M2MScratchTeacherMapContract):
             contract = map_contract
         else:
-            raise TypeError("map_contract must be ObservedHistoryMapContract or a mapping.")
+            raise TypeError("map_contract must be M2MScratchTeacherMapContract or a mapping.")
 
         proprio_groups = tuple(proprio_sets)
         if not proprio_groups or any(not isinstance(group, str) or not group for group in proprio_groups):
@@ -175,6 +240,7 @@ class M2MObservedHistoryScratchTeacher(nn.Module):
             hidden_channels=encoder_hidden_channels,
             pooled_spatial_size=encoder_pooled_spatial_size,
             mlp_hidden_dim=encoder_mlp_hidden_dim,
+            input_channels=M2MScratchTeacherMapContract.CHANNELS,
         )
         self.obs_normalization = obs_normalization
         self.obs_normalizer: nn.Module
@@ -209,14 +275,12 @@ class M2MObservedHistoryScratchTeacher(nn.Module):
         self,
         range_m: torch.Tensor,
         valid: torch.Tensor,
-        age_s: torch.Tensor,
     ) -> None:
         valid_mask = valid == 1.0
         invalid_mask = valid == 0.0
         tolerance = float(torch.finfo(valid.dtype).eps) * max(
             1.0,
             abs(self.contract.far_range_m),
-            abs(self.contract.max_age_s),
         )
         checks = torch.stack(
             (
@@ -225,18 +289,7 @@ class M2MObservedHistoryScratchTeacher(nn.Module):
                 torch.logical_or(~valid_mask, torch.isfinite(range_m)).all(),
                 torch.logical_or(~valid_mask, range_m >= self.contract.near_range_m - tolerance).all(),
                 torch.logical_or(~valid_mask, range_m <= self.contract.far_range_m + tolerance).all(),
-                torch.isfinite(age_s).all(),
-                (age_s >= -tolerance).all(),
-                (age_s <= self.contract.max_age_s + tolerance).all(),
-                torch.logical_or(
-                    ~invalid_mask,
-                    torch.isclose(
-                        age_s,
-                        torch.full_like(age_s, self.contract.max_age_s),
-                        rtol=0.0,
-                        atol=tolerance,
-                    ),
-                ).all(),
+                torch.logical_or(~invalid_mask, torch.isfinite(range_m)).all(),
             )
         ).detach().cpu().tolist()
         messages = (
@@ -245,10 +298,7 @@ class M2MObservedHistoryScratchTeacher(nn.Module):
             "valid range must be finite",
             "valid range is below near_range_m",
             "valid range exceeds far_range_m",
-            "age must be finite",
-            "age is below zero",
-            "age exceeds max_age_s",
-            "unknown age must equal max_age_s",
+            "unknown range must be finite",
         )
         for passed, message in zip(checks, messages):
             if not passed:
@@ -258,17 +308,15 @@ class M2MObservedHistoryScratchTeacher(nn.Module):
         if teacher_map.dtype not in _SUPPORTED_MAP_DTYPES:
             raise ValueError(f"Teacher map dtype is unsupported: {teacher_map.dtype}.")
         if teacher_map.ndim != 5 or tuple(teacher_map.shape[1:]) != self.map_shape:
-            raise ValueError(f"Teacher map must be [B,1,3,16,96], got {tuple(teacher_map.shape)}.")
+            raise ValueError(f"Teacher map must be [B,1,2,16,96], got {tuple(teacher_map.shape)}.")
         range_m = teacher_map[:, 0, 0:1]
         valid = teacher_map[:, 0, 1:2]
-        age_s = teacher_map[:, 0, 2:3]
         if self.strict_runtime_value_checks:
-            self._strict_validate_map_values(range_m, valid, age_s)
+            self._strict_validate_map_values(range_m, valid)
 
         compute_dtype = next(self.map_encoder.parameters()).dtype
         range_m = range_m.to(dtype=compute_dtype)
         valid = valid.to(dtype=compute_dtype)
-        age_s = age_s.to(dtype=compute_dtype)
         valid = torch.nan_to_num(valid, nan=0.0, posinf=0.0, neginf=0.0)
         valid_mask = valid > 0.5
         valid = valid_mask.to(dtype=compute_dtype)
@@ -278,19 +326,11 @@ class M2MObservedHistoryScratchTeacher(nn.Module):
             posinf=self.contract.far_range_m,
             neginf=self.contract.near_range_m,
         ).clamp(self.contract.near_range_m, self.contract.far_range_m)
-        age_s = torch.nan_to_num(
-            age_s,
-            nan=self.contract.max_age_s,
-            posinf=self.contract.max_age_s,
-            neginf=0.0,
-        ).clamp(0.0, self.contract.max_age_s)
         range_m = torch.where(valid_mask, range_m, torch.full_like(range_m, self.contract.far_range_m))
-        age_s = torch.where(valid_mask, age_s, torch.full_like(age_s, self.contract.max_age_s))
         range_unit = (range_m - self.contract.near_range_m) / (
             self.contract.far_range_m - self.contract.near_range_m
         )
-        age_unit = age_s / self.contract.max_age_s
-        return torch.cat((2.0 * range_unit - 1.0, 2.0 * valid - 1.0, 2.0 * age_unit - 1.0), dim=1)
+        return torch.cat((2.0 * range_unit - 1.0, 2.0 * valid - 1.0), dim=1)
 
     def _proprio(self, obs: TensorDict) -> torch.Tensor:
         proprio = torch.cat([obs[group] for group in self.proprio_sets], dim=-1)
@@ -422,4 +462,4 @@ class M2MObservedHistoryScratchTeacher(nn.Module):
         }
 
 
-__all__ = ["M2MObservedHistoryScratchTeacher"]
+__all__ = ["M2MObservedHistoryScratchTeacher", "M2MScratchTeacherMapContract"]

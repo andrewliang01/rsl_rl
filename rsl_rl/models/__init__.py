@@ -13,7 +13,10 @@ from .m2m_observed_history_formal_teacher import (
     M2MObservedHistoryFormalTeacher,
     M2MObservedHistoryMapEncoder,
 )
-from .m2m_observed_history_scratch_teacher import M2MObservedHistoryScratchTeacher
+from .m2m_observed_history_scratch_teacher import (
+    M2MObservedHistoryScratchTeacher,
+    M2MScratchTeacherMapContract,
+)
 from .m2m_observed_history_teacher import M2MObservedHistoryProxyTeacher, ObservedHistoryMapContract
 from .m2m_recurrent_student import M2MMapFreeRecurrentStudent, M2MStrictFrameTokenizer
 from .m2m_sequence_compatible_critic import M2MSequenceCompatibleCritic
@@ -31,6 +34,7 @@ __all__ = [
     "M2MObservedHistoryFormalTeacher",
     "M2MObservedHistoryMapEncoder",
     "M2MObservedHistoryScratchTeacher",
+    "M2MScratchTeacherMapContract",
     "M2MObservedHistoryProxyTeacher",
     "ObservedHistoryMapContract",
     "M2MMapFreeRecurrentStudent",

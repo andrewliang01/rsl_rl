@@ -16,10 +16,9 @@ _MAP_GROUP = "m2m_teacher_observed_history"
 
 
 def _obs(batch: int = _BATCH) -> TensorDict:
-    teacher_map = torch.empty(batch, 1, 3, 16, 96)
+    teacher_map = torch.empty(batch, 1, 2, 16, 96)
     teacher_map[:, :, 0] = 1.0
     teacher_map[:, :, 1] = 1.0
-    teacher_map[:, :, 2] = 0.0
     return TensorDict(
         {
             "policy": torch.randn(batch, 96),
@@ -39,11 +38,11 @@ def _contract() -> dict[str, object]:
         "uses_synthetic_fill": False,
         "near_range_m": 0.05,
         "far_range_m": 1.85699,
-        "max_age_s": 10.0,
         "storage_backend": "voxel_hash_2p5d",
+        "retention_mode": "episode",
         "voxel_size_m": 0.05,
-        "hash_capacity": 32768,
-        "hash_max_probes": 8,
+        "hash_capacity": 131072,
+        "hash_max_probes": 16,
     }
 
 
@@ -86,6 +85,10 @@ def test_all_a_b_c_and_distribution_parameters_train_from_random_initialization(
     assert audit["all_actor_parameters_trainable"] is True
     assert all(audit["required_trainable_components_present"].values())
     assert audit["architecture"]["training_initialization"] == "random_no_pretrained_policy"
+    assert audit["architecture"]["map_contract"]["channels"] == ["range_m", "valid"]
+    assert audit["architecture"]["map_contract"]["retention_mode"] == "episode"
+    assert audit["architecture"]["map_contract"]["timestamp_visibility"] == "mapper_internal_only"
+    assert model.map_encoder.spatial_encoder[0].conv.in_channels == 2
     assert audit["checkpoint_contract"]["owner"] == "ordinary_PPO_full_actor_state_dict"
     assert set(audit["checkpoint_contract"]["saved_components"]) == {
         "map_encoder_A",

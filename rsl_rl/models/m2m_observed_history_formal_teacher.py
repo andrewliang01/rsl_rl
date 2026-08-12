@@ -86,9 +86,9 @@ class _CircularAzimuthBlock(nn.Module):
 
 
 class M2MObservedHistoryMapEncoder(nn.Module):
-    """Small three-channel circular CNN producing the ECMM latent ``A64``."""
+    """Small configurable-channel circular CNN producing latent ``A64``."""
 
-    input_channels: tuple[str, str, str] = ("range_m", "valid", "age_s")
+    input_channels: tuple[str, ...] = ("range_m", "valid", "age_s")
     spatial_size: tuple[int, int] = (16, 96)
     output_dim: int = 64
 
@@ -98,8 +98,15 @@ class M2MObservedHistoryMapEncoder(nn.Module):
         hidden_channels: Sequence[int] = (16, 32, 64),
         pooled_spatial_size: tuple[int, int] = (2, 6),
         mlp_hidden_dim: int = 128,
+        input_channels: Sequence[str] | None = None,
     ) -> None:
         super().__init__()
+        channels_semantics = tuple(self.input_channels if input_channels is None else input_channels)
+        if not channels_semantics or any(not isinstance(value, str) or not value for value in channels_semantics):
+            raise ValueError("input_channels must contain non-empty semantic names.")
+        if len(set(channels_semantics)) != len(channels_semantics):
+            raise ValueError("input_channels cannot contain duplicate semantics.")
+        self.input_channels = channels_semantics
         channels = tuple(_positive_int("hidden channel", value) for value in hidden_channels)
         if not channels:
             raise ValueError("hidden_channels must contain at least one channel width.")
@@ -131,7 +138,7 @@ class M2MObservedHistoryMapEncoder(nn.Module):
             *self.spatial_size,
         ):
             raise ValueError(
-                "Normalized teacher map must be [B,3,16,96], got "
+                f"Normalized teacher map must be [B,{len(self.input_channels)},16,96], got "
                 f"{tuple(normalized_map.shape)}."
             )
         latent_a = self.projection(self.pool(self.spatial_encoder(normalized_map)))
