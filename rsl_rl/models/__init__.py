@@ -19,6 +19,7 @@ from .m2m_observed_history_scratch_teacher import (
 )
 from .m2m_observed_history_teacher import M2MObservedHistoryProxyTeacher, ObservedHistoryMapContract
 from .m2m_recurrent_student import M2MMapFreeRecurrentStudent, M2MStrictFrameTokenizer
+from .m2m_livox_deformable_memory_actor import M2MLivoxDeformableMemoryActor
 from .m2m_sequence_compatible_critic import M2MSequenceCompatibleCritic
 from .m2m_student_only import M2MStudentOnlyPolicy, normalize_m2m_student_network_config
 from .rnn_model import RNNModel
@@ -38,6 +39,7 @@ __all__ = [
     "M2MObservedHistoryProxyTeacher",
     "ObservedHistoryMapContract",
     "M2MMapFreeRecurrentStudent",
+    "M2MLivoxDeformableMemoryActor",
     "M2MStrictFrameTokenizer",
     "M2MSequenceCompatibleCritic",
     "M2MStudentOnlyPolicy",
