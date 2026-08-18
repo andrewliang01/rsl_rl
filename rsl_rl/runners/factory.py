@@ -13,6 +13,7 @@ from typing import Any
 from rsl_rl.env import VecEnv
 
 from .distillation_runner import DistillationRunner
+from .m2m_direct_ppo_runner import M2MDirectPpoRunner
 from .m2m_distillation_runner import M2MDistillationRunner
 from .on_policy_runner import OnPolicyRunner
 
@@ -20,11 +21,12 @@ _RUNNERS = MappingProxyType({
     "OnPolicyRunner": OnPolicyRunner,
     "DistillationRunner": DistillationRunner,
     "M2MDistillationRunner": M2MDistillationRunner,
+    "M2MDirectPpoRunner": M2MDirectPpoRunner,
 })
 
 
 def resolve_runner_class(class_name: str) -> type[OnPolicyRunner]:
-    """Resolve only the three audited built-in runner names."""
+    """Resolve only the audited built-in runner names."""
     if not isinstance(class_name, str) or not class_name:
         raise ValueError("runner class_name must be a non-empty string.")
     try:

@@ -24,6 +24,7 @@ _ACTION_DIM = 29
 _FRAME_SHAPE = (1, 4, 16, 96)
 _M90_SET = "height_scan_policy"
 _STRICT_SET = "mid360_strict_frame"
+_FRAME_AGE_SEMANTICS = "uniform_message_age_s"
 
 
 def _actor_cfg() -> dict[str, Any]:
@@ -103,6 +104,7 @@ def _student(
     obs: TensorDict | None = None,
     *,
     temporal_mode: str = "gru",
+    frame_age_semantics: str = _FRAME_AGE_SEMANTICS,
 ) -> M2MMapFreeRecurrentStudent:
     checkpoint, digest = _checkpoint(tmp_path)
     if obs is None:
@@ -123,6 +125,7 @@ def _student(
         frame_far_range_m=6.0,
         frame_message_period_s=0.1,
         frame_max_age_s=0.5,
+        frame_age_semantics=frame_age_semantics,
         tokenizer_hidden_channels=[4, 8],
         tokenizer_dim=24,
         tokenizer_pooled_spatial_size=(2, 4),
@@ -185,13 +188,14 @@ def test_deployment_contract_freezes_B_C_distribution_and_exports_model(tmp_path
         "proprio_feature_to_temporal_dim": 64,
         "strict_frame_set": _STRICT_SET,
         "strict_frame_shape": [1, 4, 16, 96],
-        "strict_frame_channels": ["range_m", "valid", "message_age_s", "new_frame"],
+        "strict_frame_channels": ["range_m", "valid", "frame_age_s", "new_frame"],
         "strict_frame_storage_dtypes": ["float16", "bfloat16", "float32"],
         "strict_frame_compute_dtype": "float32",
         "strict_frame_near_range_m": 0.1,
         "strict_frame_far_range_m": 6.0,
         "strict_frame_message_period_s": 0.1,
         "strict_frame_max_age_s": 0.5,
+        "strict_frame_age_semantics": _FRAME_AGE_SEMANTICS,
         "recurrent_state": [1, "batch", 20],
         "teacher_map": False,
         "ground_truth_pose": False,
@@ -230,6 +234,7 @@ def test_architecture_receipt_binds_all_same_shape_semantics_without_checkpoint_
         frame_far_range_m=6.0,
         frame_message_period_s=0.1,
         frame_max_age_s=0.5,
+        frame_age_semantics=_FRAME_AGE_SEMANTICS,
         tokenizer_hidden_channels=[4, 8],
         tokenizer_dim=24,
         tokenizer_pooled_spatial_size=(2, 4),
@@ -240,15 +245,17 @@ def test_architecture_receipt_binds_all_same_shape_semantics_without_checkpoint_
     )
 
     receipt = model.architecture_receipt()
+    assert receipt["schema"] == "m2m_map_free_student_architecture_v2"
     assert receipt["actor_interface"]["ordered_groups"] == ["policy", _STRICT_SET]
     assert receipt["actor_interface"]["proprio_group_dims"] == {"policy": 96}
     assert receipt["strict_frame"] == {
         "shape_without_batch": [1, 4, 16, 96],
-        "channels": ["range_m", "valid", "message_age_s", "new_frame"],
+        "channels": ["range_m", "valid", "frame_age_s", "new_frame"],
         "near_range_m": 0.1,
         "far_range_m": 6.0,
         "message_period_s": 0.1,
         "max_age_s": 0.5,
+        "frame_age_semantics": _FRAME_AGE_SEMANTICS,
         "accepted_storage_dtypes": ["float16", "bfloat16", "float32"],
         "compute_dtype": "float32",
     }
@@ -278,6 +285,23 @@ def test_architecture_receipt_binds_all_same_shape_semantics_without_checkpoint_
 
     receipt["strict_frame"]["near_range_m"] = 999.0
     assert model.architecture_receipt()["strict_frame"]["near_range_m"] == 0.1
+
+
+@pytest.mark.parametrize(
+    "frame_age_semantics",
+    ["uniform_message_age_s", "winning_subframe_age_20ms"],
+)
+def test_frame_age_semantics_is_required_and_exactly_bound(
+    tmp_path: Path,
+    frame_age_semantics: str,
+) -> None:
+    model = _student(tmp_path, frame_age_semantics=frame_age_semantics)
+
+    assert model.frame_tokenizer.frame_age_semantics == frame_age_semantics
+    assert model.architecture_receipt()["strict_frame"]["frame_age_semantics"] == frame_age_semantics
+    assert model.parameter_audit()["deployment_inputs"]["strict_frame_age_semantics"] == (
+        frame_age_semantics
+    )
 
 
 def test_forward_uses_predicted_A_with_exact_frozen_B_C_and_runner_distribution_api(tmp_path: Path) -> None:
@@ -536,7 +560,29 @@ def test_constructor_and_runtime_fail_closed_on_input_contract_violations(tmp_pa
         "frame_far_range_m": 6.0,
         "frame_message_period_s": 0.1,
         "frame_max_age_s": 0.5,
+        "frame_age_semantics": _FRAME_AGE_SEMANTICS,
     }
+
+    missing_semantics = dict(kwargs)
+    del missing_semantics["frame_age_semantics"]
+    with pytest.raises(TypeError, match="frame_age_semantics"):
+        M2MMapFreeRecurrentStudent(
+            obs,
+            {"actor": ["policy", _STRICT_SET]},
+            "actor",
+            _ACTION_DIM,
+            **missing_semantics,
+        )
+    for invalid_semantics in ("message_age_s", "", None, True):
+        invalid_semantics_kwargs = {**kwargs, "frame_age_semantics": invalid_semantics}
+        with pytest.raises(ValueError, match="frame_age_semantics"):
+            M2MMapFreeRecurrentStudent(
+                obs,
+                {"actor": ["policy", _STRICT_SET]},
+                "actor",
+                _ACTION_DIM,
+                **invalid_semantics_kwargs,
+            )
 
     with pytest.raises(ValueError, match="exactly the explicit original proprio"):
         M2MMapFreeRecurrentStudent(

@@ -7,7 +7,7 @@
 
 The deployment boundary is intentionally narrow.  At every policy step the
 student receives only the original 96-D ECMM proprioception, one strict
-MID-360 frame with channels ``range/valid/message_age/new_frame``, and, in GRU
+MID-360 frame with channels ``range/valid/frame_age/new_frame``, and, in GRU
 mode, its hidden state.  The frame token is concatenated with the frozen
 proprioception feature B64; a current-frame encoder or GRU then predicts the
 64-D perception latent ``A_hat`` consumed by the same frozen fusion head C and
@@ -38,7 +38,21 @@ from rsl_rl.models.prop_mlp_elevation_fusion_model import PropMLPElevationFusion
 from rsl_rl.modules.distribution import Distribution
 from rsl_rl.utils import unpad_trajectories
 
-_ARCHITECTURE_RECEIPT_SCHEMA = "m2m_map_free_student_architecture_v1"
+_ARCHITECTURE_RECEIPT_SCHEMA = "m2m_map_free_student_architecture_v2"
+M2M_FRAME_AGE_SEMANTICS: tuple[str, str] = (
+    "uniform_message_age_s",
+    "winning_subframe_age_20ms",
+)
+
+
+def validate_m2m_frame_age_semantics(value: object) -> str:
+    """Return one explicit strict-frame age meaning or fail closed."""
+    if type(value) is not str or value not in M2M_FRAME_AGE_SEMANTICS:
+        raise ValueError(
+            "frame_age_semantics must be exactly one of "
+            f"{list(M2M_FRAME_AGE_SEMANTICS)}, got {value!r}."
+        )
+    return value
 
 
 def _json_safe_architecture_value(value: object, *, field: str) -> Any:
@@ -157,7 +171,7 @@ class M2MStrictFrameTokenizer(nn.Module):
     channels: tuple[str, str, str, str] = (
         "range_m",
         "valid",
-        "message_age_s",
+        "frame_age_s",
         "new_frame",
     )
 
@@ -168,6 +182,7 @@ class M2MStrictFrameTokenizer(nn.Module):
         far_range_m: float,
         message_period_s: float,
         max_age_s: float,
+        frame_age_semantics: str,
         hidden_channels: Sequence[int] = (16, 32),
         token_dim: int = 128,
         pooled_spatial_size: tuple[int, int] = (2, 6),
@@ -212,6 +227,7 @@ class M2MStrictFrameTokenizer(nn.Module):
         self.far_range_m = float(far_range_m)
         self.message_period_s = float(message_period_s)
         self.max_age_s = float(max_age_s)
+        self.frame_age_semantics = validate_m2m_frame_age_semantics(frame_age_semantics)
         self.token_dim = token_dim
         self.hidden_channels = channels_tuple
         self.pooled_spatial_size = tuple(pooled_spatial_size)
@@ -255,7 +271,7 @@ class M2MStrictFrameTokenizer(nn.Module):
         channels = frame.squeeze(-4).float()
         range_m = channels[..., 0:1, :, :]
         valid = torch.nan_to_num(channels[..., 1:2, :, :], nan=0.0).clamp(0.0, 1.0)
-        message_age_s = channels[..., 2:3, :, :]
+        frame_age_s = channels[..., 2:3, :, :]
         new_frame = torch.nan_to_num(channels[..., 3:4, :, :], nan=0.0).clamp(0.0, 1.0)
 
         # Invalid ranges cannot affect the token through arbitrary stored
@@ -270,7 +286,7 @@ class M2MStrictFrameTokenizer(nn.Module):
         range_unit = (range_m - self.near_range_m) / (self.far_range_m - self.near_range_m)
         range_normalized = torch.where(valid > 0.5, 2.0 * range_unit - 1.0, torch.zeros_like(range_unit))
         age_normalized = torch.nan_to_num(
-            message_age_s,
+            frame_age_s,
             nan=self.max_age_s,
             posinf=self.max_age_s,
             neginf=0.0,
@@ -311,6 +327,7 @@ class M2MMapFreeRecurrentStudent(nn.Module):
         frame_far_range_m: float,
         frame_message_period_s: float,
         frame_max_age_s: float,
+        frame_age_semantics: str,
         tokenizer_hidden_channels: Sequence[int] = (16, 32),
         tokenizer_dim: int = 128,
         tokenizer_pooled_spatial_size: tuple[int, int] = (2, 6),
@@ -321,6 +338,7 @@ class M2MMapFreeRecurrentStudent(nn.Module):
     ) -> None:
         """Construct the map-free student around a verified frozen M90 core."""
         super().__init__()
+        resolved_frame_age_semantics = validate_m2m_frame_age_semantics(frame_age_semantics)
         if not isinstance(obs, TensorDict):
             raise TypeError(f"obs must be a TensorDict, got {type(obs).__name__}.")
         if len(obs.batch_size) != 1 or obs.batch_size[0] <= 0:
@@ -441,6 +459,7 @@ class M2MMapFreeRecurrentStudent(nn.Module):
             far_range_m=frame_far_range_m,
             message_period_s=frame_message_period_s,
             max_age_s=frame_max_age_s,
+            frame_age_semantics=resolved_frame_age_semantics,
             hidden_channels=tokenizer_hidden_channels,
             token_dim=tokenizer_dim,
             pooled_spatial_size=tokenizer_pooled_spatial_size,
@@ -899,6 +918,7 @@ class M2MMapFreeRecurrentStudent(nn.Module):
                 "far_range_m": self.frame_tokenizer.far_range_m,
                 "message_period_s": self.frame_tokenizer.message_period_s,
                 "max_age_s": self.frame_tokenizer.max_age_s,
+                "frame_age_semantics": self.frame_tokenizer.frame_age_semantics,
                 "accepted_storage_dtypes": ["float16", "bfloat16", "float32"],
                 "compute_dtype": "float32",
             },
@@ -959,6 +979,7 @@ class M2MMapFreeRecurrentStudent(nn.Module):
                 "strict_frame_far_range_m": self.frame_tokenizer.far_range_m,
                 "strict_frame_message_period_s": self.frame_tokenizer.message_period_s,
                 "strict_frame_max_age_s": self.frame_tokenizer.max_age_s,
+                "strict_frame_age_semantics": self.frame_tokenizer.frame_age_semantics,
                 "recurrent_state": (
                     [self.gru_num_layers, "batch", self.gru_hidden_dim]
                     if self.is_recurrent
@@ -998,4 +1019,9 @@ class M2MMapFreeRecurrentStudent(nn.Module):
         }
 
 
-__all__ = ["M2MMapFreeRecurrentStudent", "M2MStrictFrameTokenizer"]
+__all__ = [
+    "M2M_FRAME_AGE_SEMANTICS",
+    "M2MMapFreeRecurrentStudent",
+    "M2MStrictFrameTokenizer",
+    "validate_m2m_frame_age_semantics",
+]

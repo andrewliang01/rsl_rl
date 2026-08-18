@@ -33,6 +33,8 @@ _PROPRIO_DIM = 96
 _ACTION_DIM = 29
 _STRICT_SET = "mid360_strict_frame"
 _M90_SET = "height_scan_policy"
+_FRAME_AGE_SEMANTICS = "uniform_message_age_s"
+_LIVOX_FRAME_AGE_SEMANTICS = "winning_subframe_age_20ms"
 
 
 def _sha256(path: Path) -> str:
@@ -75,9 +77,13 @@ def _actor_cfg() -> dict[str, Any]:
     }
 
 
-def _construction_config(*, temporal_mode: str = "gru") -> dict[str, Any]:
+def _construction_config(
+    *,
+    temporal_mode: str = "gru",
+    frame_age_semantics: str = _FRAME_AGE_SEMANTICS,
+) -> dict[str, Any]:
     return {
-        "schema": "m2m_student_export_construction_v1",
+        "schema": "m2m_student_export_construction_v2",
         "obs_set": "actor",
         "output_dim": _ACTION_DIM,
         "strict_frame_set": _STRICT_SET,
@@ -88,6 +94,7 @@ def _construction_config(*, temporal_mode: str = "gru") -> dict[str, Any]:
         "frame_far_range_m": 6.0,
         "frame_message_period_s": 0.1,
         "frame_max_age_s": 0.5,
+        "frame_age_semantics": frame_age_semantics,
         "tokenizer_hidden_channels": [4, 8],
         "tokenizer_dim": 24,
         "tokenizer_pooled_spatial_size": [2, 4],
@@ -146,8 +153,16 @@ def _observations(batch_size: int = 3, *, step: int = 0) -> TensorDict:
     )
 
 
-def _training_student(tmp_path: Path, *, temporal_mode: str = "gru") -> M2MMapFreeRecurrentStudent:
-    config = _construction_config(temporal_mode=temporal_mode)
+def _training_student(
+    tmp_path: Path,
+    *,
+    temporal_mode: str = "gru",
+    frame_age_semantics: str = _FRAME_AGE_SEMANTICS,
+) -> M2MMapFreeRecurrentStudent:
+    config = _construction_config(
+        temporal_mode=temporal_mode,
+        frame_age_semantics=frame_age_semantics,
+    )
     m90, digest = _m90_checkpoint(tmp_path)
     torch.manual_seed(300)
     return M2MMapFreeRecurrentStudent(
@@ -164,6 +179,7 @@ def _training_student(tmp_path: Path, *, temporal_mode: str = "gru") -> M2MMapFr
         frame_far_range_m=config["frame_far_range_m"],
         frame_message_period_s=config["frame_message_period_s"],
         frame_max_age_s=config["frame_max_age_s"],
+        frame_age_semantics=config["frame_age_semantics"],
         tokenizer_hidden_channels=config["tokenizer_hidden_channels"],
         tokenizer_dim=config["tokenizer_dim"],
         tokenizer_pooled_spatial_size=tuple(config["tokenizer_pooled_spatial_size"]),
@@ -174,8 +190,13 @@ def _training_student(tmp_path: Path, *, temporal_mode: str = "gru") -> M2MMapFr
     )
 
 
-def _c11_checkpoint(tmp_path: Path, *, frozen_receipt_sha: str | None = None) -> tuple[Path, str, dict[str, Any]]:
-    student = _training_student(tmp_path)
+def _c11_checkpoint(
+    tmp_path: Path,
+    *,
+    frozen_receipt_sha: str | None = None,
+    frame_age_semantics: str = _FRAME_AGE_SEMANTICS,
+) -> tuple[Path, str, dict[str, Any]]:
+    student = _training_student(tmp_path, frame_age_semantics=frame_age_semantics)
     torch.manual_seed(400)
     with torch.no_grad():
         for parameter in student.parameters():
@@ -239,6 +260,16 @@ def _write_artifact(tmp_path: Path) -> tuple[Path, dict[str, Any], dict[str, Any
 
 def test_payload_contains_only_student_B_C_distribution_and_strict_receipts(tmp_path: Path) -> None:
     payload, _c11 = _build_payload(tmp_path)
+    assert payload["schema"] == "m2m_student_only_artifact_v2"
+    assert payload["network_config"]["schema"] == "m2m_student_only_network_v2"
+    assert payload["network_config"]["frame_age_semantics"] == _FRAME_AGE_SEMANTICS
+    assert payload["input_receipt"]["frame_age_semantics"] == _FRAME_AGE_SEMANTICS
+    assert payload["input_receipt"]["strict_frame_channels"] == [
+        "range_m",
+        "valid",
+        "frame_age_s",
+        "new_frame",
+    ]
     state_keys = set(payload["student_state_dict"])
     assert any(key.startswith("frame_tokenizer.") for key in state_keys)
     assert any(key.startswith("gru.") for key in state_keys)
@@ -276,6 +307,7 @@ def test_isaac_free_roundtrip_matches_training_student_over_recurrent_steps(tmp_
     policy = load_m2m_student_artifact(
         artifact,
         expected_sha256=receipt["artifact_sha256"],
+        expected_frame_age_semantics=_FRAME_AGE_SEMANTICS,
     )
     source = _training_student(tmp_path)
     with torch.no_grad():
@@ -328,15 +360,81 @@ def test_artifact_load_does_not_construct_C07_M90_teacher_or_mapper(
         raise AssertionError("Artifact load attempted to construct the C07/M90 training model.")
 
     monkeypatch.setattr(M2MMapFreeRecurrentStudent, "__init__", _forbid_training_student)
-    policy = load_m2m_student_artifact(artifact, expected_sha256=receipt["artifact_sha256"])
+    policy = load_m2m_student_artifact(
+        artifact,
+        expected_sha256=receipt["artifact_sha256"],
+        expected_frame_age_semantics=_FRAME_AGE_SEMANTICS,
+    )
     assert policy(_observations()).shape == (3, _ACTION_DIM)
+
+
+def test_runtime_age_semantics_mismatch_rejects_before_any_state_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact, receipt, _c11 = _write_artifact(tmp_path)
+
+    def _forbid_state_copy(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("Frame-age mismatch reached deployment state copying.")
+
+    monkeypatch.setattr(
+        student_artifact_module.M2MStudentOnlyPolicy,
+        "load_state_dict",
+        _forbid_state_copy,
+    )
+    with pytest.raises(ValueError, match="explicitly selected runtime contract"):
+        load_m2m_student_artifact(
+            artifact,
+            expected_sha256=receipt["artifact_sha256"],
+            expected_frame_age_semantics=_LIVOX_FRAME_AGE_SEMANTICS,
+        )
+    with pytest.raises(ValueError, match="explicitly selected runtime contract"):
+        inspect_m2m_student_artifact(
+            artifact,
+            expected_sha256=receipt["artifact_sha256"],
+            expected_frame_age_semantics=_LIVOX_FRAME_AGE_SEMANTICS,
+        )
+
+
+def test_legacy_artifact_missing_frame_age_semantics_is_rejected_before_state_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact, _receipt, _c11 = _write_artifact(tmp_path)
+    payload = torch.load(artifact, map_location="cpu", weights_only=True)
+    del payload["network_config"]["frame_age_semantics"]
+    legacy = tmp_path / "legacy-without-frame-age-semantics.pt"
+    torch.save(payload, legacy)
+
+    def _forbid_state_copy(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("Legacy artifact reached deployment state copying.")
+
+    monkeypatch.setattr(
+        student_artifact_module.M2MStudentOnlyPolicy,
+        "load_state_dict",
+        _forbid_state_copy,
+    )
+    with pytest.raises(ValueError, match=r"network config key mismatch.*frame_age_semantics"):
+        load_m2m_student_artifact(
+            legacy,
+            expected_sha256=_sha256(legacy),
+            expected_frame_age_semantics=_FRAME_AGE_SEMANTICS,
+        )
 
 
 def test_torchscript_and_onnx_wrapper_match_tensor_policy(tmp_path: Path) -> None:
     artifact, receipt, _c11 = _write_artifact(tmp_path)
-    policy = load_m2m_student_artifact(artifact, expected_sha256=receipt["artifact_sha256"])
+    policy = load_m2m_student_artifact(
+        artifact,
+        expected_sha256=receipt["artifact_sha256"],
+        expected_frame_age_semantics=_FRAME_AGE_SEMANTICS,
+    )
     wrapper = policy.as_jit().eval()
     scripted = torch.jit.script(wrapper)
+    assert wrapper.frame_age_semantics == _FRAME_AGE_SEMANTICS
+    assert scripted.frame_age_semantics == _FRAME_AGE_SEMANTICS
     assert wrapper.input_names == ["proprio", "strict_frame", "hidden_state"]
     assert wrapper.output_names == ["action", "latent_A", "next_hidden_state"]
     assert policy.as_onnx().input_names == wrapper.input_names
@@ -401,14 +499,22 @@ def test_torchscript_and_onnx_wrapper_match_tensor_policy(tmp_path: Path) -> Non
 def test_artifact_hash_state_digest_and_dependency_corruption_fail_closed(tmp_path: Path) -> None:
     artifact, receipt, _c11 = _write_artifact(tmp_path)
     with pytest.raises(ValueError, match="SHA-256 mismatch"):
-        load_m2m_student_artifact(artifact, expected_sha256="0" * 64)
+        load_m2m_student_artifact(
+            artifact,
+            expected_sha256="0" * 64,
+            expected_frame_age_semantics=_FRAME_AGE_SEMANTICS,
+        )
 
     corrupted = tmp_path / "corrupt-bytes.pt"
     value = bytearray(artifact.read_bytes())
     value[len(value) // 2] ^= 0x01
     corrupted.write_bytes(value)
     with pytest.raises(ValueError, match="SHA-256 mismatch"):
-        load_m2m_student_artifact(corrupted, expected_sha256=receipt["artifact_sha256"])
+        load_m2m_student_artifact(
+            corrupted,
+            expected_sha256=receipt["artifact_sha256"],
+            expected_frame_age_semantics=_FRAME_AGE_SEMANTICS,
+        )
 
     payload = torch.load(artifact, map_location="cpu", weights_only=True)
     first_key = sorted(payload["student_state_dict"])[0]
@@ -416,7 +522,11 @@ def test_artifact_hash_state_digest_and_dependency_corruption_fail_closed(tmp_pa
     tampered_state = tmp_path / "tampered-state.pt"
     torch.save(payload, tampered_state)
     with pytest.raises(ValueError, match="state content digest differs"):
-        load_m2m_student_artifact(tampered_state, expected_sha256=_sha256(tampered_state))
+        load_m2m_student_artifact(
+            tampered_state,
+            expected_sha256=_sha256(tampered_state),
+            expected_frame_age_semantics=_FRAME_AGE_SEMANTICS,
+        )
 
     payload = torch.load(artifact, map_location="cpu", weights_only=True)
     payload["dependency_receipt"]["constructs_teacher"] = True
@@ -426,6 +536,7 @@ def test_artifact_hash_state_digest_and_dependency_corruption_fail_closed(tmp_pa
         load_m2m_student_artifact(
             tampered_dependency,
             expected_sha256=_sha256(tampered_dependency),
+            expected_frame_age_semantics=_FRAME_AGE_SEMANTICS,
         )
 
 
@@ -442,6 +553,14 @@ def test_source_hashes_and_C11_M90_binding_are_verified_before_export(
         "expected_frozen_m90_sha256": m90_sha,
         "construction_config": _construction_config(),
     }
+    missing_semantics = _construction_config()
+    del missing_semantics["frame_age_semantics"]
+    with pytest.raises(ValueError, match=r"construction config key mismatch.*frame_age_semantics"):
+        build_m2m_student_artifact_payload(**{**kwargs, "construction_config": missing_semantics})
+    invalid_semantics = _construction_config()
+    invalid_semantics["frame_age_semantics"] = "message_age_s"
+    with pytest.raises(ValueError, match="frame_age_semantics"):
+        build_m2m_student_artifact_payload(**{**kwargs, "construction_config": invalid_semantics})
     with pytest.raises(ValueError, match="C11 distillation checkpoint SHA-256 mismatch"):
         build_m2m_student_artifact_payload(**{**kwargs, "expected_distillation_sha256": "0" * 64})
     with pytest.raises(ValueError, match="frozen M90 checkpoint SHA-256 mismatch"):
@@ -471,6 +590,7 @@ def test_source_hashes_and_C11_M90_binding_are_verified_before_export(
     (
         ("frame_near_range_m", 0.2),
         ("frame_far_range_m", 5.5),
+        ("frame_age_semantics", _LIVOX_FRAME_AGE_SEMANTICS),
         ("tokenizer_pooled_spatial_size", [1, 8]),
         ("frozen_actor_activation", "relu"),
     ),
@@ -530,6 +650,26 @@ def test_export_rejects_legacy_C11_without_C07_architecture_receipt(tmp_path: Pa
         )
 
 
+def test_export_rejects_legacy_C11_without_frame_age_semantics(tmp_path: Path) -> None:
+    m90, m90_sha = _m90_checkpoint(tmp_path)
+    _c11, _c11_sha, source = _c11_checkpoint(tmp_path)
+    legacy = copy.deepcopy(source)
+    del legacy["config_receipt"]["student"]["architecture_receipt"]["strict_frame"][
+        "frame_age_semantics"
+    ]
+    legacy_path = tmp_path / "legacy-c11-without-frame-age-semantics.pt"
+    torch.save(legacy, legacy_path)
+
+    with pytest.raises(ValueError, match=r"architecture receipt.*differs"):
+        build_m2m_student_artifact_payload(
+            distillation_checkpoint_path=legacy_path,
+            expected_distillation_sha256=_sha256(legacy_path),
+            frozen_m90_checkpoint_path=m90,
+            expected_frozen_m90_sha256=m90_sha,
+            construction_config=_construction_config(),
+        )
+
+
 def test_cli_exports_create_only_artifact_and_strict_inspection(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
     m90, m90_sha = _m90_checkpoint(tmp_path)
     c11, c11_sha, _payload = _c11_checkpoint(tmp_path)
@@ -559,12 +699,21 @@ def test_cli_exports_create_only_artifact_and_strict_inspection(tmp_path: Path, 
         main(arguments)
 
     assert main(
-        ["inspect", "--artifact", str(output), "--sha256", exported["artifact_sha256"]]
+        [
+            "inspect",
+            "--artifact",
+            str(output),
+            "--sha256",
+            exported["artifact_sha256"],
+            "--frame-age-semantics",
+            _FRAME_AGE_SEMANTICS,
+        ]
     ) == 0
     inspected_stdout = json.loads(capsys.readouterr().out)
     inspected = inspect_m2m_student_artifact(
         output,
         expected_sha256=exported["artifact_sha256"],
+        expected_frame_age_semantics=_FRAME_AGE_SEMANTICS,
     )
     assert inspected_stdout == inspected
     assert inspected["dependency_audit"]["constructs_teacher"] is False
@@ -577,6 +726,8 @@ def test_cli_exports_create_only_artifact_and_strict_inspection(tmp_path: Path, 
         str(output),
         "--sha256",
         exported["artifact_sha256"],
+        "--frame-age-semantics",
+        _FRAME_AGE_SEMANTICS,
         "--torchscript-output",
         str(torchscript_output),
         "--onnx-output",
@@ -585,10 +736,22 @@ def test_cli_exports_create_only_artifact_and_strict_inspection(tmp_path: Path, 
     assert main(compile_arguments) == 0
     compiled = json.loads(capsys.readouterr().out)
     assert set(compiled["backends"]) == {"torchscript", "onnx"}
+    assert compiled["frame_age_semantics"] == _FRAME_AGE_SEMANTICS
+    assert compiled["backends"]["torchscript"]["interface"]["frame_age_semantics"] == (
+        _FRAME_AGE_SEMANTICS
+    )
+    assert compiled["backends"]["onnx"]["interface"]["frame_age_semantics"] == (
+        _FRAME_AGE_SEMANTICS
+    )
     assert compiled["backends"]["torchscript"]["sha256"] == _sha256(torchscript_output)
     assert compiled["backends"]["onnx"]["sha256"] == _sha256(onnx_output)
-    onnx.checker.check_model(onnx.load(onnx_output))
+    compiled_onnx = onnx.load(onnx_output)
+    onnx.checker.check_model(compiled_onnx)
+    assert {entry.key: entry.value for entry in compiled_onnx.metadata_props}[
+        "m2m.frame_age_semantics"
+    ] == _FRAME_AGE_SEMANTICS
     scripted = torch.jit.load(str(torchscript_output))
+    assert scripted.frame_age_semantics == _FRAME_AGE_SEMANTICS
     scripted_outputs = scripted(
         torch.zeros(1, _PROPRIO_DIM),
         torch.zeros(1, 1, 4, 16, 96),

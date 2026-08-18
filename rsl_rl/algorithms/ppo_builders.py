@@ -19,6 +19,7 @@ def construct_single_critic_algorithm(
     device: str,
     *,
     include_amp_obs: bool = False,
+    actor_constructor_obs_set: str = "actor",
 ):
     """Construct a PPO-family algorithm with one critic."""
     alg_cfg = cfg["algorithm"].copy()
@@ -42,7 +43,29 @@ def construct_single_critic_algorithm(
     alg_cfg = resolve_symmetry_config(alg_cfg, env)
 
     actor_obs = _augment_actor_obs_sample_for_dwaq(obs, alg_cfg)
-    actor: MLPModel = actor_class(actor_obs, obs_groups, "actor", env.num_actions, **actor_cfg).to(device)
+    if not isinstance(actor_constructor_obs_set, str) or not actor_constructor_obs_set:
+        raise ValueError("actor_constructor_obs_set must be a non-empty string.")
+    actor_constructor_groups = obs_groups
+    if actor_constructor_obs_set != "actor":
+        if (
+            actor_constructor_obs_set in obs_groups
+            and obs_groups[actor_constructor_obs_set] != obs_groups["actor"]
+        ):
+            raise ValueError(
+                f"Actor constructor set {actor_constructor_obs_set!r} conflicts with "
+                "the resolved 'actor' observation groups."
+            )
+        actor_constructor_groups = {
+            **obs_groups,
+            actor_constructor_obs_set: list(obs_groups["actor"]),
+        }
+    actor: MLPModel = actor_class(
+        actor_obs,
+        actor_constructor_groups,
+        actor_constructor_obs_set,
+        env.num_actions,
+        **actor_cfg,
+    ).to(device)
     print(f"Actor Model: {actor}")
     if alg_cfg.pop("share_cnn_encoders", None):
         critic_cfg["cnns"] = actor.cnns  # type: ignore[attr-defined]

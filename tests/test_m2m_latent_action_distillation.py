@@ -124,6 +124,7 @@ class _DummyC07Student(nn.Module):
             "schema": "test_c07_architecture_v1",
             "ordered_inputs": ["policy", "strict_frame"],
             "input_dims": {"policy": 2, "strict_frame": 3},
+            "strict_frame": {"frame_age_semantics": "uniform_message_age_s"},
             "temporal": {"mode": "gru", "hidden_dim": 6, "num_layers": 1},
             "checkpoint_path_embedded": False,
         }
@@ -511,6 +512,19 @@ def test_checkpoint_roundtrip_saves_only_trainable_student_and_rejects_mismatch(
     ] = 999
     with pytest.raises(ValueError, match="configuration receipt"):
         restored.load(tampered_architecture)
+    semantic_mismatch = copy.deepcopy(payload)
+    semantic_mismatch["config_receipt"]["student"]["architecture_receipt"]["strict_frame"][
+        "frame_age_semantics"
+    ] = "winning_subframe_age_20ms"
+    before_semantic_rejection = {
+        name: parameter.detach().clone()
+        for name, parameter in restored.student.named_parameters()
+        if parameter.requires_grad
+    }
+    with pytest.raises(ValueError, match="configuration receipt"):
+        restored.load(semantic_mismatch)
+    for name, expected in before_semantic_rejection.items():
+        torch.testing.assert_close(dict(restored.student.named_parameters())[name], expected)
     wrong_artifact = _algorithm(
         rollout_length=3,
         frozen_artifact_receipt={

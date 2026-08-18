@@ -19,14 +19,19 @@ from pathlib import Path
 from tensordict import TensorDict
 from typing import Any
 
-from rsl_rl.models.m2m_recurrent_student import M2MMapFreeRecurrentStudent, M2MStrictFrameTokenizer
+from rsl_rl.models.m2m_recurrent_student import (
+    M2MMapFreeRecurrentStudent,
+    M2MStrictFrameTokenizer,
+    M2M_FRAME_AGE_SEMANTICS,
+    validate_m2m_frame_age_semantics,
+)
 from rsl_rl.models.m2m_student_only import (
     M2MStudentOnlyPolicy,
     normalize_m2m_student_network_config,
 )
 
-_ARTIFACT_SCHEMA = "m2m_student_only_artifact_v1"
-_CONSTRUCTION_SCHEMA = "m2m_student_export_construction_v1"
+_ARTIFACT_SCHEMA = "m2m_student_only_artifact_v2"
+_CONSTRUCTION_SCHEMA = "m2m_student_export_construction_v2"
 _C11_SCHEMA = "m2m_latent_action_distillation_v1"
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _TRAINABLE_PREFIXES = ("frame_tokenizer.", "gru.", "current_encoder.", "latent_head.")
@@ -128,6 +133,7 @@ def _normalize_export_construction_config(config: Mapping[str, Any]) -> dict[str
         "frame_far_range_m",
         "frame_message_period_s",
         "frame_max_age_s",
+        "frame_age_semantics",
         "tokenizer_hidden_channels",
         "tokenizer_dim",
         "tokenizer_pooled_spatial_size",
@@ -177,7 +183,7 @@ def _network_config_from_construction(config: Mapping[str, Any]) -> dict[str, An
     actor_cfg = config["frozen_ecmm_actor_cfg"]
     return normalize_m2m_student_network_config(
         {
-            "schema": "m2m_student_only_network_v1",
+            "schema": "m2m_student_only_network_v2",
             "obs_set": config["obs_set"],
             "output_dim": config["output_dim"],
             "strict_frame_set": config["strict_frame_set"],
@@ -187,6 +193,7 @@ def _network_config_from_construction(config: Mapping[str, Any]) -> dict[str, An
             "frame_far_range_m": config["frame_far_range_m"],
             "frame_message_period_s": config["frame_message_period_s"],
             "frame_max_age_s": config["frame_max_age_s"],
+            "frame_age_semantics": config["frame_age_semantics"],
             "tokenizer_hidden_channels": config["tokenizer_hidden_channels"],
             "tokenizer_dim": config["tokenizer_dim"],
             "tokenizer_pooled_spatial_size": config["tokenizer_pooled_spatial_size"],
@@ -389,6 +396,7 @@ def build_m2m_student_artifact_payload(
         frame_far_range_m=normalized_config["frame_far_range_m"],
         frame_message_period_s=normalized_config["frame_message_period_s"],
         frame_max_age_s=normalized_config["frame_max_age_s"],
+        frame_age_semantics=normalized_config["frame_age_semantics"],
         tokenizer_hidden_channels=normalized_config["tokenizer_hidden_channels"],
         tokenizer_dim=normalized_config["tokenizer_dim"],
         tokenizer_pooled_spatial_size=tuple(normalized_config["tokenizer_pooled_spatial_size"]),
@@ -451,6 +459,7 @@ def build_m2m_student_artifact_payload(
         "strict_frame_set": policy.strict_frame_set,
         "strict_frame_shape": list(M2MStrictFrameTokenizer.frame_shape),
         "strict_frame_channels": list(M2MStrictFrameTokenizer.channels),
+        "frame_age_semantics": policy.frame_age_semantics,
         "recurrent_hidden_shape": (
             [policy.gru_num_layers, "batch", policy.gru_hidden_dim] if policy.is_recurrent else False
         ),
@@ -471,7 +480,30 @@ def build_m2m_student_artifact_payload(
     }
 
 
-def _validate_artifact_payload(payload: dict[str, Any]) -> M2MStudentOnlyPolicy:
+def _input_receipt_from_network_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Derive the complete deployment-input receipt without constructing a policy."""
+    recurrent_hidden_shape: list[int | str] | bool
+    if config["temporal_mode"] == "gru":
+        recurrent_hidden_shape = [config["gru_num_layers"], "batch", config["gru_hidden_dim"]]
+    else:
+        recurrent_hidden_shape = False
+    return {
+        "ordered_groups": [*config["proprio_sets"], config["strict_frame_set"]],
+        "proprio_sets": list(config["proprio_sets"]),
+        "proprio_group_dims": dict(config["proprio_group_dims"]),
+        "strict_frame_set": config["strict_frame_set"],
+        "strict_frame_shape": list(M2MStrictFrameTokenizer.frame_shape),
+        "strict_frame_channels": list(M2MStrictFrameTokenizer.channels),
+        "frame_age_semantics": config["frame_age_semantics"],
+        "recurrent_hidden_shape": recurrent_hidden_shape,
+    }
+
+
+def _validate_artifact_payload(
+    payload: dict[str, Any],
+    *,
+    expected_frame_age_semantics: str | None = None,
+) -> M2MStudentOnlyPolicy:
     expected = {
         "schema",
         "network_config",
@@ -487,9 +519,20 @@ def _validate_artifact_payload(payload: dict[str, Any]) -> M2MStudentOnlyPolicy:
     if payload["schema"] != _ARTIFACT_SCHEMA:
         raise ValueError(f"Unsupported C13 artifact schema {payload['schema']!r}.")
     network_config = normalize_m2m_student_network_config(payload["network_config"])
+    artifact_age_semantics = network_config["frame_age_semantics"]
+    if expected_frame_age_semantics is not None:
+        expected_age_semantics = validate_m2m_frame_age_semantics(expected_frame_age_semantics)
+        if artifact_age_semantics != expected_age_semantics:
+            raise ValueError(
+                "C13 artifact frame_age_semantics differs from the explicitly selected runtime "
+                f"contract: artifact={artifact_age_semantics!r}, expected={expected_age_semantics!r}."
+            )
     expected_config_sha = _canonical_json_sha256(network_config, label="artifact network config")
     if payload["network_config_sha256"] != expected_config_sha:
         raise ValueError("Student-only artifact network config digest differs.")
+    expected_input = _input_receipt_from_network_config(network_config)
+    if payload["input_receipt"] != expected_input:
+        raise ValueError("Student-only artifact input receipt differs from its network config.")
     if payload["dependency_receipt"] != _DEPENDENCY_RECEIPT:
         raise ValueError("Student-only artifact dependency receipt differs or claims training-only dependencies.")
     source_receipt = payload["source_receipt"]
@@ -555,19 +598,6 @@ def _validate_artifact_payload(payload: dict[str, Any]) -> M2MStudentOnlyPolicy:
     if audit["forbidden_state_keys"] or audit["forbidden_module_names"]:
         raise ValueError("Loaded student-only policy contains a forbidden training-only dependency.")
 
-    expected_input = {
-        "ordered_groups": list(policy.obs_groups),
-        "proprio_sets": list(policy.proprio_sets),
-        "proprio_group_dims": dict(policy.proprio_group_dims),
-        "strict_frame_set": policy.strict_frame_set,
-        "strict_frame_shape": list(M2MStrictFrameTokenizer.frame_shape),
-        "strict_frame_channels": list(M2MStrictFrameTokenizer.channels),
-        "recurrent_hidden_shape": (
-            [policy.gru_num_layers, "batch", policy.gru_hidden_dim] if policy.is_recurrent else False
-        ),
-    }
-    if payload["input_receipt"] != expected_input:
-        raise ValueError("Student-only artifact input receipt differs from the reconstructed policy.")
     policy.artifact_receipt = {
         "schema": payload["schema"],
         "network_config_sha256": payload["network_config_sha256"],
@@ -600,6 +630,7 @@ def write_m2m_student_artifact(payload: dict[str, Any], output_path: str | Path)
         "artifact_sha256": _sha256_bytes(value),
         "artifact_bytes": len(value),
         "schema": _ARTIFACT_SCHEMA,
+        "frame_age_semantics": payload["network_config"]["frame_age_semantics"],
     }
 
 
@@ -607,12 +638,16 @@ def load_m2m_student_artifact(
     artifact_path: str | Path,
     *,
     expected_sha256: str,
+    expected_frame_age_semantics: str,
     device: str | torch.device = "cpu",
 ) -> M2MStudentOnlyPolicy:
     """Hash-verify, strict-load, and return a standalone deployment policy."""
     _path, value = _read_verified_bytes(artifact_path, expected_sha256, label="C13 student-only artifact")
     payload = _weights_only_mapping(value, label="C13 student-only artifact")
-    policy = _validate_artifact_payload(payload)
+    policy = _validate_artifact_payload(
+        payload,
+        expected_frame_age_semantics=expected_frame_age_semantics,
+    )
     return policy.to(device).eval()
 
 
@@ -620,11 +655,18 @@ def inspect_m2m_student_artifact(
     artifact_path: str | Path,
     *,
     expected_sha256: str,
+    expected_frame_age_semantics: str,
 ) -> dict[str, Any]:
     """Return verified artifact and dependency receipts without running policy inference."""
-    policy = load_m2m_student_artifact(artifact_path, expected_sha256=expected_sha256, device="cpu")
+    policy = load_m2m_student_artifact(
+        artifact_path,
+        expected_sha256=expected_sha256,
+        expected_frame_age_semantics=expected_frame_age_semantics,
+        device="cpu",
+    )
     return {
         "artifact_sha256": expected_sha256,
+        "frame_age_semantics": policy.frame_age_semantics,
         "artifact_receipt": copy.deepcopy(policy.artifact_receipt),
         "dependency_audit": policy.dependency_audit(),
     }
@@ -634,6 +676,7 @@ def export_m2m_student_backends(
     artifact_path: str | Path,
     *,
     expected_sha256: str,
+    expected_frame_age_semantics: str,
     torchscript_output: str | Path | None = None,
     onnx_output: str | Path | None = None,
     onnx_opset_version: int = 18,
@@ -653,6 +696,7 @@ def export_m2m_student_backends(
     policy = load_m2m_student_artifact(
         artifact_path,
         expected_sha256=expected_sha256,
+        expected_frame_age_semantics=expected_frame_age_semantics,
         device="cpu",
     )
     generated: list[tuple[str, Path, bytes, dict[str, Any]]] = []
@@ -670,6 +714,7 @@ def export_m2m_student_backends(
                     "input_names": list(wrapper.input_names),
                     "output_names": list(wrapper.output_names),
                     "dynamic_axes": copy.deepcopy(wrapper.dynamic_axes),
+                    "frame_age_semantics": policy.frame_age_semantics,
                 },
             )
         )
@@ -687,16 +732,33 @@ def export_m2m_student_backends(
             output_names=wrapper.output_names,
             dynamic_axes=wrapper.dynamic_axes,
         )
+        # The returned receipt is useful only while it remains attached to the
+        # launch record.  Also bind the meaning inside the ONNX file itself so
+        # a copied backend can be checked without its original Python process.
+        import onnx
+
+        onnx_model = onnx.load_model_from_string(buffer.getvalue())
+        metadata = {entry.key: entry.value for entry in onnx_model.metadata_props}
+        metadata_key = "m2m.frame_age_semantics"
+        if metadata_key in metadata and metadata[metadata_key] != policy.frame_age_semantics:
+            raise ValueError("ONNX exporter produced conflicting M2M frame-age metadata.")
+        if metadata_key not in metadata:
+            entry = onnx_model.metadata_props.add()
+            entry.key = metadata_key
+            entry.value = policy.frame_age_semantics
+        onnx_value = onnx_model.SerializeToString()
         generated.append(
             (
                 "onnx",
                 Path(onnx_output).expanduser(),
-                buffer.getvalue(),
+                onnx_value,
                 {
                     "opset_version": onnx_opset_version,
                     "input_names": list(wrapper.input_names),
                     "output_names": list(wrapper.output_names),
                     "dynamic_axes": copy.deepcopy(wrapper.dynamic_axes),
+                    "frame_age_semantics": policy.frame_age_semantics,
+                    "model_metadata_key": metadata_key,
                 },
             )
         )
@@ -715,6 +777,7 @@ def export_m2m_student_backends(
         }
     return {
         "source_artifact_sha256": expected_sha256,
+        "frame_age_semantics": policy.frame_age_semantics,
         "backends": backend_receipts,
     }
 
@@ -740,12 +803,18 @@ def _parser() -> argparse.ArgumentParser:
     inspect = subparsers.add_parser("inspect", help="Strictly inspect an existing C13 artifact.")
     inspect.add_argument("--artifact", required=True)
     inspect.add_argument("--sha256", required=True)
+    inspect.add_argument("--frame-age-semantics", required=True, choices=M2M_FRAME_AGE_SEMANTICS)
     compile_parser = subparsers.add_parser(
         "compile",
         help="Export create-only TorchScript and/or ONNX deployment files.",
     )
     compile_parser.add_argument("--artifact", required=True)
     compile_parser.add_argument("--sha256", required=True)
+    compile_parser.add_argument(
+        "--frame-age-semantics",
+        required=True,
+        choices=M2M_FRAME_AGE_SEMANTICS,
+    )
     compile_parser.add_argument("--torchscript-output")
     compile_parser.add_argument("--onnx-output")
     compile_parser.add_argument("--onnx-opset-version", type=int, default=18)
@@ -765,11 +834,16 @@ def main(argv: list[str] | None = None) -> int:
         )
         result = write_m2m_student_artifact(payload, args.output)
     elif args.command == "inspect":
-        result = inspect_m2m_student_artifact(args.artifact, expected_sha256=args.sha256)
+        result = inspect_m2m_student_artifact(
+            args.artifact,
+            expected_sha256=args.sha256,
+            expected_frame_age_semantics=args.frame_age_semantics,
+        )
     else:
         result = export_m2m_student_backends(
             args.artifact,
             expected_sha256=args.sha256,
+            expected_frame_age_semantics=args.frame_age_semantics,
             torchscript_output=args.torchscript_output,
             onnx_output=args.onnx_output,
             onnx_opset_version=args.onnx_opset_version,

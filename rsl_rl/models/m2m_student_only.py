@@ -20,12 +20,15 @@ from collections.abc import Mapping
 from tensordict import TensorDict
 from typing import Any
 
-from rsl_rl.models.m2m_recurrent_student import M2MStrictFrameTokenizer
+from rsl_rl.models.m2m_recurrent_student import (
+    M2MStrictFrameTokenizer,
+    validate_m2m_frame_age_semantics,
+)
 from rsl_rl.modules import MLP, EmpiricalNormalization
 from rsl_rl.modules.distribution import Distribution
 from rsl_rl.utils import resolve_callable
 
-_NETWORK_SCHEMA = "m2m_student_only_network_v1"
+_NETWORK_SCHEMA = "m2m_student_only_network_v2"
 _FORBIDDEN_INPUT_TOKENS = (
     "teacher",
     "map",
@@ -80,6 +83,7 @@ def normalize_m2m_student_network_config(config: Mapping[str, Any]) -> dict[str,
         "frame_far_range_m",
         "frame_message_period_s",
         "frame_max_age_s",
+        "frame_age_semantics",
         "tokenizer_hidden_channels",
         "tokenizer_dim",
         "tokenizer_pooled_spatial_size",
@@ -131,6 +135,7 @@ def normalize_m2m_student_network_config(config: Mapping[str, Any]) -> dict[str,
     max_age = _exact_finite_float("frame_max_age_s", config["frame_max_age_s"])
     if far <= near or period <= 0.0 or max_age < period:
         raise ValueError("Frame ranges/period/max-age violate the strict MID-360 contract.")
+    frame_age_semantics = validate_m2m_frame_age_semantics(config["frame_age_semantics"])
 
     tokenizer_channels_raw = config["tokenizer_hidden_channels"]
     pooled_raw = config["tokenizer_pooled_spatial_size"]
@@ -202,6 +207,7 @@ def normalize_m2m_student_network_config(config: Mapping[str, Any]) -> dict[str,
         "frame_far_range_m": far,
         "frame_message_period_s": period,
         "frame_max_age_s": max_age,
+        "frame_age_semantics": frame_age_semantics,
         "tokenizer_hidden_channels": tokenizer_channels,
         "tokenizer_dim": tokenizer_dim,
         "tokenizer_pooled_spatial_size": pooled,
@@ -241,6 +247,7 @@ class M2MStudentOnlyPolicy(nn.Module):
         self.proprio_group_dims = dict(config["proprio_group_dims"])
         self.obs_groups = [*self.proprio_sets, self.strict_frame_set]
         self.temporal_mode = config["temporal_mode"]
+        self.frame_age_semantics = config["frame_age_semantics"]
         self.is_recurrent = self.temporal_mode == "gru"
         self.gru_hidden_dim = config["gru_hidden_dim"]
         self.gru_num_layers = config["gru_num_layers"]
@@ -250,6 +257,7 @@ class M2MStudentOnlyPolicy(nn.Module):
             far_range_m=config["frame_far_range_m"],
             message_period_s=config["frame_message_period_s"],
             max_age_s=config["frame_max_age_s"],
+            frame_age_semantics=self.frame_age_semantics,
             hidden_channels=config["tokenizer_hidden_channels"],
             token_dim=config["tokenizer_dim"],
             pooled_spatial_size=tuple(config["tokenizer_pooled_spatial_size"]),
@@ -434,6 +442,7 @@ class M2MStudentOnlyPolicy(nn.Module):
         return {
             "model": "m2m_student_only_policy",
             "deployment_inputs": list(self.obs_groups),
+            "frame_age_semantics": self.frame_age_semantics,
             "state_keys": state_keys,
             "forbidden_state_keys": forbidden_state,
             "forbidden_module_names": forbidden_modules,
@@ -448,6 +457,8 @@ class M2MStudentOnlyPolicy(nn.Module):
 
 class _M2MStudentOnlyTensorExportBase(nn.Module):
     """Tensor-only copy of the student deployment path for JIT/ONNX."""
+
+    __constants__ = ["frame_age_semantics"]
 
     def __init__(self, policy: M2MStudentOnlyPolicy) -> None:
         super().__init__()
@@ -473,6 +484,7 @@ class _M2MStudentOnlyTensorExportBase(nn.Module):
         self.frame_near_range_m = policy.frame_tokenizer.near_range_m
         self.frame_far_range_m = policy.frame_tokenizer.far_range_m
         self.frame_max_age_s = policy.frame_tokenizer.max_age_s
+        self.frame_age_semantics = policy.frame_age_semantics
         self.obs_normalizer = copy.deepcopy(policy.obs_normalizer)
         self.prop_mlp = copy.deepcopy(policy.prop_mlp)
         self.latent_head = copy.deepcopy(policy.latent_head)
