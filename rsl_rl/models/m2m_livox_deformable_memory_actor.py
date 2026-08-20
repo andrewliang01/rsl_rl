@@ -238,6 +238,8 @@ class M2MLivoxDeformableMemoryActor(nn.Module):
         frame_far_range_m: float,
         frame_max_age_s: float,
         frame_age_semantics: str,
+        temporal_variant: str = "deformable_recursive",
+        memory_history_mix: float = 1.0,
         spatial_hidden_channels: Sequence[int] = (16, 16),
         deformable_samples: int = 4,
         motion_dim: int = 64,
@@ -259,6 +261,23 @@ class M2MLivoxDeformableMemoryActor(nn.Module):
             raise ValueError(f"Unitree-G1 actor requires output_dim={self.action_dim}")
         if frame_age_semantics != "winning_subframe_age_20ms":
             raise ValueError("deformable Livox memory requires winning_subframe_age_20ms")
+        if temporal_variant not in (
+            "gru_only",
+            "deformable_recursive",
+            "deformable_anchored",
+        ):
+            raise ValueError(
+                "temporal_variant must be gru_only, deformable_recursive, or "
+                "deformable_anchored"
+            )
+        if not math.isfinite(memory_history_mix) or not 0.0 <= memory_history_mix <= 1.0:
+            raise ValueError("memory_history_mix must be finite and in [0,1]")
+        if temporal_variant == "deformable_recursive" and memory_history_mix != 1.0:
+            raise ValueError("deformable_recursive requires memory_history_mix=1")
+        if temporal_variant == "deformable_anchored" and not 0.0 < memory_history_mix < 1.0:
+            raise ValueError("deformable_anchored requires memory_history_mix strictly in (0,1)")
+        if temporal_variant == "gru_only" and memory_history_mix != 0.0:
+            raise ValueError("gru_only requires memory_history_mix=0")
         proprio_groups = tuple(proprio_sets)
         expected_groups = (*proprio_groups, strict_frame_set)
         if tuple(obs_groups.get(obs_set, ())) != expected_groups:
@@ -314,17 +333,21 @@ class M2MLivoxDeformableMemoryActor(nn.Module):
             EmpiricalNormalization(proprio_dim) if obs_normalization else nn.Identity()
         )
         self.prop_mlp = MLP(proprio_dim, prop_feature_dim, prop_hidden_dims, activation)
-        self.deformable_fusion = _MotionConditionedDeformableFusion(
-            channels=channels,
-            height=height,
-            width=width,
-            prop_dim=prop_feature_dim,
-            gru_dim=gru_hidden_dim,
-            motion_dim=motion_dim,
-            samples=deformable_samples,
-            max_elevation_offset_cells=max_elevation_offset_cells,
-            max_azimuth_offset_cells=max_azimuth_offset_cells,
-        )
+        self.deformable_fusion: _MotionConditionedDeformableFusion | None
+        if temporal_variant == "gru_only":
+            self.deformable_fusion = None
+        else:
+            self.deformable_fusion = _MotionConditionedDeformableFusion(
+                channels=channels,
+                height=height,
+                width=width,
+                prop_dim=prop_feature_dim,
+                gru_dim=gru_hidden_dim,
+                motion_dim=motion_dim,
+                samples=deformable_samples,
+                max_elevation_offset_cells=max_elevation_offset_cells,
+                max_azimuth_offset_cells=max_azimuth_offset_cells,
+            )
         self.recurrent_cell = nn.GRUCell(channels + prop_feature_dim, gru_hidden_dim)
         self.latent_head = nn.Sequential(
             nn.LayerNorm(gru_hidden_dim),
@@ -347,6 +370,8 @@ class M2MLivoxDeformableMemoryActor(nn.Module):
         self.obs_groups = list(expected_groups)
         self.obs_set = obs_set
         self.frame_age_semantics = frame_age_semantics
+        self.temporal_variant = temporal_variant
+        self.memory_history_mix = float(memory_history_mix)
         self.obs_normalization = obs_normalization
         self.spatial_hidden_channels = tuple(spatial_hidden_channels)
         self.deformable_samples = deformable_samples
@@ -361,9 +386,16 @@ class M2MLivoxDeformableMemoryActor(nn.Module):
         self.activation = activation
         self.distribution_config = {"class_name": class_name, **distribution_values}
         self.memory_shape = (channels, height, width)
-        self.memory_dim = channels * height * width
+        self.memory_dim = (
+            channels * height * width if temporal_variant != "gru_only" else 0
+        )
+        self.previous_prop_dim = prop_feature_dim if temporal_variant != "gru_only" else 0
         self.hidden_state_dim = (
-            gru_hidden_dim + self.memory_dim + prop_feature_dim + self.latent_dim + 1
+            gru_hidden_dim
+            + self.memory_dim
+            + self.previous_prop_dim
+            + self.latent_dim
+            + 1
         )
         self._hidden_state: torch.Tensor | None = None
         self._last_offsets: torch.Tensor | None = None
@@ -394,10 +426,15 @@ class M2MLivoxDeformableMemoryActor(nn.Module):
         cursor = 0
         gru = flat[:, cursor : cursor + self.gru_hidden_dim]
         cursor += self.gru_hidden_dim
-        memory = flat[:, cursor : cursor + self.memory_dim].reshape(-1, *self.memory_shape)
+        if self.memory_dim:
+            memory = flat[:, cursor : cursor + self.memory_dim].reshape(
+                -1, *self.memory_shape
+            )
+        else:
+            memory = flat[:, cursor:cursor]
         cursor += self.memory_dim
-        previous_prop = flat[:, cursor : cursor + self.prop_feature_dim]
-        cursor += self.prop_feature_dim
+        previous_prop = flat[:, cursor : cursor + self.previous_prop_dim]
+        cursor += self.previous_prop_dim
         latent = flat[:, cursor : cursor + self.latent_dim]
         cursor += self.latent_dim
         initialized = flat[:, cursor : cursor + 1]
@@ -423,21 +460,38 @@ class M2MLivoxDeformableMemoryActor(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         current, new_frame = self.spatial_encoder(frame)
         gru, memory, previous_prop, held_latent, initialized = self._unpack(state)
-        fused, offsets = self.deformable_fusion(
-            current,
-            memory,
-            prop,
-            previous_prop,
-            gru,
-            initialized,
-        )
-        pooled = fused.mean(dim=(-2, -1))
+        if self.deformable_fusion is None:
+            recurrent_spatial = current
+            candidate_memory = memory
+            candidate_previous_prop = previous_prop
+            offsets = None
+        else:
+            fused, offsets = self.deformable_fusion(
+                current,
+                memory,
+                prop,
+                previous_prop,
+                gru,
+                initialized,
+            )
+            candidate_memory = torch.lerp(
+                current, fused, self.memory_history_mix
+            )
+            recurrent_spatial = candidate_memory
+            candidate_previous_prop = prop
+        pooled = recurrent_spatial.mean(dim=(-2, -1))
         candidate_gru = self.recurrent_cell(torch.cat((pooled, prop), dim=-1), gru)
         candidate_latent = self.latent_head(candidate_gru)
         update = new_frame[:, None]
         next_gru = torch.where(update, candidate_gru, gru)
-        next_memory = torch.where(update[:, :, None, None], fused, memory)
-        next_prop = torch.where(update, prop, previous_prop)
+        if self.memory_dim:
+            next_memory = torch.where(
+                update[:, :, None, None], candidate_memory, memory
+            )
+            next_prop = torch.where(update, candidate_previous_prop, previous_prop)
+        else:
+            next_memory = memory
+            next_prop = previous_prop
         next_latent = torch.where(update, candidate_latent, held_latent)
         next_initialized = torch.where(update, torch.ones_like(initialized), initialized)
         self._last_offsets = offsets
@@ -563,7 +617,7 @@ class M2MLivoxDeformableMemoryActor(nn.Module):
     def architecture_receipt(self) -> dict[str, Any]:
         return {
             "training_initialization": "random_no_pretrained_policy",
-            "temporal_model": "motion_conditioned_deformable_spatial_memory_plus_persistent_gru",
+            "temporal_model": self.temporal_variant,
             "actor_inputs": {
                 "ordered_groups": list(self.obs_groups),
                 "strict_frame_set": self.strict_frame_set,
@@ -575,9 +629,18 @@ class M2MLivoxDeformableMemoryActor(nn.Module):
             "strict_frame_channels": list(_StrictPacketSpatialEncoder.frame_channels),
             "frame_age_semantics": self.frame_age_semantics,
             "spatial_hidden_channels": list(self.spatial_hidden_channels),
-            "spatial_memory_shape": list(self.memory_shape),
-            "deformable_samples": self.deformable_samples,
-            "motion_conditioning": "current_B64_previous_packet_B64_persistent_GRU",
+            "spatial_memory_shape": (
+                list(self.memory_shape) if self.memory_dim else None
+            ),
+            "deformable_samples": (
+                self.deformable_samples if self.deformable_fusion is not None else 0
+            ),
+            "memory_history_mix": self.memory_history_mix,
+            "motion_conditioning": (
+                "current_B64_previous_packet_B64_persistent_GRU"
+                if self.deformable_fusion is not None
+                else "persistent_GRU_only"
+            ),
             "max_elevation_offset_cells": self.max_elevation_offset_cells,
             "max_azimuth_offset_cells": self.max_azimuth_offset_cells,
             "gru_hidden_dim": self.gru_hidden_dim,

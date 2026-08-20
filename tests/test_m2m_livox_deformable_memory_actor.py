@@ -27,7 +27,12 @@ def _obs(batch: int, *, new_frame: bool, value: float = 0.8) -> TensorDict:
     )
 
 
-def _actor(batch: int = 3) -> M2MLivoxDeformableMemoryActor:
+def _actor(
+    batch: int = 3,
+    *,
+    temporal_variant: str = "deformable_recursive",
+    memory_history_mix: float = 1.0,
+) -> M2MLivoxDeformableMemoryActor:
     return M2MLivoxDeformableMemoryActor(
         _obs(batch, new_frame=False),
         {"actor": ["policy", "strict_livox"]},
@@ -39,6 +44,8 @@ def _actor(batch: int = 3) -> M2MLivoxDeformableMemoryActor:
         frame_far_range_m=1.85699,
         frame_max_age_s=10.0,
         frame_age_semantics="winning_subframe_age_20ms",
+        temporal_variant=temporal_variant,
+        memory_history_mix=memory_history_mix,
         spatial_hidden_channels=(8, 8),
         deformable_samples=2,
         motion_dim=16,
@@ -114,7 +121,54 @@ def test_receipt_declares_no_map_pose_or_future_input() -> None:
     assert receipt["actor_inputs"]["uses_ground_truth_pose"] is False
     assert receipt["actor_inputs"]["uses_future_frames"] is False
     assert receipt["actor_inputs"]["updates_only_on_new_10hz_packet"] is True
-    assert receipt["temporal_model"].endswith("persistent_gru")
+    assert receipt["temporal_model"] == "deformable_recursive"
+
+
+def test_gru_only_removes_recursive_spatial_state_and_still_updates_at_10hz() -> None:
+    actor = _actor(
+        batch=2,
+        temporal_variant="gru_only",
+        memory_history_mix=0.0,
+    )
+    assert actor.deformable_fusion is None
+    assert actor.memory_dim == 0
+    assert actor.hidden_state_dim == actor.gru_hidden_dim + actor.latent_dim + 1
+    actor(_obs(2, new_frame=True))
+    updated = actor.get_hidden_state().clone()
+    actor(_obs(2, new_frame=False, value=1.4))
+    assert torch.equal(actor.get_hidden_state(), updated)
+    receipt = actor.architecture_receipt()
+    assert receipt["temporal_model"] == "gru_only"
+    assert receipt["spatial_memory_shape"] is None
+
+
+def test_anchored_memory_blends_toward_current_packet() -> None:
+    actor = _actor(
+        batch=2,
+        temporal_variant="deformable_anchored",
+        memory_history_mix=0.25,
+    )
+    obs = _obs(2, new_frame=True, value=0.4)
+    prop = actor._proprio(obs)
+    initial = actor._zero_state(2, prop)
+    gru, empty_memory, previous_prop, _, initialized = actor._unpack(initial)
+    current, _ = actor.spatial_encoder(obs["strict_livox"])
+    assert actor.deformable_fusion is not None
+    fused, _ = actor.deformable_fusion(
+        current,
+        empty_memory,
+        prop,
+        previous_prop,
+        gru,
+        initialized,
+    )
+    expected = torch.lerp(current, fused, 0.25)
+    actor(obs)
+    state = actor.get_hidden_state()
+    _, stored_memory, _, _, initialized = actor._unpack(state)
+    assert torch.all(initialized == 1.0)
+    torch.testing.assert_close(stored_memory, expected)
+    assert actor.architecture_receipt()["memory_history_mix"] == 0.25
 
 
 def test_actual_recurrent_ppo_collection_and_update_runs_end_to_end() -> None:
