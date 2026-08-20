@@ -9,6 +9,7 @@ from .amp_discriminator import AMPDiscriminator
 from .cnn_model import CNNModel
 from .mlp_model import MLPModel
 from .m2m_frozen_ecmm import M2MFrozenECMMCore, load_frozen_m90_ecmm_core
+from .m2m_frozen_scratch_teacher import M2MFrozenScratchTeacherCore
 from .m2m_observed_history_formal_teacher import (
     M2MObservedHistoryFormalTeacher,
     M2MObservedHistoryMapEncoder,
@@ -31,6 +32,7 @@ __all__ = [
     "CNNModel",
     "MLPModel",
     "M2MFrozenECMMCore",
+    "M2MFrozenScratchTeacherCore",
     "load_frozen_m90_ecmm_core",
     "M2MObservedHistoryFormalTeacher",
     "M2MObservedHistoryMapEncoder",

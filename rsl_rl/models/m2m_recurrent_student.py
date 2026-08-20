@@ -34,11 +34,16 @@ from tensordict import TensorDict
 from typing import Any
 
 from rsl_rl.models.m2m_frozen_ecmm import M2MFrozenECMMCore
+from rsl_rl.models.m2m_frozen_scratch_teacher import M2MFrozenScratchTeacherCore
+from rsl_rl.models.m2m_observed_history_scratch_teacher import (
+    M2MObservedHistoryScratchTeacher,
+)
 from rsl_rl.models.prop_mlp_elevation_fusion_model import PropMLPElevationFusionModel
 from rsl_rl.modules.distribution import Distribution
-from rsl_rl.utils import unpad_trajectories
+from rsl_rl.utils import resolve_callable, unpad_trajectories
 
 _ARCHITECTURE_RECEIPT_SCHEMA = "m2m_map_free_student_architecture_v2"
+_SCRATCH_ARCHITECTURE_RECEIPT_SCHEMA = "m2m_map_free_student_scratch_control_architecture_v1"
 M2M_FRAME_AGE_SEMANTICS: tuple[str, str] = (
     "uniform_message_age_s",
     "winning_subframe_age_20ms",
@@ -319,10 +324,15 @@ class M2MMapFreeRecurrentStudent(nn.Module):
         *,
         strict_frame_set: str,
         proprio_sets: Sequence[str],
-        frozen_ecmm_checkpoint_path: str,
-        frozen_ecmm_expected_sha256: str,
-        frozen_ecmm_actor_cfg: Mapping[str, Any],
+        frozen_ecmm_checkpoint_path: str | None = None,
+        frozen_ecmm_expected_sha256: str | None = None,
+        frozen_ecmm_actor_cfg: Mapping[str, Any] | None = None,
         frozen_ecmm_actor_state_dict_key: str = "actor_state_dict",
+        scratch_teacher_checkpoint_path: str | None = None,
+        scratch_teacher_expected_sha256: str | None = None,
+        scratch_teacher_actor_cfg: Mapping[str, Any] | None = None,
+        scratch_teacher_actor_state_dict_key: str = "actor_state_dict",
+        shared_ecmm_core: M2MFrozenECMMCore | M2MFrozenScratchTeacherCore | None = None,
         frame_near_range_m: float,
         frame_far_range_m: float,
         frame_message_period_s: float,
@@ -336,7 +346,7 @@ class M2MMapFreeRecurrentStudent(nn.Module):
         gru_num_layers: int = 1,
         latent_hidden_dim: int = 128,
     ) -> None:
-        """Construct the map-free student around a verified frozen M90 core."""
+        """Construct the student around either a legacy M90 or scratch-teacher core."""
         super().__init__()
         resolved_frame_age_semantics = validate_m2m_frame_age_semantics(frame_age_semantics)
         if not isinstance(obs, TensorDict):
@@ -392,50 +402,165 @@ class M2MMapFreeRecurrentStudent(nn.Module):
                 f"Frozen ECMM B requires exactly {self.proprio_dim} proprioception values, got {proprio_dim}."
             )
 
-        if not isinstance(frozen_ecmm_actor_cfg, Mapping):
-            raise TypeError("frozen_ecmm_actor_cfg must be a mapping.")
-        actor_cfg_receipt = _resolved_frozen_actor_cfg_receipt(frozen_ecmm_actor_cfg)
-        actor_cfg = copy.deepcopy(actor_cfg_receipt)
-        elevation_set = actor_cfg.get("elevation_set", "height_scan_actor")
-        if not isinstance(elevation_set, str) or not elevation_set:
-            raise ValueError("Frozen actor elevation_set must be a non-empty string.")
-        if elevation_set == strict_frame_set or elevation_set in proprio_groups:
-            raise ValueError("Frozen actor elevation_set must be separate from every deployment input group.")
-        spatial_size = tuple(actor_cfg.get("vision_spatial_size", (25, 17)))
-        if spatial_size != (16, 96):
-            raise ValueError(f"Frozen M90 ECMM actor must use vision_spatial_size=(16,96), got {spatial_size}.")
+        legacy_artifact_values = (
+            frozen_ecmm_checkpoint_path,
+            frozen_ecmm_expected_sha256,
+            frozen_ecmm_actor_cfg,
+        )
+        scratch_artifact_values = (
+            scratch_teacher_checkpoint_path,
+            scratch_teacher_expected_sha256,
+            scratch_teacher_actor_cfg,
+        )
+        scratch_mode = any(value is not None for value in scratch_artifact_values)
+        if shared_ecmm_core is not None:
+            if not isinstance(shared_ecmm_core, (M2MFrozenECMMCore, M2MFrozenScratchTeacherCore)):
+                raise TypeError(
+                    "shared_ecmm_core must be M2MFrozenECMMCore or "
+                    "M2MFrozenScratchTeacherCore."
+                )
+            if any(value is not None for value in (*legacy_artifact_values, *scratch_artifact_values)):
+                raise ValueError(
+                    "shared_ecmm_core is mutually exclusive with all external artifact fields."
+                )
+            self.ecmm_core = shared_ecmm_core
+            self._control_core_kind = "scratch_teacher_full_actor"
+            core_audit = shared_ecmm_core.parameter_audit()
+            control_contract = core_audit.get("contract")
+            if not isinstance(control_contract, Mapping):
+                raise ValueError("Shared scratch-teacher core must expose a mapping contract.")
+            self._frozen_ecmm_actor_cfg_receipt: dict[str, Any] | None = None
+            self._frozen_control_core_receipt = copy.deepcopy(dict(control_contract))
+        elif scratch_mode:
+            if any(value is not None for value in legacy_artifact_values):
+                raise ValueError(
+                    "scratch-teacher and legacy frozen-M90 artifact fields are mutually exclusive."
+                )
+            if not isinstance(scratch_teacher_checkpoint_path, str) or not scratch_teacher_checkpoint_path:
+                raise ValueError("scratch_teacher_checkpoint_path is required in scratch-control mode.")
+            if not isinstance(scratch_teacher_expected_sha256, str) or not scratch_teacher_expected_sha256:
+                raise ValueError("scratch_teacher_expected_sha256 is required in scratch-control mode.")
+            if not isinstance(scratch_teacher_actor_cfg, Mapping):
+                raise TypeError("scratch_teacher_actor_cfg must be a mapping in scratch-control mode.")
+            teacher_cfg = copy.deepcopy(dict(scratch_teacher_actor_cfg))
+            reserved = {"obs", "obs_groups", "output_dim"}
+            conflicts = sorted(reserved.intersection(teacher_cfg))
+            if conflicts:
+                raise ValueError(
+                    "scratch_teacher_actor_cfg cannot override constructor-owned fields: "
+                    f"{conflicts}."
+                )
+            class_name = teacher_cfg.pop("class_name", None)
+            if not isinstance(class_name, str) or not class_name:
+                raise ValueError(
+                    "scratch_teacher_actor_cfg.class_name must be a non-empty string."
+                )
+            teacher_class = resolve_callable(class_name)
+            if not isinstance(teacher_class, type) or not issubclass(
+                teacher_class, M2MObservedHistoryScratchTeacher
+            ):
+                raise TypeError(
+                    "scratch_teacher_actor_cfg.class_name must resolve to a scratch-teacher actor."
+                )
+            teacher_obs_set = teacher_cfg.pop("obs_set", None)
+            if not isinstance(teacher_obs_set, str) or not teacher_obs_set:
+                raise ValueError("scratch_teacher_actor_cfg.obs_set must be a non-empty string.")
+            teacher_proprio = tuple(teacher_cfg.pop("proprio_sets", proprio_groups))
+            if teacher_proprio != proprio_groups:
+                raise ValueError("scratch teacher and student proprio_sets must be identical.")
+            teacher_map_set = teacher_cfg.get("teacher_map_set")
+            if (
+                not isinstance(teacher_map_set, str)
+                or not teacher_map_set
+                or teacher_map_set in expected_active
+            ):
+                raise ValueError(
+                    "scratch_teacher_actor_cfg.teacher_map_set must be distinct from deployment inputs."
+                )
+            reference = obs[proprio_groups[0]]
+            teacher_obs = TensorDict(
+                {
+                    **{group: obs[group] for group in proprio_groups},
+                    teacher_map_set: torch.zeros(
+                        (obs.batch_size[0], 1, 2, 16, 96),
+                        dtype=reference.dtype,
+                        device=reference.device,
+                    ),
+                },
+                batch_size=obs.batch_size,
+                device=obs.device,
+            )
+            teacher = teacher_class(
+                obs=teacher_obs,
+                obs_groups={teacher_obs_set: [*proprio_groups, teacher_map_set]},
+                obs_set=teacher_obs_set,
+                output_dim=output_dim,
+                proprio_sets=proprio_groups,
+                **teacher_cfg,
+            )
+            self.ecmm_core = M2MFrozenScratchTeacherCore(
+                teacher,
+                checkpoint_path=scratch_teacher_checkpoint_path,
+                expected_sha256=scratch_teacher_expected_sha256,
+                actor_state_dict_key=scratch_teacher_actor_state_dict_key,
+            )
+            self._control_core_kind = "scratch_teacher_full_actor"
+            self._frozen_ecmm_actor_cfg_receipt = None
+            control_contract = self.ecmm_core.parameter_audit().get("contract")
+            if not isinstance(control_contract, Mapping):
+                raise ValueError("Scratch-teacher core must expose a mapping contract.")
+            self._frozen_control_core_receipt = copy.deepcopy(dict(control_contract))
+        else:
+            if not isinstance(frozen_ecmm_checkpoint_path, str) or not frozen_ecmm_checkpoint_path:
+                raise ValueError("frozen_ecmm_checkpoint_path is required in legacy M90 mode.")
+            if not isinstance(frozen_ecmm_expected_sha256, str) or not frozen_ecmm_expected_sha256:
+                raise ValueError("frozen_ecmm_expected_sha256 is required in legacy M90 mode.")
+            if not isinstance(frozen_ecmm_actor_cfg, Mapping):
+                raise TypeError("frozen_ecmm_actor_cfg must be a mapping in legacy M90 mode.")
+            actor_cfg_receipt = _resolved_frozen_actor_cfg_receipt(frozen_ecmm_actor_cfg)
+            actor_cfg = copy.deepcopy(actor_cfg_receipt)
+            elevation_set = actor_cfg.get("elevation_set", "height_scan_actor")
+            if not isinstance(elevation_set, str) or not elevation_set:
+                raise ValueError("Frozen actor elevation_set must be a non-empty string.")
+            if elevation_set == strict_frame_set or elevation_set in proprio_groups:
+                raise ValueError("Frozen actor elevation_set must be separate from deployment inputs.")
+            spatial_size = tuple(actor_cfg.get("vision_spatial_size", (25, 17)))
+            if spatial_size != (16, 96):
+                raise ValueError(
+                    f"Frozen M90 ECMM actor must use vision_spatial_size=(16,96), got {spatial_size}."
+                )
 
-        # Construct the frozen actor with a local shape-only placeholder.  No
-        # M90 observation is required at deployment and no external teacher
-        # tensor is consulted even if one exists in ``obs``.
-        reference = obs[proprio_groups[0]]
-        frozen_obs = TensorDict(
-            {
-                **{group: obs[group] for group in proprio_groups},
-                elevation_set: torch.full(
-                    (obs.batch_size[0], 1, *spatial_size),
-                    float(actor_cfg.get("depth_camera_far", 6.0)),
-                    dtype=reference.dtype,
-                    device=reference.device,
-                ),
-            },
-            batch_size=obs.batch_size,
-            device=obs.device,
-        )
-        frozen_obs_groups = {obs_set: [*proprio_groups, elevation_set]}
-        frozen_actor = PropMLPElevationFusionModel(
-            obs=frozen_obs,
-            obs_groups=frozen_obs_groups,
-            obs_set=obs_set,
-            output_dim=output_dim,
-            **actor_cfg,
-        )
-        self.ecmm_core = M2MFrozenECMMCore(
-            frozen_actor,
-            checkpoint_path=frozen_ecmm_checkpoint_path,
-            expected_sha256=frozen_ecmm_expected_sha256,
-            actor_state_dict_key=frozen_ecmm_actor_state_dict_key,
-        )
+            reference = obs[proprio_groups[0]]
+            frozen_obs = TensorDict(
+                {
+                    **{group: obs[group] for group in proprio_groups},
+                    elevation_set: torch.full(
+                        (obs.batch_size[0], 1, *spatial_size),
+                        float(actor_cfg.get("depth_camera_far", 6.0)),
+                        dtype=reference.dtype,
+                        device=reference.device,
+                    ),
+                },
+                batch_size=obs.batch_size,
+                device=obs.device,
+            )
+            frozen_obs_groups = {obs_set: [*proprio_groups, elevation_set]}
+            frozen_actor = PropMLPElevationFusionModel(
+                obs=frozen_obs,
+                obs_groups=frozen_obs_groups,
+                obs_set=obs_set,
+                output_dim=output_dim,
+                **actor_cfg,
+            )
+            self.ecmm_core = M2MFrozenECMMCore(
+                frozen_actor,
+                checkpoint_path=frozen_ecmm_checkpoint_path,
+                expected_sha256=frozen_ecmm_expected_sha256,
+                actor_state_dict_key=frozen_ecmm_actor_state_dict_key,
+            )
+            self._control_core_kind = "legacy_frozen_m90_ecmm"
+            self._frozen_ecmm_actor_cfg_receipt = actor_cfg_receipt
+            self._frozen_control_core_receipt = None
 
         for name, value in (
             ("gru_hidden_dim", gru_hidden_dim),
@@ -489,7 +614,6 @@ class M2MMapFreeRecurrentStudent(nn.Module):
         self.gru_num_layers = gru_num_layers
         self.latent_hidden_dim = latent_hidden_dim
         self.temporal_input_dim = temporal_input_dim
-        self._frozen_ecmm_actor_cfg_receipt = actor_cfg_receipt
         self._hidden_state: torch.Tensor | None = None
 
     @property
@@ -872,7 +996,20 @@ class M2MMapFreeRecurrentStudent(nn.Module):
     @property
     def output_std(self) -> torch.Tensor:
         """Return the current action-distribution standard deviation."""
-        return self.distribution.std
+        distribution = self.distribution
+        # Mean-action distillation deliberately never calls Distribution.update
+        # during rollout.  The common runner still logs action_std after the
+        # update, so expose the frozen state-independent parameter without
+        # materializing a fake batch distribution.
+        if getattr(distribution, "_distribution", None) is None:
+            std_param = getattr(distribution, "std_param", None)
+            if isinstance(std_param, torch.Tensor):
+                return std_param
+            log_std_param = getattr(distribution, "log_std_param", None)
+            if isinstance(log_std_param, torch.Tensor):
+                return torch.exp(log_std_param)
+            raise RuntimeError("Frozen action distribution has no initialized or static standard deviation.")
+        return distribution.std
 
     @property
     def output_entropy(self) -> torch.Tensor:
@@ -899,7 +1036,11 @@ class M2MMapFreeRecurrentStudent(nn.Module):
     def architecture_receipt(self) -> dict[str, Any]:
         """Return the exact path-free constructor semantics bound by C11/C13."""
         receipt = {
-            "schema": _ARCHITECTURE_RECEIPT_SCHEMA,
+            "schema": (
+                _SCRATCH_ARCHITECTURE_RECEIPT_SCHEMA
+                if self._control_core_kind == "scratch_teacher_full_actor"
+                else _ARCHITECTURE_RECEIPT_SCHEMA
+            ),
             "model_class": f"{type(self).__module__}.{type(self).__qualname__}",
             "actor_interface": {
                 "obs_set": self.obs_set,
@@ -937,13 +1078,22 @@ class M2MMapFreeRecurrentStudent(nn.Module):
                 "latent_hidden_dim": self.latent_hidden_dim,
                 "proprio_feature_in_temporal_input": True,
             },
-            "frozen_ecmm_actor_cfg": copy.deepcopy(self._frozen_ecmm_actor_cfg_receipt),
             "artifact_binding": {
                 "checkpoint_path_embedded": False,
                 "checkpoint_sha256_embedded": False,
                 "checkpoint_binding_owner": "C11_frozen_artifact_receipt",
             },
         }
+        if self._frozen_ecmm_actor_cfg_receipt is not None:
+            # Preserve the legacy receipt byte-for-byte for existing artifacts.
+            receipt["frozen_ecmm_actor_cfg"] = copy.deepcopy(
+                self._frozen_ecmm_actor_cfg_receipt
+            )
+        else:
+            receipt["frozen_control"] = {
+                "kind": self._control_core_kind,
+                "contract": copy.deepcopy(self._frozen_control_core_receipt),
+            }
         # Keep this method safe to embed directly in torch/JSON receipts.
         json.dumps(receipt, sort_keys=True, allow_nan=False)
         return receipt

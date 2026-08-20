@@ -17,7 +17,7 @@ import torch
 from tensordict import TensorDict
 
 from rsl_rl.algorithms import M2MDirectPPO
-from rsl_rl.models import PropMLPElevationFusionModel
+from rsl_rl.models import M2MObservedHistoryScratchTeacher
 from rsl_rl.runners import M2MDirectPpoRunner, resolve_runner_class
 
 
@@ -25,16 +25,44 @@ _NUM_ENVS = 3
 _NUM_STEPS = 4
 _ACTION_DIM = 29
 _STRICT_SET = "m2m_student_current_frame"
-_M90_SET = "height_scan_policy"
+_TEACHER_MAP_SET = "teacher_map"
 _OBS_GROUPS = {
     "actor": ["policy", _STRICT_SET],
     "critic": ["critic", "height_scan_critic"],
 }
 
 
-def _frozen_actor_cfg() -> dict[str, Any]:
+def _map_contract() -> dict[str, Any]:
     return {
-        "hidden_dims": [32, 16],
+        "source": "observed_m52_history",
+        "alignment": "gt_pose_training_only",
+        "target_grid": "m90_spherical_16x96",
+        "uses_future_frames": False,
+        "uses_privileged_terrain_mesh": False,
+        "uses_synthetic_fill": False,
+        "near_range_m": 0.05,
+        "far_range_m": 1.85699,
+        "storage_backend": "voxel_hash_2p5d",
+        "retention_mode": "episode",
+        "voxel_size_m": 0.05,
+        "hash_capacity": 1024,
+        "hash_max_probes": 16,
+    }
+
+
+def _scratch_teacher_actor_cfg() -> dict[str, Any]:
+    return {
+        "class_name": "M2MObservedHistoryScratchTeacher",
+        "obs_set": "teacher",
+        "teacher_map_set": _TEACHER_MAP_SET,
+        "proprio_sets": ["policy"],
+        "map_contract": _map_contract(),
+        "encoder_hidden_channels": [4, 8],
+        "encoder_pooled_spatial_size": [1, 3],
+        "encoder_mlp_hidden_dim": 16,
+        "prop_feature_dim": 64,
+        "prop_hidden_dims": [16],
+        "fusion_hidden_dims": [32, 16],
         "activation": "elu",
         "obs_normalization": True,
         "distribution_cfg": {
@@ -42,19 +70,7 @@ def _frozen_actor_cfg() -> dict[str, Any]:
             "init_std": 0.7,
             "std_type": "scalar",
         },
-        "elevation_set": _M90_SET,
-        "cnn_observation_type": "depthcamera",
-        "depth_camera_near": 0.05,
-        "depth_camera_far": 6.0,
-        "vision_spatial_size": (16, 96),
-        "vision_feature_dim": 64,
-        "elevation_history_length": 1,
-        "cnn_hidden_dims": [4, 8],
-        "cnn_kernel_sizes": [3, 3],
-        "cnn_strides": [2, 2],
-        "prop_feature_dim": 64,
-        "prop_hidden_dims": [16],
-        "use_prop_encoder": True,
+        "strict_runtime_value_checks": False,
     }
 
 
@@ -63,18 +79,21 @@ def _make_frozen_checkpoint(tmp_path: Path) -> tuple[Path, str]:
     obs = TensorDict(
         {
             "policy": torch.randn(2, 96),
-            _M90_SET: torch.rand(2, 1, 16, 96) + 0.05,
+            _TEACHER_MAP_SET: torch.rand(2, 1, 2, 16, 96) + 0.05,
         },
         batch_size=[2],
     )
-    actor = PropMLPElevationFusionModel(
+    cfg = _scratch_teacher_actor_cfg()
+    cfg.pop("class_name")
+    cfg.pop("obs_set")
+    actor = M2MObservedHistoryScratchTeacher(
         obs=obs,
-        obs_groups={"actor": ["policy", _M90_SET]},
-        obs_set="actor",
+        obs_groups={"teacher": ["policy", _TEACHER_MAP_SET]},
+        obs_set="teacher",
         output_dim=_ACTION_DIM,
-        **_frozen_actor_cfg(),
+        **cfg,
     )
-    path = tmp_path / "synthetic_m90.pt"
+    path = tmp_path / "synthetic_scratch_teacher.pt"
     torch.save({"actor_state_dict": actor.state_dict(), "iter": 71}, path)
     return path, hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -117,10 +136,13 @@ def _runner_cfg(
             "class_name": "M2MMapFreeRecurrentStudent",
             "strict_frame_set": _STRICT_SET,
             "proprio_sets": ["policy"],
-            "frozen_ecmm_checkpoint_path": str(checkpoint),
-            "frozen_ecmm_expected_sha256": digest,
-            "frozen_ecmm_actor_state_dict_key": "actor_state_dict",
-            "frozen_ecmm_actor_cfg": _frozen_actor_cfg(),
+            "frozen_ecmm_checkpoint_path": None,
+            "frozen_ecmm_expected_sha256": None,
+            "frozen_ecmm_actor_cfg": None,
+            "scratch_teacher_checkpoint_path": str(checkpoint),
+            "scratch_teacher_expected_sha256": digest,
+            "scratch_teacher_actor_state_dict_key": "actor_state_dict",
+            "scratch_teacher_actor_cfg": _scratch_teacher_actor_cfg(),
             "frame_near_range_m": 0.1,
             "frame_far_range_m": 6.0,
             "frame_message_period_s": 0.1,

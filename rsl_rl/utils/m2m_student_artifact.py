@@ -25,13 +25,19 @@ from rsl_rl.models.m2m_recurrent_student import (
     M2M_FRAME_AGE_SEMANTICS,
     validate_m2m_frame_age_semantics,
 )
+from rsl_rl.models.m2m_frozen_scratch_teacher import M2MFrozenScratchTeacherCore
+from rsl_rl.models.m2m_observed_history_scratch_teacher import (
+    M2MObservedHistoryScratchTeacher,
+)
 from rsl_rl.models.m2m_student_only import (
     M2MStudentOnlyPolicy,
     normalize_m2m_student_network_config,
 )
+from rsl_rl.utils import resolve_callable
 
 _ARTIFACT_SCHEMA = "m2m_student_only_artifact_v2"
 _CONSTRUCTION_SCHEMA = "m2m_student_export_construction_v2"
+_SCRATCH_CONSTRUCTION_SCHEMA = "m2m_student_export_scratch_control_v1"
 _C11_SCHEMA = "m2m_latent_action_distillation_v1"
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _TRAINABLE_PREFIXES = ("frame_tokenizer.", "gru.", "current_encoder.", "latent_head.")
@@ -215,6 +221,131 @@ def _network_config_from_construction(config: Mapping[str, Any]) -> dict[str, An
     )
 
 
+def _normalize_scratch_export_construction_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate a C13 construction receipt backed by one full scratch teacher."""
+    if not isinstance(config, Mapping):
+        raise TypeError("C13 scratch export construction config must be a mapping.")
+    common = {
+        "schema",
+        "obs_set",
+        "output_dim",
+        "strict_frame_set",
+        "proprio_sets",
+        "proprio_group_dims",
+        "scratch_teacher",
+        "frame_near_range_m",
+        "frame_far_range_m",
+        "frame_message_period_s",
+        "frame_max_age_s",
+        "frame_age_semantics",
+        "tokenizer_hidden_channels",
+        "tokenizer_dim",
+        "tokenizer_pooled_spatial_size",
+        "temporal_mode",
+        "gru_hidden_dim",
+        "gru_num_layers",
+        "latent_hidden_dim",
+    }
+    missing = common.difference(config)
+    unexpected = set(config).difference(common)
+    if missing or unexpected:
+        raise ValueError(
+            "C13 scratch construction config key mismatch: "
+            f"missing={sorted(missing)}, unexpected={sorted(unexpected)}."
+        )
+    if config["schema"] != _SCRATCH_CONSTRUCTION_SCHEMA:
+        raise ValueError(f"Unsupported C13 scratch construction schema {config['schema']!r}.")
+    teacher = config["scratch_teacher"]
+    if not isinstance(teacher, Mapping):
+        raise ValueError("scratch_teacher must be a mapping.")
+    teacher_expected = {
+        "class_name",
+        "obs_set",
+        "teacher_map_set",
+        "map_contract",
+        "encoder_hidden_channels",
+        "encoder_pooled_spatial_size",
+        "encoder_mlp_hidden_dim",
+        "prop_feature_dim",
+        "prop_hidden_dims",
+        "fusion_hidden_dims",
+        "activation",
+        "obs_normalization",
+        "distribution_cfg",
+        "strict_runtime_value_checks",
+    }
+    teacher_missing = teacher_expected.difference(teacher)
+    teacher_unexpected = set(teacher).difference(teacher_expected)
+    if teacher_missing or teacher_unexpected:
+        raise ValueError(
+            "C13 scratch_teacher key mismatch: "
+            f"missing={sorted(teacher_missing)}, unexpected={sorted(teacher_unexpected)}."
+        )
+    if teacher["obs_set"] != "teacher":
+        raise ValueError("scratch_teacher.obs_set must be exactly 'teacher'.")
+    if teacher["prop_feature_dim"] != 64:
+        raise ValueError("scratch teacher must expose B64.")
+    if not isinstance(teacher["class_name"], str) or not teacher["class_name"]:
+        raise ValueError("scratch_teacher.class_name must be a non-empty string.")
+
+    # Reuse the mature standalone-network validation by deriving only the B/C
+    # constructor semantics from the scratch teacher.  No map encoder field is
+    # copied into the deployable network.
+    legacy_shape = {
+        key: copy.deepcopy(value)
+        for key, value in config.items()
+        if key not in {"schema", "scratch_teacher"}
+    }
+    legacy_shape.update(
+        {
+            "schema": _CONSTRUCTION_SCHEMA,
+            "frozen_ecmm_actor_cfg": {
+                "hidden_dims": teacher["fusion_hidden_dims"],
+                "activation": teacher["activation"],
+                "obs_normalization": teacher["obs_normalization"],
+                "distribution_cfg": teacher["distribution_cfg"],
+                "prop_feature_dim": teacher["prop_feature_dim"],
+                "prop_hidden_dims": teacher["prop_hidden_dims"],
+                "use_prop_encoder": True,
+                "vision_feature_dim": 64,
+            },
+        }
+    )
+    normalized_legacy = _normalize_export_construction_config(legacy_shape)
+    try:
+        normalized_teacher = json.loads(json.dumps(copy.deepcopy(dict(teacher)), allow_nan=False))
+    except (TypeError, ValueError) as error:
+        raise ValueError("scratch_teacher must contain finite JSON metadata.") from error
+    result = {
+        key: value
+        for key, value in normalized_legacy.items()
+        if key not in {"schema", "frozen_ecmm_actor_cfg"}
+    }
+    result["schema"] = _SCRATCH_CONSTRUCTION_SCHEMA
+    result["scratch_teacher"] = normalized_teacher
+    return result
+
+
+def _network_config_from_scratch_construction(config: Mapping[str, Any]) -> dict[str, Any]:
+    teacher = config["scratch_teacher"]
+    legacy = {
+        key: copy.deepcopy(value)
+        for key, value in config.items()
+        if key not in {"schema", "scratch_teacher"}
+    }
+    legacy["frozen_ecmm_actor_cfg"] = {
+        "hidden_dims": teacher["fusion_hidden_dims"],
+        "activation": teacher["activation"],
+        "obs_normalization": teacher["obs_normalization"],
+        "distribution_cfg": teacher["distribution_cfg"],
+        "prop_feature_dim": teacher["prop_feature_dim"],
+        "prop_hidden_dims": teacher["prop_hidden_dims"],
+        "use_prop_encoder": True,
+        "vision_feature_dim": 64,
+    }
+    return _network_config_from_construction(legacy)
+
+
 def _construction_observations(config: Mapping[str, Any]) -> TensorDict:
     data = {
         group: torch.zeros(1, int(config["proprio_group_dims"][group]), dtype=torch.float32)
@@ -228,11 +359,21 @@ def _construction_observations(config: Mapping[str, Any]) -> TensorDict:
     return TensorDict(data, batch_size=[1])
 
 
+def _scratch_construction_observations(config: Mapping[str, Any]) -> TensorDict:
+    obs = _construction_observations(config)
+    teacher = config["scratch_teacher"]
+    map_set = teacher["teacher_map_set"]
+    if not isinstance(map_set, str) or not map_set or map_set in obs:
+        raise ValueError("scratch teacher_map_set must be a distinct non-empty group name.")
+    obs[map_set] = torch.zeros(1, 1, 2, 16, 96, dtype=torch.float32)
+    return obs
+
+
 def _validate_c11_source(
     checkpoint: dict[str, Any],
     *,
     student: M2MMapFreeRecurrentStudent,
-    expected_m90_sha256: str,
+    expected_control_sha256: str,
     actor_state_dict_key: str,
 ) -> dict[str, torch.Tensor]:
     required = {
@@ -259,10 +400,10 @@ def _validate_c11_source(
     frozen_receipt = checkpoint["frozen_artifact_receipt"]
     if not isinstance(frozen_receipt, Mapping):
         raise ValueError("C11 frozen_artifact_receipt must be a mapping.")
-    if frozen_receipt.get("checkpoint_sha256") != expected_m90_sha256:
-        raise ValueError("C11 frozen receipt and explicitly selected M90 SHA-256 differ.")
+    if frozen_receipt.get("checkpoint_sha256") != expected_control_sha256:
+        raise ValueError("C11 frozen receipt and explicitly selected control SHA-256 differ.")
     if frozen_receipt.get("actor_state_dict_key") != actor_state_dict_key:
-        raise ValueError("C11 frozen receipt and selected M90 actor state key differ.")
+        raise ValueError("C11 frozen receipt and selected control actor state key differ.")
     if frozen_receipt.get("checkpoint_bytes_saved") is not False:
         raise ValueError("C11 frozen receipt must state checkpoint_bytes_saved=False.")
 
@@ -408,7 +549,7 @@ def build_m2m_student_artifact_payload(
     trainable_state = _validate_c11_source(
         c11,
         student=student,
-        expected_m90_sha256=m90_digest,
+        expected_control_sha256=m90_digest,
         actor_state_dict_key=actor_state_dict_key,
     )
     _load_c11_trainable_state(student, trainable_state)
@@ -480,6 +621,169 @@ def build_m2m_student_artifact_payload(
     }
 
 
+def build_m2m_scratch_student_artifact_payload(
+    *,
+    distillation_checkpoint_path: str | Path,
+    expected_distillation_sha256: str,
+    scratch_teacher_checkpoint_path: str | Path,
+    expected_scratch_teacher_sha256: str,
+    construction_config: Mapping[str, Any],
+    actor_state_dict_key: str = "actor_state_dict",
+) -> dict[str, Any]:
+    """Build a standalone student from C11 plus one full scratch teacher."""
+    if not isinstance(actor_state_dict_key, str) or not actor_state_dict_key:
+        raise ValueError("actor_state_dict_key must be a non-empty string.")
+    teacher_digest = _validate_sha256(
+        expected_scratch_teacher_sha256,
+        label="scratch teacher expected SHA-256",
+    )
+    normalized = _normalize_scratch_export_construction_config(construction_config)
+    network_config = _network_config_from_scratch_construction(normalized)
+    _distill_path, distill_bytes = _read_verified_bytes(
+        distillation_checkpoint_path,
+        expected_distillation_sha256,
+        label="C11 distillation checkpoint",
+    )
+    teacher_path, _teacher_bytes = _read_verified_bytes(
+        scratch_teacher_checkpoint_path,
+        teacher_digest,
+        label="scratch teacher checkpoint",
+    )
+    c11 = _weights_only_mapping(distill_bytes, label="C11 distillation checkpoint")
+    obs = _scratch_construction_observations(normalized)
+
+    teacher_cfg = copy.deepcopy(normalized["scratch_teacher"])
+    teacher_class_name = teacher_cfg.pop("class_name")
+    teacher_obs_set = teacher_cfg.pop("obs_set")
+    teacher_class = resolve_callable(teacher_class_name)
+    if not isinstance(teacher_class, type) or not issubclass(
+        teacher_class, M2MObservedHistoryScratchTeacher
+    ):
+        raise TypeError("scratch_teacher.class_name must resolve to a scratch-teacher actor.")
+    map_set = teacher_cfg["teacher_map_set"]
+    teacher = teacher_class(
+        obs,
+        {teacher_obs_set: [*normalized["proprio_sets"], map_set]},
+        teacher_obs_set,
+        normalized["output_dim"],
+        proprio_sets=normalized["proprio_sets"],
+        **teacher_cfg,
+    )
+    core = M2MFrozenScratchTeacherCore(
+        teacher,
+        checkpoint_path=teacher_path,
+        expected_sha256=teacher_digest,
+        actor_state_dict_key=actor_state_dict_key,
+    )
+    student = M2MMapFreeRecurrentStudent(
+        obs,
+        {
+            normalized["obs_set"]: [
+                *normalized["proprio_sets"],
+                normalized["strict_frame_set"],
+            ]
+        },
+        normalized["obs_set"],
+        normalized["output_dim"],
+        strict_frame_set=normalized["strict_frame_set"],
+        proprio_sets=normalized["proprio_sets"],
+        shared_ecmm_core=core,
+        frame_near_range_m=normalized["frame_near_range_m"],
+        frame_far_range_m=normalized["frame_far_range_m"],
+        frame_message_period_s=normalized["frame_message_period_s"],
+        frame_max_age_s=normalized["frame_max_age_s"],
+        frame_age_semantics=normalized["frame_age_semantics"],
+        tokenizer_hidden_channels=normalized["tokenizer_hidden_channels"],
+        tokenizer_dim=normalized["tokenizer_dim"],
+        tokenizer_pooled_spatial_size=tuple(normalized["tokenizer_pooled_spatial_size"]),
+        temporal_mode=normalized["temporal_mode"],
+        gru_hidden_dim=normalized["gru_hidden_dim"],
+        gru_num_layers=normalized["gru_num_layers"],
+        latent_hidden_dim=normalized["latent_hidden_dim"],
+    )
+    trainable_state = _validate_c11_source(
+        c11,
+        student=student,
+        expected_control_sha256=teacher_digest,
+        actor_state_dict_key=actor_state_dict_key,
+    )
+    _load_c11_trainable_state(student, trainable_state)
+    student.eval()
+    policy = _copy_training_student_to_deployment(student, network_config)
+    student_obs = TensorDict(
+        {
+            group: obs[group]
+            for group in [*normalized["proprio_sets"], normalized["strict_frame_set"]]
+        },
+        batch_size=obs.batch_size,
+    )
+
+    student.reset()
+    policy.reset()
+    with torch.no_grad():
+        expected_action, expected_latent = student.forward_with_latent(student_obs)
+        actual_action = policy(student_obs)
+        actual_hidden = policy.get_hidden_state()
+        policy.reset()
+        proprio = torch.cat([student_obs[group] for group in policy.proprio_sets], dim=-1)
+        direct_action, actual_latent, direct_hidden = policy.step_tensors(
+            proprio,
+            student_obs[policy.strict_frame_set],
+        )
+    torch.testing.assert_close(actual_action, expected_action, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(direct_action, expected_action, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(actual_latent, expected_latent, rtol=0.0, atol=0.0)
+    if policy.is_recurrent:
+        torch.testing.assert_close(actual_hidden, direct_hidden, rtol=0.0, atol=0.0)
+
+    state = {key: value.detach().cpu().clone() for key, value in policy.state_dict().items()}
+    invalid_state_keys = [key for key in state if not key.startswith(_STATE_PREFIXES)]
+    if invalid_state_keys:
+        raise RuntimeError(f"Student-only state contains unexpected component keys {invalid_state_keys}.")
+    config_sha = _canonical_json_sha256(network_config, label="student-only network config")
+    source_receipt = {
+        "distillation_checkpoint_sha256": _sha256_bytes(distill_bytes),
+        "distillation_schema": c11["schema"],
+        "distillation_algorithm_iteration": c11["algorithm_iteration"],
+        "distillation_config_receipt_sha256": _canonical_json_sha256(
+            c11["config_receipt"], label="C11 config receipt"
+        ),
+        "control_artifact_kind": "scratch_teacher_ordinary_ppo_full_actor",
+        "scratch_teacher_checkpoint_sha256": teacher_digest,
+        "scratch_teacher_actor_state_dict_key": actor_state_dict_key,
+        "source_paths_embedded": False,
+        "source_checkpoint_bytes_embedded": False,
+    }
+    input_receipt = {
+        "ordered_groups": list(policy.obs_groups),
+        "proprio_sets": list(policy.proprio_sets),
+        "proprio_group_dims": dict(policy.proprio_group_dims),
+        "strict_frame_set": policy.strict_frame_set,
+        "strict_frame_shape": list(M2MStrictFrameTokenizer.frame_shape),
+        "strict_frame_channels": list(M2MStrictFrameTokenizer.channels),
+        "frame_age_semantics": policy.frame_age_semantics,
+        "recurrent_hidden_shape": (
+            [policy.gru_num_layers, "batch", policy.gru_hidden_dim]
+            if policy.is_recurrent
+            else False
+        ),
+    }
+    return {
+        "schema": _ARTIFACT_SCHEMA,
+        "network_config": network_config,
+        "network_config_sha256": config_sha,
+        "input_receipt": input_receipt,
+        "dependency_receipt": copy.deepcopy(_DEPENDENCY_RECEIPT),
+        "source_receipt": source_receipt,
+        "state_receipt": {
+            "content_sha256": _state_content_sha256(state),
+            "keys": sorted(state),
+            "tensor_count": len(state),
+        },
+        "student_state_dict": state,
+    }
+
+
 def _input_receipt_from_network_config(config: Mapping[str, Any]) -> dict[str, Any]:
     """Derive the complete deployment-input receipt without constructing a policy."""
     recurrent_hidden_shape: list[int | str] | bool
@@ -538,29 +842,51 @@ def _validate_artifact_payload(
     source_receipt = payload["source_receipt"]
     if not isinstance(source_receipt, Mapping):
         raise ValueError("Student-only source_receipt must be a mapping.")
-    expected_source_keys = {
+    common_source_keys = {
         "distillation_checkpoint_sha256",
         "distillation_schema",
         "distillation_algorithm_iteration",
         "distillation_config_receipt_sha256",
-        "frozen_m90_checkpoint_sha256",
-        "frozen_m90_actor_state_dict_key",
         "source_paths_embedded",
         "source_checkpoint_bytes_embedded",
     }
-    if set(source_receipt) != expected_source_keys:
+    legacy_source_keys = common_source_keys | {
+        "frozen_m90_checkpoint_sha256",
+        "frozen_m90_actor_state_dict_key",
+    }
+    scratch_source_keys = common_source_keys | {
+        "control_artifact_kind",
+        "scratch_teacher_checkpoint_sha256",
+        "scratch_teacher_actor_state_dict_key",
+    }
+    source_keys = set(source_receipt)
+    if source_keys not in (legacy_source_keys, scratch_source_keys):
         raise ValueError("Student-only source_receipt keys differ from the C13 schema.")
     _validate_sha256(source_receipt.get("distillation_checkpoint_sha256"), label="source C11 SHA-256")
-    _validate_sha256(source_receipt.get("frozen_m90_checkpoint_sha256"), label="source M90 SHA-256")
     _validate_sha256(source_receipt.get("distillation_config_receipt_sha256"), label="C11 config SHA-256")
     if source_receipt.get("distillation_schema") != _C11_SCHEMA:
         raise ValueError("Student-only source receipt has an unsupported distillation schema.")
     source_iteration = source_receipt.get("distillation_algorithm_iteration")
     if type(source_iteration) is not int or source_iteration < 0:
         raise ValueError("Student-only source receipt iteration must be a non-negative integer.")
-    source_state_key = source_receipt.get("frozen_m90_actor_state_dict_key")
-    if not isinstance(source_state_key, str) or not source_state_key:
-        raise ValueError("Student-only source receipt requires the external M90 actor state key.")
+    if source_keys == legacy_source_keys:
+        _validate_sha256(
+            source_receipt.get("frozen_m90_checkpoint_sha256"),
+            label="source M90 SHA-256",
+        )
+        source_state_key = source_receipt.get("frozen_m90_actor_state_dict_key")
+        if not isinstance(source_state_key, str) or not source_state_key:
+            raise ValueError("Student-only source receipt requires the external M90 actor state key.")
+    else:
+        if source_receipt.get("control_artifact_kind") != "scratch_teacher_ordinary_ppo_full_actor":
+            raise ValueError("Student-only scratch source receipt has an unsupported control artifact kind.")
+        _validate_sha256(
+            source_receipt.get("scratch_teacher_checkpoint_sha256"),
+            label="source scratch-teacher SHA-256",
+        )
+        source_state_key = source_receipt.get("scratch_teacher_actor_state_dict_key")
+        if not isinstance(source_state_key, str) or not source_state_key:
+            raise ValueError("Student-only source receipt requires the scratch-teacher actor state key.")
     if source_receipt.get("source_paths_embedded") is not False:
         raise ValueError("Student-only artifact must not embed source paths.")
     if source_receipt.get("source_checkpoint_bytes_embedded") is not False:
@@ -800,6 +1126,17 @@ def _parser() -> argparse.ArgumentParser:
     export.add_argument("--actor-state-dict-key", default="actor_state_dict")
     export.add_argument("--construction-config", required=True)
     export.add_argument("--output", required=True)
+    export_scratch = subparsers.add_parser(
+        "export-scratch",
+        help="Build a create-only C13 artifact from one full scratch-teacher checkpoint.",
+    )
+    export_scratch.add_argument("--distillation-checkpoint", required=True)
+    export_scratch.add_argument("--distillation-sha256", required=True)
+    export_scratch.add_argument("--scratch-teacher-checkpoint", required=True)
+    export_scratch.add_argument("--scratch-teacher-sha256", required=True)
+    export_scratch.add_argument("--actor-state-dict-key", default="actor_state_dict")
+    export_scratch.add_argument("--construction-config", required=True)
+    export_scratch.add_argument("--output", required=True)
     inspect = subparsers.add_parser("inspect", help="Strictly inspect an existing C13 artifact.")
     inspect.add_argument("--artifact", required=True)
     inspect.add_argument("--sha256", required=True)
@@ -833,6 +1170,16 @@ def main(argv: list[str] | None = None) -> int:
             actor_state_dict_key=args.actor_state_dict_key,
         )
         result = write_m2m_student_artifact(payload, args.output)
+    elif args.command == "export-scratch":
+        payload = build_m2m_scratch_student_artifact_payload(
+            distillation_checkpoint_path=args.distillation_checkpoint,
+            expected_distillation_sha256=args.distillation_sha256,
+            scratch_teacher_checkpoint_path=args.scratch_teacher_checkpoint,
+            expected_scratch_teacher_sha256=args.scratch_teacher_sha256,
+            construction_config=_load_json_mapping(args.construction_config),
+            actor_state_dict_key=args.actor_state_dict_key,
+        )
+        result = write_m2m_student_artifact(payload, args.output)
     elif args.command == "inspect":
         result = inspect_m2m_student_artifact(
             args.artifact,
@@ -857,6 +1204,7 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "build_m2m_scratch_student_artifact_payload",
     "build_m2m_student_artifact_payload",
     "export_m2m_student_backends",
     "inspect_m2m_student_artifact",

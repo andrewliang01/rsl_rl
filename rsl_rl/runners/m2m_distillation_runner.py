@@ -27,6 +27,7 @@ from typing import Any
 
 from rsl_rl.algorithms import M2MDistillationLossConfig, M2MLatentActionDistillation
 from rsl_rl.env import VecEnv
+from rsl_rl.models import M2MFrozenScratchTeacherCore
 from rsl_rl.storage import M2MSequenceRolloutStorage
 from rsl_rl.utils import resolve_callable, resolve_obs_groups
 from rsl_rl.utils.logger import Logger
@@ -223,21 +224,110 @@ class M2MDistillationRunner(DistillationRunner):
         self._formal_updates_completed = 0
         self._formal_resume_loaded = False
 
-    def _construct_m2m_algorithm(self, obs: TensorDict) -> M2MLatentActionDistillation:
-        if type(self.env.num_envs) is not int or self.env.num_envs <= 0:
-            raise ValueError("M2M env.num_envs must be an exact positive integer.")
-        if type(self.env.num_actions) is not int or self.env.num_actions != 29:
-            raise ValueError(f"M2M Unitree-G1 requires env.num_actions=29, got {self.env.num_actions!r}.")
-        rollout_length = _exact_positive_int(self.cfg.get("num_steps_per_env"), field="num_steps_per_env")
+    def _construct_scratch_teacher_models(
+        self,
+        obs: TensorDict,
+    ) -> tuple[nn.Module, nn.Module, dict[str, Any]]:
+        """Build one full frozen teacher artifact and its shared map-free student."""
+        if self.cfg.get("frozen_ecmm_artifact") is not None or self.cfg.get("teacher_artifact") is not None:
+            raise ValueError(
+                "scratch_teacher_artifact is mutually exclusive with legacy frozen_ecmm_artifact/teacher_artifact."
+            )
+        path, digest, actor_state_key, _ = _validate_artifact_config(
+            self.cfg.get("scratch_teacher_artifact"),
+            field="scratch_teacher_artifact",
+            allow_actor_state_key=True,
+        )
+        assert actor_state_key is not None
 
-        obs_groups_value = self.cfg.get("obs_groups")
-        obs_groups = _mapping_copy(obs_groups_value, field="obs_groups")
-        # Unlike generic RSL-RL fallback behavior, both scientific input sets
-        # are mandatory and explicit.
-        if "student" not in obs_groups or "teacher" not in obs_groups:
-            raise ValueError("M2M obs_groups must explicitly define both 'student' and 'teacher'.")
-        self.cfg["obs_groups"] = resolve_obs_groups(obs, obs_groups, ["student", "teacher"])
+        teacher_cfg = _mapping_copy(self.cfg.get("teacher"), field="teacher")
+        teacher_owned = (
+            _ARTIFACT_PATH_KEYS
+            | _CONSTRUCTOR_OWNED_KEYS
+            | _FROZEN_ECMM_INJECTION_KEYS
+            | {"frozen_ecmm_actor_cfg"}
+        ).intersection(teacher_cfg)
+        if teacher_owned:
+            raise ValueError(
+                "Scratch teacher constructor/artifact fields are runner-owned: "
+                f"{sorted(teacher_owned)}."
+            )
+        teacher_class = _model_class(teacher_cfg, field="teacher")
+        teacher_obs_set = teacher_cfg.pop("obs_set", None)
+        if teacher_obs_set != "teacher":
+            raise ValueError("teacher.obs_set must be exactly 'teacher'.")
+        teacher = teacher_class(
+            obs=obs,
+            obs_groups=self.cfg["obs_groups"],
+            obs_set=teacher_obs_set,
+            output_dim=self.env.num_actions,
+            **teacher_cfg,
+        )
+        core = M2MFrozenScratchTeacherCore(
+            teacher,
+            checkpoint_path=path,
+            expected_sha256=digest,
+            actor_state_dict_key=actor_state_key,
+        )
 
+        student_cfg = _mapping_copy(self.cfg.get("student"), field="student")
+        student_owned = (
+            _ARTIFACT_PATH_KEYS | _CONSTRUCTOR_OWNED_KEYS | _FROZEN_ECMM_INJECTION_KEYS
+        ).intersection(student_cfg)
+        if student_owned:
+            raise ValueError(
+                "Student constructor/artifact fields are runner-owned; configure scratch_teacher_artifact: "
+                f"{sorted(student_owned)}."
+            )
+        # A scratch core supplies its own architecture; admitting the legacy
+        # actor mapping here would silently mix two control policies.
+        if "frozen_ecmm_actor_cfg" in student_cfg:
+            raise ValueError("Scratch-teacher student config must not contain frozen_ecmm_actor_cfg.")
+        student_class = _model_class(student_cfg, field="student")
+        student_obs_set = student_cfg.pop("obs_set", None)
+        if student_obs_set != "student":
+            raise ValueError("student.obs_set must be exactly 'student'.")
+        student = student_class(
+            obs=obs,
+            obs_groups=self.cfg["obs_groups"],
+            obs_set=student_obs_set,
+            output_dim=self.env.num_actions,
+            shared_ecmm_core=core,
+            **student_cfg,
+        )
+        if getattr(student, "ecmm_core", None) is not core:
+            raise RuntimeError("Scratch-teacher student did not preserve the shared frozen core identity.")
+
+        audit = core.parameter_audit()
+        receipt = {
+            "checkpoint_sha256": digest,
+            "actor_state_dict_key": actor_state_key,
+            "contract": audit["contract"],
+            "artifact_kind": "scratch_teacher_ordinary_ppo_full_actor",
+            "checkpoint_path_source": "external_runner_configuration",
+            "checkpoint_bytes_saved": False,
+            "teacher_artifact": {
+                "checkpoint_sha256": digest,
+                "schema": "ordinary_ppo_full_actor_state_dict",
+                "checkpoint_state_key": actor_state_key,
+                "container_schema": None,
+                "checkpoint_path_source": "same_scratch_teacher_artifact",
+                "checkpoint_bytes_saved": False,
+            },
+        }
+        self._artifact_mode = "scratch_teacher_full_actor"
+        self._frozen_ecmm_artifact_path = path.resolve()
+        self._teacher_artifact_path = path.resolve()
+        self._frozen_ecmm_sha256 = digest
+        self._teacher_artifact_sha256 = digest
+        self._teacher_checkpoint_state_key = actor_state_key
+        return student, core.actor, receipt
+
+    def _construct_legacy_models(
+        self,
+        obs: TensorDict,
+    ) -> tuple[nn.Module, nn.Module, dict[str, Any]]:
+        """Preserve the original frozen-M90 plus C06 map-only path."""
         frozen_path, frozen_sha256, actor_state_key, _ = _validate_artifact_config(
             self.cfg.get("frozen_ecmm_artifact"),
             field="frozen_ecmm_artifact",
@@ -250,6 +340,7 @@ class M2MDistillationRunner(DistillationRunner):
             allow_actor_state_key=False,
             allow_checkpoint_state_key=True,
         )
+        self._artifact_mode = "legacy_m90_plus_c06"
         self._frozen_ecmm_artifact_path = frozen_path.resolve()
         self._teacher_artifact_path = teacher_path.resolve()
         self._frozen_ecmm_sha256 = frozen_sha256
@@ -257,9 +348,9 @@ class M2MDistillationRunner(DistillationRunner):
         self._teacher_checkpoint_state_key = teacher_checkpoint_state_key
 
         student_cfg = _mapping_copy(self.cfg.get("student"), field="student")
-        student_owned = (_ARTIFACT_PATH_KEYS | _CONSTRUCTOR_OWNED_KEYS | _FROZEN_ECMM_INJECTION_KEYS).intersection(
-            student_cfg
-        )
+        student_owned = (
+            _ARTIFACT_PATH_KEYS | _CONSTRUCTOR_OWNED_KEYS | _FROZEN_ECMM_INJECTION_KEYS
+        ).intersection(student_cfg)
         if student_owned:
             raise ValueError(
                 "student constructor/artifact fields are runner-owned; configure frozen_ecmm_artifact instead: "
@@ -282,7 +373,10 @@ class M2MDistillationRunner(DistillationRunner):
 
         teacher_cfg = _mapping_copy(self.cfg.get("teacher"), field="teacher")
         teacher_owned = (
-            _ARTIFACT_PATH_KEYS | _CONSTRUCTOR_OWNED_KEYS | _FROZEN_ECMM_INJECTION_KEYS | {"frozen_ecmm_actor_cfg"}
+            _ARTIFACT_PATH_KEYS
+            | _CONSTRUCTOR_OWNED_KEYS
+            | _FROZEN_ECMM_INJECTION_KEYS
+            | {"frozen_ecmm_actor_cfg"}
         ).intersection(teacher_cfg)
         if teacher_owned:
             raise ValueError(
@@ -304,7 +398,6 @@ class M2MDistillationRunner(DistillationRunner):
         load_teacher = getattr(teacher, "load_checkpoint_state", None)
         if not callable(load_teacher):
             raise TypeError("M2M teacher must expose load_checkpoint_state(checkpoint).")
-        # SHA validation above always precedes this safe deserialization.
         teacher_container = torch.load(teacher_path, map_location="cpu", weights_only=True)
         if not isinstance(teacher_container, Mapping):
             raise TypeError("teacher_artifact checkpoint root must be a mapping.")
@@ -312,10 +405,10 @@ class M2MDistillationRunner(DistillationRunner):
         if teacher_checkpoint_state_key is None:
             teacher_checkpoint = teacher_container
         else:
-            teacher_container_schema_value = teacher_container.get("schema")
-            if not isinstance(teacher_container_schema_value, str) or not teacher_container_schema_value:
+            container_schema = teacher_container.get("schema")
+            if not isinstance(container_schema, str) or not container_schema:
                 raise ValueError("Nested teacher artifact container must contain a non-empty schema string.")
-            teacher_container_schema = teacher_container_schema_value
+            teacher_container_schema = container_schema
             if teacher_checkpoint_state_key not in teacher_container:
                 raise KeyError(
                     "teacher_artifact checkpoint is missing configured checkpoint_state_key "
@@ -328,6 +421,36 @@ class M2MDistillationRunner(DistillationRunner):
         if not isinstance(teacher_schema, str) or not teacher_schema:
             raise ValueError("teacher_artifact must contain a non-empty schema string.")
         load_teacher(teacher_checkpoint)
+        receipt = _artifact_receipt(
+            student=student,
+            frozen_sha256=frozen_sha256,
+            actor_state_dict_key=actor_state_key,
+            teacher_sha256=teacher_sha256,
+            teacher_schema=teacher_schema,
+            teacher_checkpoint_state_key=teacher_checkpoint_state_key,
+            teacher_container_schema=teacher_container_schema,
+        )
+        return student, teacher, receipt
+
+    def _construct_m2m_algorithm(self, obs: TensorDict) -> M2MLatentActionDistillation:
+        if type(self.env.num_envs) is not int or self.env.num_envs <= 0:
+            raise ValueError("M2M env.num_envs must be an exact positive integer.")
+        if type(self.env.num_actions) is not int or self.env.num_actions != 29:
+            raise ValueError(f"M2M Unitree-G1 requires env.num_actions=29, got {self.env.num_actions!r}.")
+        rollout_length = _exact_positive_int(self.cfg.get("num_steps_per_env"), field="num_steps_per_env")
+
+        obs_groups_value = self.cfg.get("obs_groups")
+        obs_groups = _mapping_copy(obs_groups_value, field="obs_groups")
+        # Unlike generic RSL-RL fallback behavior, both scientific input sets
+        # are mandatory and explicit.
+        if "student" not in obs_groups or "teacher" not in obs_groups:
+            raise ValueError("M2M obs_groups must explicitly define both 'student' and 'teacher'.")
+        self.cfg["obs_groups"] = resolve_obs_groups(obs, obs_groups, ["student", "teacher"])
+
+        if self.cfg.get("scratch_teacher_artifact") is not None:
+            student, teacher, receipt = self._construct_scratch_teacher_models(obs)
+        else:
+            student, teacher, receipt = self._construct_legacy_models(obs)
 
         storage_cfg = _mapping_copy(self.cfg.get("storage"), field="storage")
         allowed_storage_keys = {
@@ -415,15 +538,6 @@ class M2MDistillationRunner(DistillationRunner):
         if not isinstance(loss_value, Mapping):
             raise TypeError("algorithm.loss_config must be an explicit mapping.")
         loss_config = M2MDistillationLossConfig(**copy.deepcopy(dict(loss_value)))
-        receipt = _artifact_receipt(
-            student=student,
-            frozen_sha256=frozen_sha256,
-            actor_state_dict_key=actor_state_key,
-            teacher_sha256=teacher_sha256,
-            teacher_schema=teacher_schema,
-            teacher_checkpoint_state_key=teacher_checkpoint_state_key,
-            teacher_container_schema=teacher_container_schema,
-        )
         algorithm = algorithm_class(
             student,
             teacher,
@@ -536,6 +650,7 @@ class M2MDistillationRunner(DistillationRunner):
             "runner_factory_integrated": True,
             "teacher_loaded": self.alg.teacher_loaded,
             "artifacts": {
+                "mode": self._artifact_mode,
                 "frozen_ecmm_sha256": self._frozen_ecmm_sha256,
                 "teacher_sha256": self._teacher_artifact_sha256,
                 "teacher_checkpoint_state_key": self._teacher_checkpoint_state_key,

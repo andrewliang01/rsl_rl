@@ -336,6 +336,13 @@ class M2MObservedHistoryScratchTeacher(nn.Module):
         proprio = torch.cat([obs[group] for group in self.proprio_sets], dim=-1)
         return self.prop_mlp(self.obs_normalizer(proprio))
 
+    def encode_proprio(self, obs: TensorDict) -> torch.Tensor:
+        """Expose the exact B64 interface shared with a map-free student."""
+        features = self._proprio(obs)
+        if features.shape[-1] != self.prop_feature_dim:
+            raise RuntimeError(f"Scratch teacher B produced invalid shape {tuple(features.shape)}.")
+        return features
+
     def predict_latent(self, obs: TensorDict) -> torch.Tensor:
         if self.teacher_map_set not in obs:
             raise KeyError(f"Observation is missing {self.teacher_map_set!r}.")

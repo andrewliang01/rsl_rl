@@ -7,9 +7,9 @@
 
 The algorithm deliberately keeps ordinary PPO rollout, GAE, clipped losses,
 recurrent mini-batches, and critic updates.  Its only special responsibilities
-are enforcing the F14 frozen-control boundary, excluding frozen M90 parameters
+are enforcing the F14 frozen-control boundary, excluding frozen teacher parameters
 from the optimizer, and saving a resumable checkpoint without copying the
-externally identified M90 artifact bytes.
+externally identified control artifact bytes.
 """
 
 from __future__ import annotations
@@ -135,7 +135,7 @@ class M2MDirectPPO(PPO):
             raise ValueError("M2M direct PPO actor audit lacks component counts.")
         frozen = components.get("frozen_ecmm")
         if not isinstance(frozen, Mapping) or frozen.get("trainable") != 0:
-            raise ValueError("M2M direct PPO actor audit did not confirm a frozen ECMM core.")
+            raise ValueError("M2M direct PPO actor audit did not confirm a frozen control core.")
         if audit.get("temporal_mode") != "gru" or audit.get("is_recurrent") is not True:
             raise ValueError("M2M direct PPO actor audit differs from the GRU contract.")
 
@@ -143,7 +143,7 @@ class M2MDirectPPO(PPO):
         if not isinstance(core, nn.Module):
             raise TypeError("M2M direct PPO actor must expose its frozen ecmm_core.")
         if any(parameter.requires_grad for parameter in core.parameters()):
-            raise ValueError("M2M direct PPO frozen ECMM core contains trainable parameters.")
+            raise ValueError("M2M direct PPO frozen control core contains trainable parameters.")
 
     def _assert_optimizer_and_gradient_boundary(self) -> None:
         optimizer_ids = {
@@ -185,9 +185,9 @@ class M2MDirectPPO(PPO):
         digest = getattr(core, "checkpoint_sha256", None)
         state_key = getattr(core, "actor_state_dict_key", None)
         if not isinstance(digest, str) or len(digest) != 64:
-            raise ValueError("M2M direct PPO frozen ECMM core lacks a SHA-256 receipt.")
+            raise ValueError("M2M direct PPO frozen control core lacks a SHA-256 receipt.")
         if not isinstance(state_key, str) or not state_key:
-            raise ValueError("M2M direct PPO frozen ECMM core lacks an actor state key receipt.")
+            raise ValueError("M2M direct PPO frozen control core lacks an actor state key receipt.")
         return {
             "checkpoint_sha256": digest,
             "actor_state_dict_key": state_key,
