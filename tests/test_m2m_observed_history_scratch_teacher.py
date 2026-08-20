@@ -87,6 +87,7 @@ def test_all_a_b_c_and_distribution_parameters_train_from_random_initialization(
     assert audit["architecture"]["training_initialization"] == "random_no_pretrained_policy"
     assert audit["architecture"]["map_contract"]["channels"] == ["range_m", "valid"]
     assert audit["architecture"]["map_contract"]["retention_mode"] == "episode"
+    assert audit["architecture"]["map_contract"]["query_frame"] == "full_pose"
     assert audit["architecture"]["map_contract"]["timestamp_visibility"] == "mapper_internal_only"
     assert model.map_encoder.spatial_encoder[0].conv.in_channels == 2
     assert audit["checkpoint_contract"]["owner"] == "ordinary_PPO_full_actor_state_dict"
@@ -96,6 +97,28 @@ def test_all_a_b_c_and_distribution_parameters_train_from_random_initialization(
         "control_head_C",
         "distribution",
     }
+
+
+def test_query_frame_is_receipted_and_invalid_frame_fails_closed() -> None:
+    contract = _contract()
+    contract["query_frame"] = "gravity_yaw"
+    model = _model(map_contract=contract)
+    assert model.architecture_receipt()["map_contract"]["query_frame"] == "gravity_yaw"
+
+    contract["query_frame"] = "body_roll_pitch"
+    with pytest.raises(ValueError, match="query_frame"):
+        _model(map_contract=contract)
+
+
+def test_action_distribution_must_resolve_to_rsl_distribution() -> None:
+    with pytest.raises(ValueError, match="Distribution subclass"):
+        _model(
+            distribution_cfg={
+                "class_name": "torch.nn.Linear",
+                "init_std": 1.0,
+                "std_type": "scalar",
+            }
+        )
 
 
 def test_forward_and_joint_gradients_cover_a_b_c() -> None:

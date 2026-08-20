@@ -59,6 +59,7 @@ class M2MScratchTeacherMapContract:
     voxel_size_m: float
     hash_capacity: int
     hash_max_probes: int
+    query_frame: str = "full_pose"
 
     SHAPE: ClassVar[tuple[int, int, int, int]] = (1, 2, 16, 96)
     CHANNELS: ClassVar[tuple[str, str]] = ("range_m", "valid")
@@ -91,6 +92,8 @@ class M2MScratchTeacherMapContract:
             raise ValueError("hash_capacity must be a power of two >= 2.")
         if not 1 <= self.hash_max_probes <= self.hash_capacity:
             raise ValueError("hash_max_probes must be within hash capacity.")
+        if self.query_frame not in ("full_pose", "gravity_yaw"):
+            raise ValueError("query_frame must be 'full_pose' or 'gravity_yaw'.")
 
     def audit(self) -> dict[str, Any]:
         result = asdict(self)
@@ -234,7 +237,13 @@ class M2MObservedHistoryScratchTeacher(nn.Module):
         class_name = distribution_values.pop("class_name", None)
         if not isinstance(class_name, str) or not class_name:
             raise ValueError("distribution_cfg.class_name must be a non-empty string.")
-        distribution_class: type[Distribution] = resolve_callable(class_name)
+        distribution_class = resolve_callable(class_name)
+        if not isinstance(distribution_class, type) or not issubclass(
+            distribution_class, Distribution
+        ):
+            raise ValueError(
+                "distribution_cfg.class_name must resolve to an rsl_rl Distribution subclass."
+            )
 
         self.map_encoder = M2MObservedHistoryMapEncoder(
             hidden_channels=encoder_hidden_channels,
