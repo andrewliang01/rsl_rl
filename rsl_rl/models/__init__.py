@@ -25,7 +25,9 @@ from .m2m_sequence_compatible_critic import M2MSequenceCompatibleCritic
 from .m2m_student_only import M2MStudentOnlyPolicy, normalize_m2m_student_network_config
 from .rnn_model import RNNModel
 from .prop_mlp_elevation_fusion_model import PropMLPElevationFusionModel
+from .prop_mlp_elevation_unifp_fusion_model import PropMLPElevationUniFPFusionModel
 from .shared_prop_mlp_elevation_multi_head_critic import SharedPropMLPElevationMultiHeadCritic
+from .unifp_adaptation_actor import UniFPAdaptationActor
 
 __all__ = [
     "AMPDiscriminator",
@@ -48,5 +50,7 @@ __all__ = [
     "normalize_m2m_student_network_config",
     "RNNModel",
     "PropMLPElevationFusionModel",
+    "PropMLPElevationUniFPFusionModel",
     "SharedPropMLPElevationMultiHeadCritic",
+    "UniFPAdaptationActor",
 ]

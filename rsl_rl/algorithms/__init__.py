@@ -13,6 +13,7 @@ from .m2m_direct_ppo import M2MDirectPPO
 from .m2m_teacher_ppo import M2MObservedHistoryTeacherPPO
 from .multi_ppo import MultiPPO
 from .ppo import PPO
+from .unifp_adaptation_ppo import UniFPAdaptationPPO
 
 __all__ = [
     "AMPPPO",
@@ -24,4 +25,5 @@ __all__ = [
     "M2MObservedHistoryTeacherPPO",
     "MultiPPO",
     "PPO",
+    "UniFPAdaptationPPO",
 ]
