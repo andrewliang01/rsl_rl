@@ -170,6 +170,12 @@ class GaussianDistribution(Distribution):
         """Update the Gaussian distribution from MLP output."""
         mean = mlp_output
         if self.std_type == "scalar":
+            # Direct scalar parameters can cross zero after an optimizer step.
+            # Project them before constructing Normal so legacy scalar configs
+            # cannot fail in the next PPO minibatch. Log-space parameterization
+            # remains preferred for task-specific bounded exploration.
+            with torch.no_grad():
+                self.std_param.clamp_(min=1.0e-6)
             std = self.std_param.expand_as(mean)
         elif self.std_type == "log":
             std = torch.exp(self.log_std_param).expand_as(mean)
