@@ -8,7 +8,9 @@ from tensordict import TensorDict
 from rsl_rl.models import PropMLPElevationUniFPFusionModel
 
 
-def _actor(batch_size: int = 3) -> tuple[PropMLPElevationUniFPFusionModel, TensorDict]:
+def _actor(
+    batch_size: int = 3, num_pred_obs: int = 6
+) -> tuple[PropMLPElevationUniFPFusionModel, TensorDict]:
     obs = TensorDict(
         {
             "policy": torch.randn(batch_size, 42),
@@ -27,7 +29,7 @@ def _actor(batch_size: int = 3) -> tuple[PropMLPElevationUniFPFusionModel, Tenso
         estimator_latent_dim=16,
         estimator_hidden_dims=(32, 24),
         decoder_hidden_dims=(16,),
-        num_pred_obs=6,
+        num_pred_obs=num_pred_obs,
         history_normalization=False,
         elevation_set="height_scan_policy",
         cnn_observation_type="depthcamera",
@@ -58,6 +60,18 @@ def test_ecmm_unifp_actor_predicts_twist6_and_leg_actions():
     assert twist.shape == (3, 6)
     assert actions.shape == (3, 12)
     assert torch.isfinite(twist).all()
+    assert torch.isfinite(actions).all()
+
+
+def test_ecmm_unifp_actor_can_predict_only_base_linear_velocity():
+    actor, obs = _actor(num_pred_obs=3)
+
+    base_linear_velocity = actor.predict_obs_pred(obs)
+    actions = actor(obs)
+
+    assert base_linear_velocity.shape == (3, 3)
+    assert actions.shape == (3, 12)
+    assert torch.isfinite(base_linear_velocity).all()
     assert torch.isfinite(actions).all()
 
 
@@ -97,3 +111,10 @@ def test_history_contract_and_twist_width_are_rejected_early():
         assert "not divisible" in str(exc)
     else:
         raise AssertionError("invalid flattened history width was accepted")
+
+    try:
+        _actor(batch_size=1, num_pred_obs=4)
+    except ValueError as exc:
+        assert "three-dimensional chunks" in str(exc)
+    else:
+        raise AssertionError("non-3D-aligned prediction width was accepted")

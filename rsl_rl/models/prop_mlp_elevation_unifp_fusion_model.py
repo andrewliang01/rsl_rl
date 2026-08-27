@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""ECMM elevation fusion actor with a UniFP base-twist adaptation encoder."""
+"""ECMM elevation fusion actor with a UniFP adaptation encoder."""
 
 from __future__ import annotations
 
@@ -19,13 +19,14 @@ from .prop_mlp_elevation_fusion_model import PropMLPElevationFusionModel
 
 
 class PropMLPElevationUniFPFusionModel(PropMLPElevationFusionModel):
-    """Fuse ECMM proprio/depth features with a UniFP 6D twist estimate.
+    """Fuse ECMM proprio/depth features with a UniFP adaptation estimate.
 
     The ECMM branch encodes the current proprioceptive frame and elevation or
     depth history. A separate UniFP history encoder produces an adaptation
-    latent, while its decoder estimates body-frame linear and angular velocity.
-    Both the latent and explicit six-dimensional estimate are consumed by the
-    locomotion head.
+    latent, while its decoder estimates one or more supervised 3D quantities.
+    Both the latent and the explicit estimate are consumed by the locomotion
+    head. For example, a task with direct IMU angular velocity can configure a
+    three-dimensional decoder that estimates only body-frame linear velocity.
     """
 
     def __init__(
@@ -47,10 +48,10 @@ class PropMLPElevationUniFPFusionModel(PropMLPElevationFusionModel):
             raise KeyError(f"Missing UniFP history observation group '{history_set}'.")
         if len(obs[history_set].shape) != 2:
             raise ValueError(f"UniFP history must be [B,D], got {tuple(obs[history_set].shape)}.")
-        if num_pred_obs != 6:
+        if num_pred_obs <= 0 or num_pred_obs % 3 != 0:
             raise ValueError(
-                "The ECMM-UniFP decoder must predict exactly six values: "
-                "base linear velocity xyz and base angular velocity xyz."
+                "The ECMM-UniFP decoder output must contain one or more "
+                f"three-dimensional chunks, got num_pred_obs={num_pred_obs}."
             )
 
         active_groups = list(obs_groups[obs_set])
@@ -121,19 +122,19 @@ class PropMLPElevationUniFPFusionModel(PropMLPElevationFusionModel):
         if self.distribution is not None:
             self.distribution.init_mlp_weights(self.mlp)
 
-    def _history_latent_and_twist(self, obs: TensorDict) -> tuple[torch.Tensor, torch.Tensor]:
+    def _history_latent_and_prediction(self, obs: TensorDict) -> tuple[torch.Tensor, torch.Tensor]:
         history = self.history_normalizer(obs[self.history_set])
         latent = self.encoder(history)
-        estimated_twist = self.decoder(latent)
-        return latent, estimated_twist
+        prediction = self.decoder(latent)
+        return latent, prediction
 
     def predict_obs_pred(self, obs: TensorDict) -> torch.Tensor:
-        """Return ``[v_x, v_y, v_z, w_x, w_y, w_z]`` for UniFP supervision."""
-        _, estimated_twist = self._history_latent_and_twist(obs)
-        return estimated_twist
+        """Return the task-configured UniFP prediction for auxiliary supervision."""
+        _, prediction = self._history_latent_and_prediction(obs)
+        return prediction
 
-    def get_estimated_base_twist(self, obs: TensorDict) -> torch.Tensor:
-        """Expose the estimated 6D body twist for diagnostics."""
+    def get_estimated_adaptation(self, obs: TensorDict) -> torch.Tensor:
+        """Expose the task-configured adaptation prediction for diagnostics."""
         return self.predict_obs_pred(obs)
 
     def get_latent(
@@ -143,8 +144,8 @@ class PropMLPElevationUniFPFusionModel(PropMLPElevationFusionModel):
         hidden_state: HiddenState = None,
     ) -> torch.Tensor:
         ecmm_features = super().get_latent(obs, masks, hidden_state)
-        estimator_latent, estimated_twist = self._history_latent_and_twist(obs)
-        return torch.cat((ecmm_features, estimator_latent, estimated_twist), dim=-1)
+        estimator_latent, prediction = self._history_latent_and_prediction(obs)
+        return torch.cat((ecmm_features, estimator_latent, prediction), dim=-1)
 
     def update_normalization(self, obs: TensorDict) -> None:
         super().update_normalization(obs)
@@ -194,10 +195,10 @@ class _TorchPropMLPElevationUniFPFusionModel(nn.Module):
         current_features = self.prop_mlp(self.obs_normalizer(current_proprio))
         normalized_history = self.history_normalizer(proprio_history)
         estimator_latent = self.encoder(normalized_history)
-        estimated_twist = self.decoder(estimator_latent)
+        prediction = self.decoder(estimator_latent)
         depth_features = self.elevation_encoder(self._normalize_depth(depth_history))
         fused = torch.cat(
-            (current_features, depth_features, estimator_latent, estimated_twist),
+            (current_features, depth_features, estimator_latent, prediction),
             dim=-1,
         )
         return self.deterministic_output(self.mlp(fused))
