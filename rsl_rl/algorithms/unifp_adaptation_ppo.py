@@ -71,8 +71,8 @@ class UniFPAdaptationPPO(PPO):
             )
         self.adaptation_frozen = False
         self._update_count = 0
-        adaptation_params = list(self.actor.encoder.parameters()) + list(self.actor.decoder.parameters())
-        self.adaptation_optimizer = torch.optim.Adam(adaptation_params, lr=adaptation_learning_rate)
+        self._adaptation_params = list(self.actor.encoder.parameters()) + list(self.actor.decoder.parameters())
+        self.adaptation_optimizer = torch.optim.Adam(self._adaptation_params, lr=adaptation_learning_rate)
 
     @staticmethod
     def construct_algorithm(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> UniFPAdaptationPPO:
@@ -118,10 +118,15 @@ class UniFPAdaptationPPO(PPO):
                 if key == "adaptation_frozen":
                     continue
                 logs[key] = value / count
+        self._average_adaptation_logs(logs)
         loss_dict.update(logs)
         return loss_dict
 
     def _freeze_adaptation(self) -> None:
+        # PPO synchronizes its own gradients, but the adaptation optimizer is
+        # independent.  Broadcast once more at the optional freeze boundary so
+        # every rank freezes the exact same encoder/decoder parameters.
+        self._broadcast_adaptation_parameters()
         for module in (self.actor.encoder, self.actor.decoder):
             for param in module.parameters():
                 param.requires_grad = False
@@ -131,6 +136,13 @@ class UniFPAdaptationPPO(PPO):
             f"[UniFPAdaptationPPO] Frozen encoder+decoder at iter {self._update_count}; "
             "actor body and critic stay trainable."
         )
+
+    def train_mode(self) -> None:
+        """Keep optionally frozen adaptation modules in evaluation mode."""
+        super().train_mode()
+        if self.adaptation_frozen:
+            self.actor.encoder.eval()
+            self.actor.decoder.eval()
 
     def _empty_adaptation_logs(self) -> dict[str, float]:
         logs: dict[str, float] = {
@@ -174,9 +186,74 @@ class UniFPAdaptationPPO(PPO):
             if train:
                 self.adaptation_optimizer.zero_grad()
                 loss.backward()
+                self._reduce_adaptation_gradients()
                 self.adaptation_optimizer.step()
         logs["adaptation"] += loss.item()
         for name, value, rmse in zip(self.adaptation_part_names, parts, rmses, strict=True):
             logs[name] += value
             logs[name.replace("adaptation_", "adaptation_rmse_", 1)] += rmse
         logs["_count"] += 1.0
+
+    def _reduce_adaptation_gradients(self) -> None:
+        """Average UniFP encoder/decoder gradients across distributed ranks."""
+        if self.is_multi_gpu:
+            self._reduce_gradients(self._adaptation_params)
+
+    def _average_adaptation_logs(self, logs: dict[str, float]) -> None:
+        """Report globally averaged UniFP losses instead of rank-zero-only values."""
+        if not self.is_multi_gpu:
+            return
+        metric_names = [name for name in logs if name != "adaptation_frozen"]
+        metric_values = torch.tensor([logs[name] for name in metric_names], device=self.device)
+        torch.distributed.all_reduce(metric_values, op=torch.distributed.ReduceOp.SUM)
+        metric_values /= self.gpu_world_size
+        for name, value in zip(metric_names, metric_values.tolist(), strict=True):
+            logs[name] = value
+
+    def _broadcast_adaptation_parameters(self) -> None:
+        """Make all ranks use rank zero's UniFP parameters before freezing."""
+        if not self.is_multi_gpu:
+            return
+        for module in (self.actor.encoder, self.actor.decoder):
+            for param in module.parameters():
+                torch.distributed.broadcast(param.data, src=0)
+            for buffer in module.buffers():
+                torch.distributed.broadcast(buffer.data, src=0)
+
+    def save(self) -> dict:
+        """Save PPO and UniFP adaptation optimizer/lifecycle state."""
+        saved_dict = super().save()
+        saved_dict["adaptation_optimizer_state_dict"] = self.adaptation_optimizer.state_dict()
+        saved_dict["adaptation_update_count"] = self._update_count
+        saved_dict["adaptation_frozen"] = self.adaptation_frozen
+        return saved_dict
+
+    def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
+        """Restore PPO and UniFP adaptation optimizer/lifecycle state."""
+        load_all = load_cfg is None
+        load_optimizer = load_all or bool(load_cfg and load_cfg.get("optimizer"))
+        load_iteration = load_all or bool(load_cfg and load_cfg.get("iteration"))
+        loaded_iteration = super().load(loaded_dict, load_cfg, strict)
+
+        if load_optimizer and "adaptation_optimizer_state_dict" in loaded_dict:
+            self.adaptation_optimizer.load_state_dict(loaded_dict["adaptation_optimizer_state_dict"])
+
+        if load_iteration:
+            self._update_count = int(loaded_dict.get("adaptation_update_count", loaded_dict.get("iter", 0)))
+            restored_frozen = bool(
+                loaded_dict.get(
+                    "adaptation_frozen",
+                    self.freeze_adaptation_after_iter is not None
+                    and self._update_count >= self.freeze_adaptation_after_iter,
+                )
+            )
+            if restored_frozen:
+                self._freeze_adaptation()
+            else:
+                for module in (self.actor.encoder, self.actor.decoder):
+                    for param in module.parameters():
+                        param.requires_grad = True
+                    module.train()
+                self.adaptation_frozen = False
+
+        return loaded_iteration
