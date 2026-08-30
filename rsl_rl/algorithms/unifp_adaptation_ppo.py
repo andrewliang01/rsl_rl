@@ -51,12 +51,43 @@ class UniFPAdaptationPPO(PPO):
         obs_pred_group: str = "obs_pred",
         adaptation_weights: tuple[float, ...] = (0.6, 0.8, 1.0, 1.0),
         adaptation_part_names: tuple[str, ...] | None = None,
+        adaptation_part_dims: tuple[int, ...] | None = None,
+        adaptation_loss_types: tuple[str, ...] | None = None,
+        reconstruction_obs_group: str | None = None,
+        reconstruction_weight: float = 0.0,
         **kwargs,
     ) -> None:
         super().__init__(actor, critic, storage, **kwargs)
         self.freeze_adaptation_after_iter = freeze_adaptation_after_iter
         self.obs_pred_group = obs_pred_group
         self.adaptation_weights = torch.tensor(adaptation_weights, device=self.device)
+        self._legacy_chunk_weighting = adaptation_part_dims is None
+        self.adaptation_part_dims = (
+            (3,) * len(adaptation_weights) if adaptation_part_dims is None else tuple(adaptation_part_dims)
+        )
+        if len(self.adaptation_part_dims) != len(adaptation_weights):
+            raise ValueError(
+                "len(adaptation_part_dims) must match len(adaptation_weights), got "
+                f"{len(self.adaptation_part_dims)} and {len(adaptation_weights)}."
+            )
+        if any(dim <= 0 for dim in self.adaptation_part_dims):
+            raise ValueError(f"adaptation_part_dims must be positive, got {self.adaptation_part_dims}.")
+        self.adaptation_loss_types = (
+            ("mse",) * len(adaptation_weights)
+            if adaptation_loss_types is None
+            else tuple(adaptation_loss_types)
+        )
+        if len(self.adaptation_loss_types) != len(adaptation_weights):
+            raise ValueError(
+                "len(adaptation_loss_types) must match len(adaptation_weights), got "
+                f"{len(self.adaptation_loss_types)} and {len(adaptation_weights)}."
+            )
+        supported_losses = {"mse", "bce_logits"}
+        unsupported_losses = set(self.adaptation_loss_types) - supported_losses
+        if unsupported_losses:
+            raise ValueError(
+                f"Unsupported adaptation loss types {sorted(unsupported_losses)}; expected {sorted(supported_losses)}."
+            )
         if adaptation_part_names is None:
             self.adaptation_part_names = _adaptation_part_names(len(adaptation_weights))
         else:
@@ -69,9 +100,26 @@ class UniFPAdaptationPPO(PPO):
                 name if name.startswith("adaptation_") else f"adaptation_{name}"
                 for name in adaptation_part_names
             )
+        self.reconstruction_obs_group = reconstruction_obs_group
+        self.reconstruction_weight = float(reconstruction_weight)
+        if self.reconstruction_weight < 0.0:
+            raise ValueError("reconstruction_weight must be non-negative.")
+        has_reconstruction_decoder = getattr(self.actor, "reconstruction_decoder", None) is not None
+        if (self.reconstruction_obs_group is None) != (not has_reconstruction_decoder):
+            raise ValueError(
+                "reconstruction_obs_group and the actor reconstruction decoder must be configured together."
+            )
         self.adaptation_frozen = False
         self._update_count = 0
-        self._adaptation_params = list(self.actor.encoder.parameters()) + list(self.actor.decoder.parameters())
+        if hasattr(self.actor, "adaptation_modules"):
+            self._adaptation_modules = tuple(self.actor.adaptation_modules())
+        else:
+            self._adaptation_modules = (self.actor.encoder, self.actor.decoder)
+        self._adaptation_params = [
+            parameter
+            for module in self._adaptation_modules
+            for parameter in module.parameters()
+        ]
         self.adaptation_optimizer = torch.optim.Adam(self._adaptation_params, lr=adaptation_learning_rate)
 
     @staticmethod
@@ -127,7 +175,7 @@ class UniFPAdaptationPPO(PPO):
         # independent.  Broadcast once more at the optional freeze boundary so
         # every rank freezes the exact same encoder/decoder parameters.
         self._broadcast_adaptation_parameters()
-        for module in (self.actor.encoder, self.actor.decoder):
+        for module in self._get_adaptation_modules():
             for param in module.parameters():
                 param.requires_grad = False
             module.eval()
@@ -141,8 +189,12 @@ class UniFPAdaptationPPO(PPO):
         """Keep optionally frozen adaptation modules in evaluation mode."""
         super().train_mode()
         if self.adaptation_frozen:
-            self.actor.encoder.eval()
-            self.actor.decoder.eval()
+            for module in self._get_adaptation_modules():
+                module.eval()
+
+    def _get_adaptation_modules(self) -> tuple[torch.nn.Module, ...]:
+        """Return all supervised modules, including legacy actors used by old checkpoints/tests."""
+        return getattr(self, "_adaptation_modules", (self.actor.encoder, self.actor.decoder))
 
     def _empty_adaptation_logs(self) -> dict[str, float]:
         logs: dict[str, float] = {
@@ -150,9 +202,17 @@ class UniFPAdaptationPPO(PPO):
             "adaptation_frozen": float(self.adaptation_frozen),
             "_count": 0.0,
         }
-        for name in self.adaptation_part_names:
+        for name, loss_type in zip(
+            self.adaptation_part_names,
+            self.adaptation_loss_types,
+            strict=True,
+        ):
             logs[name] = 0.0
-            logs[name.replace("adaptation_", "adaptation_rmse_", 1)] = 0.0
+            metric_prefix = "adaptation_accuracy_" if loss_type == "bce_logits" else "adaptation_rmse_"
+            logs[name.replace("adaptation_", metric_prefix, 1)] = 0.0
+        if self.reconstruction_obs_group is not None:
+            logs["adaptation_next_state_reconstruction"] = 0.0
+            logs["adaptation_rmse_next_state_reconstruction"] = 0.0
         return logs
 
     def _adaptation_step(self, batch, logs: dict[str, float], *, train: bool) -> None:
@@ -168,30 +228,95 @@ class UniFPAdaptationPPO(PPO):
                 raise ValueError(
                     f"Adaptation pred dim {pred.shape[-1]} does not match target dim {target.shape[-1]}."
                 )
-            expected = 3 * int(self.adaptation_weights.numel())
+            expected = sum(self.adaptation_part_dims)
             if pred.shape[-1] != expected:
                 raise ValueError(
                     f"Adaptation pred dim {pred.shape[-1]} does not match "
-                    f"3 * len(adaptation_weights) = {expected}."
+                    f"sum(adaptation_part_dims) = {expected}."
                 )
             loss = pred.new_zeros(())
             parts = []
-            rmses = []
-            for i, weight in enumerate(self.adaptation_weights.tolist()):
-                sl = slice(i * 3, (i + 1) * 3)
-                part = F.mse_loss(pred[:, sl] * weight, target[:, sl] * weight)
+            metrics = []
+            offset = 0
+            for dim, loss_type, weight in zip(
+                self.adaptation_part_dims,
+                self.adaptation_loss_types,
+                self.adaptation_weights.tolist(),
+                strict=True,
+            ):
+                sl = slice(offset, offset + dim)
+                pred_part = pred[:, sl]
+                target_part = target[:, sl]
+                if loss_type == "mse":
+                    raw_part = F.mse_loss(pred_part, target_part)
+                    metric = torch.sqrt(raw_part).item()
+                    part = (
+                        F.mse_loss(pred_part * weight, target_part * weight)
+                        if self._legacy_chunk_weighting
+                        else raw_part * weight
+                    )
+                else:
+                    raw_part = F.binary_cross_entropy_with_logits(pred_part, target_part)
+                    part = raw_part * weight
+                    metric = ((pred_part >= 0.0) == (target_part >= 0.5)).float().mean().item()
                 parts.append(part.item())
-                rmses.append(torch.sqrt(F.mse_loss(pred[:, sl], target[:, sl])).item())
+                metrics.append(metric)
                 loss = loss + part
+                offset += dim
+
+            reconstruction_part = None
+            reconstruction_rmse = None
+            if self.reconstruction_obs_group is not None:
+                if batch.next_observations is None:
+                    raise ValueError("UniFP next-state reconstruction requires batch.next_observations.")
+                if self.reconstruction_obs_group not in batch.next_observations.keys():
+                    raise KeyError(
+                        f"Reconstruction target group '{self.reconstruction_obs_group}' is missing from "
+                        "next rollout observations."
+                    )
+                reconstruction_pred = self.actor.predict_reconstruction(batch.observations)
+                reconstruction_target = batch.next_observations[self.reconstruction_obs_group]
+                if reconstruction_pred.shape != reconstruction_target.shape:
+                    raise ValueError(
+                        f"Reconstruction pred shape {tuple(reconstruction_pred.shape)} does not match "
+                        f"next target shape {tuple(reconstruction_target.shape)}."
+                    )
+                valid = torch.ones(
+                    reconstruction_pred.shape[0],
+                    dtype=torch.bool,
+                    device=reconstruction_pred.device,
+                )
+                if batch.dones is not None:
+                    valid &= ~batch.dones.reshape(batch.dones.shape[0], -1).any(dim=-1).bool()
+                if torch.any(valid):
+                    raw_reconstruction = F.mse_loss(
+                        reconstruction_pred[valid],
+                        reconstruction_target[valid],
+                    )
+                else:
+                    raw_reconstruction = reconstruction_pred.sum() * 0.0
+                reconstruction_part = raw_reconstruction * self.reconstruction_weight
+                reconstruction_rmse = torch.sqrt(raw_reconstruction).item()
+                loss = loss + reconstruction_part
             if train:
                 self.adaptation_optimizer.zero_grad()
                 loss.backward()
                 self._reduce_adaptation_gradients()
                 self.adaptation_optimizer.step()
         logs["adaptation"] += loss.item()
-        for name, value, rmse in zip(self.adaptation_part_names, parts, rmses, strict=True):
+        for name, loss_type, value, metric in zip(
+            self.adaptation_part_names,
+            self.adaptation_loss_types,
+            parts,
+            metrics,
+            strict=True,
+        ):
             logs[name] += value
-            logs[name.replace("adaptation_", "adaptation_rmse_", 1)] += rmse
+            metric_prefix = "adaptation_accuracy_" if loss_type == "bce_logits" else "adaptation_rmse_"
+            logs[name.replace("adaptation_", metric_prefix, 1)] += metric
+        if reconstruction_part is not None and reconstruction_rmse is not None:
+            logs["adaptation_next_state_reconstruction"] += reconstruction_part.item()
+            logs["adaptation_rmse_next_state_reconstruction"] += reconstruction_rmse
         logs["_count"] += 1.0
 
     def _reduce_adaptation_gradients(self) -> None:
@@ -214,7 +339,7 @@ class UniFPAdaptationPPO(PPO):
         """Make all ranks use rank zero's UniFP parameters before freezing."""
         if not self.is_multi_gpu:
             return
-        for module in (self.actor.encoder, self.actor.decoder):
+        for module in self._get_adaptation_modules():
             for param in module.parameters():
                 torch.distributed.broadcast(param.data, src=0)
             for buffer in module.buffers():
@@ -250,7 +375,7 @@ class UniFPAdaptationPPO(PPO):
             if restored_frozen:
                 self._freeze_adaptation()
             else:
-                for module in (self.actor.encoder, self.actor.decoder):
+                for module in self._get_adaptation_modules():
                     for param in module.parameters():
                         param.requires_grad = True
                     module.train()

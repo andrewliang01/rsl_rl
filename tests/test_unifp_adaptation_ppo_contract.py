@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import os
 from itertools import chain
+from types import SimpleNamespace
 
 import torch
 import torch.multiprocessing as mp
 from torch import nn
+from tensordict import TensorDict
 
 from rsl_rl.algorithms.ppo import PPO
 from rsl_rl.algorithms.unifp_adaptation_ppo import UniFPAdaptationPPO
@@ -20,6 +22,26 @@ class _Actor(nn.Module):
         self.encoder = nn.Sequential(nn.Linear(2, 2), nn.BatchNorm1d(2))
         self.decoder = nn.Linear(2, 2)
         self.body = nn.Linear(2, 1)
+
+
+class _MultiHeadActor(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.encoder = nn.Linear(2, 4)
+        self.decoder = nn.Linear(4, 11)
+        self.reconstruction_decoder = nn.Linear(4, 3)
+
+    def _latent(self, observations):
+        return self.encoder(observations["history"])
+
+    def predict_obs_pred(self, observations):
+        return self.decoder(self._latent(observations))
+
+    def predict_reconstruction(self, observations):
+        return self.reconstruction_decoder(self._latent(observations))
+
+    def adaptation_modules(self):
+        return self.encoder, self.decoder, self.reconstruction_decoder
 
 
 def _algorithm(*, multi_gpu: bool = False) -> UniFPAdaptationPPO:
@@ -134,6 +156,66 @@ def test_adaptation_logs_are_averaged_across_ranks(monkeypatch):
         "adaptation_rmse_base_velocity": 3.0,
         "adaptation_frozen": 0.0,
     }
+
+
+def test_explicit_multi_head_loss_uses_true_next_observation_and_masks_resets():
+    algorithm = UniFPAdaptationPPO.__new__(UniFPAdaptationPPO)
+    algorithm.actor = _MultiHeadActor()
+    algorithm.obs_pred_group = "adaptation_target"
+    algorithm.adaptation_weights = torch.tensor((1.0, 5.0, 0.2))
+    algorithm.adaptation_part_names = (
+        "adaptation_base_linear_velocity",
+        "adaptation_foot_clearance",
+        "adaptation_foot_contact_probability",
+    )
+    algorithm.adaptation_part_dims = (3, 4, 4)
+    algorithm.adaptation_loss_types = ("mse", "mse", "bce_logits")
+    algorithm._legacy_chunk_weighting = False
+    algorithm.reconstruction_obs_group = "reconstruction_target"
+    algorithm.reconstruction_weight = 1.0
+    algorithm._adaptation_modules = tuple(algorithm.actor.adaptation_modules())
+    algorithm._adaptation_params = [
+        parameter
+        for module in algorithm._adaptation_modules
+        for parameter in module.parameters()
+    ]
+    algorithm.adaptation_optimizer = torch.optim.Adam(algorithm._adaptation_params, lr=1.0e-3)
+    algorithm.is_multi_gpu = False
+    algorithm.adaptation_frozen = False
+
+    observations = TensorDict(
+        {
+            "history": torch.randn(3, 2),
+            "adaptation_target": torch.cat(
+                (
+                    torch.randn(3, 3),
+                    torch.randn(3, 4),
+                    torch.randint(0, 2, (3, 4)).float(),
+                ),
+                dim=-1,
+            ),
+            "reconstruction_target": torch.full((3, 3), -100.0),
+        },
+        batch_size=[3],
+    )
+    next_observations = observations.clone()
+    next_observations["reconstruction_target"] = torch.tensor(
+        [[0.1, 0.2, 0.3], [500.0, 500.0, 500.0], [0.4, 0.5, 0.6]]
+    )
+    batch = SimpleNamespace(
+        observations=observations,
+        next_observations=next_observations,
+        dones=torch.tensor([[False], [True], [False]]),
+    )
+    logs = algorithm._empty_adaptation_logs()
+    algorithm._adaptation_step(batch, logs, train=True)
+
+    assert logs["_count"] == 1.0
+    assert logs["adaptation"] > 0.0
+    assert logs["adaptation_foot_clearance"] > 0.0
+    assert 0.0 <= logs["adaptation_accuracy_foot_contact_probability"] <= 1.0
+    assert logs["adaptation_next_state_reconstruction"] < 10.0
+    assert all(parameter.grad is not None for parameter in algorithm._adaptation_params)
 
 
 def test_optional_freeze_broadcasts_then_freezes_adaptation(monkeypatch):

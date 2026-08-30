@@ -103,3 +103,5 @@ def test_rollout_storage_preserves_each_observation_dtype() -> None:
         assert batch.next_observations["policy"].dtype == torch.float32
         assert batch.next_observations["ray_history"].dtype == torch.float16
         assert batch.next_observations["ray_state"].dtype == torch.uint8
+        assert batch.dones is not None
+        assert batch.dones.dtype == torch.uint8

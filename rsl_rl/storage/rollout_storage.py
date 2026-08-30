@@ -313,6 +313,7 @@ class RolloutStorage:
         values = self.values.flatten(0, 1)  # [batch_size, num_critics]
         returns = self.returns.flatten(0, 1)  # [batch_size, num_critics]
         old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
+        dones = self.dones.flatten(0, 1)
 
         # Handle advantages
         if use_weighted_advantages and self.num_critics > 1:
@@ -344,6 +345,7 @@ class RolloutStorage:
                     returns=returns[batch_idx],
                     old_actions_log_prob=old_actions_log_prob[batch_idx],
                     old_distribution_params=tuple(p[batch_idx] for p in old_distribution_params),
+                    dones=dones[batch_idx],
                 )
 
     # For reinforcement learning with recurrent networks
