@@ -38,14 +38,11 @@ def _adaptation_part_names(num_chunks: int) -> tuple[str, ...]:
     return _ADAPTATION_PART_NAMES[:num_chunks]
 
 
-class UniFPAdaptationPPO(PPO):
-    """Run a weighted UniFP reconstruction update after every PPO minibatch."""
+class UniFPAdaptationMixin:
+    """Reusable UniFP auxiliary-update lifecycle for PPO-family algorithms."""
 
-    def __init__(
+    def _init_adaptation(
         self,
-        actor: MLPModel,
-        critic: MLPModel,
-        storage: RolloutStorage,
         freeze_adaptation_after_iter: int | None = 4000,
         adaptation_learning_rate: float = 5.0e-6,
         obs_pred_group: str = "obs_pred",
@@ -55,9 +52,7 @@ class UniFPAdaptationPPO(PPO):
         adaptation_loss_types: tuple[str, ...] | None = None,
         reconstruction_obs_group: str | None = None,
         reconstruction_weight: float = 0.0,
-        **kwargs,
     ) -> None:
-        super().__init__(actor, critic, storage, **kwargs)
         self.freeze_adaptation_after_iter = freeze_adaptation_after_iter
         self.obs_pred_group = obs_pred_group
         self.adaptation_weights = torch.tensor(adaptation_weights, device=self.device)
@@ -122,10 +117,6 @@ class UniFPAdaptationPPO(PPO):
         ]
         self.adaptation_optimizer = torch.optim.Adam(self._adaptation_params, lr=adaptation_learning_rate)
 
-    @staticmethod
-    def construct_algorithm(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> UniFPAdaptationPPO:
-        return construct_single_critic_algorithm(UniFPAdaptationPPO, obs, env, cfg, device)
-
     def update(self) -> dict[str, float]:
         self._update_count += 1
         if (
@@ -181,7 +172,7 @@ class UniFPAdaptationPPO(PPO):
             module.eval()
         self.adaptation_frozen = True
         print(
-            f"[UniFPAdaptationPPO] Frozen encoder+decoder at iter {self._update_count}; "
+            f"[{type(self).__name__}] Frozen encoder+decoder at iter {self._update_count}; "
             "actor body and critic stay trainable."
         )
 
@@ -382,3 +373,40 @@ class UniFPAdaptationPPO(PPO):
                 self.adaptation_frozen = False
 
         return loaded_iteration
+
+
+class UniFPAdaptationPPO(UniFPAdaptationMixin, PPO):
+    """PPO with a weighted UniFP auxiliary update after every minibatch."""
+
+    def __init__(
+        self,
+        actor: MLPModel,
+        critic: MLPModel,
+        storage: RolloutStorage,
+        freeze_adaptation_after_iter: int | None = 4000,
+        adaptation_learning_rate: float = 5.0e-6,
+        obs_pred_group: str = "obs_pred",
+        adaptation_weights: tuple[float, ...] = (0.6, 0.8, 1.0, 1.0),
+        adaptation_part_names: tuple[str, ...] | None = None,
+        adaptation_part_dims: tuple[int, ...] | None = None,
+        adaptation_loss_types: tuple[str, ...] | None = None,
+        reconstruction_obs_group: str | None = None,
+        reconstruction_weight: float = 0.0,
+        **kwargs,
+    ) -> None:
+        super().__init__(actor, critic, storage, **kwargs)
+        self._init_adaptation(
+            freeze_adaptation_after_iter=freeze_adaptation_after_iter,
+            adaptation_learning_rate=adaptation_learning_rate,
+            obs_pred_group=obs_pred_group,
+            adaptation_weights=adaptation_weights,
+            adaptation_part_names=adaptation_part_names,
+            adaptation_part_dims=adaptation_part_dims,
+            adaptation_loss_types=adaptation_loss_types,
+            reconstruction_obs_group=reconstruction_obs_group,
+            reconstruction_weight=reconstruction_weight,
+        )
+
+    @staticmethod
+    def construct_algorithm(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> "UniFPAdaptationPPO":
+        return construct_single_critic_algorithm(UniFPAdaptationPPO, obs, env, cfg, device)
