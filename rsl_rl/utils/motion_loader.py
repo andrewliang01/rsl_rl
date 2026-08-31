@@ -291,6 +291,36 @@ class AMPLoader:
                 dim=-1,
             )
 
+            # Replay/export can cache the exact observation-manager output.
+            # Prefer it when present so expert features are bit-for-bit aligned
+            # with the environment observation functions used by the policy.
+            if "amp_obs" in data.files:
+                cached_amp_obs = torch.tensor(data["amp_obs"], dtype=torch.float32, device=self.device)
+                expected_shape = (body_pos_w.shape[0], self._amp_obs_dim)
+                if tuple(cached_amp_obs.shape) != expected_shape:
+                    raise ValueError(
+                        f"[AMPLoader] {motion_file} amp_obs shape is {tuple(cached_amp_obs.shape)}, "
+                        f"expected {expected_shape}"
+                    )
+                if not torch.isfinite(cached_amp_obs).all():
+                    raise ValueError(f"[AMPLoader] {motion_file} amp_obs contains non-finite values")
+
+                if "amp_body_names" in data.files:
+                    cached_body_names = tuple(np.asarray(data["amp_body_names"]).astype(str).reshape(-1))
+                    if cached_body_names != tuple(body_names):
+                        raise ValueError(
+                            f"[AMPLoader] {motion_file} amp_body_names mismatch: "
+                            f"cached={cached_body_names}, requested={tuple(body_names)}"
+                        )
+                if "amp_anchor_name" in data.files:
+                    cached_anchor = str(np.asarray(data["amp_anchor_name"]).reshape(-1)[0])
+                    if cached_anchor != anchor_name:
+                        raise ValueError(
+                            f"[AMPLoader] {motion_file} amp_anchor_name mismatch: "
+                            f"cached={cached_anchor!r}, requested={anchor_name!r}"
+                        )
+                trajectory = cached_amp_obs
+
             default_fps = float(np.asarray(data["fps"]).reshape(-1)[0])
             if "clip_lengths" in data.files:
                 clip_lengths = np.asarray(data["clip_lengths"], dtype=np.int64).reshape(-1)
