@@ -86,6 +86,8 @@ class UniFPAdaptationActor(nn.Module):
         num_pred_obs: int = 12,
         history_set: str | None = None,
         current_obs_set: str | None = None,
+        history_term_dims: tuple[int, ...] | list[int] | None = None,
+        exclude_current_from_history: bool = False,
         latent_dim: int | None = None,
         use_prediction_in_actor: bool = False,
         prediction_part_dims: tuple[int, ...] | list[int] | None = None,
@@ -96,8 +98,20 @@ class UniFPAdaptationActor(nn.Module):
         self.obs_groups, self.obs_dim = self._get_obs_dim(obs, obs_groups, obs_set)
         self.history_set = history_set
         self.current_obs_set = current_obs_set
+        self.history_term_dims = (
+            () if history_term_dims is None else tuple(int(dim) for dim in history_term_dims)
+        )
+        if any(dim <= 0 for dim in self.history_term_dims):
+            raise ValueError(f"history_term_dims must be positive, got {self.history_term_dims}.")
+        self.exclude_current_from_history = bool(exclude_current_from_history)
+        self.term_major_history = bool(self.history_term_dims)
         self.separate_history_and_current = history_set is not None or current_obs_set is not None
         if self.separate_history_and_current:
+            if self.history_term_dims or self.exclude_current_from_history:
+                raise ValueError(
+                    "history_term_dims/exclude_current_from_history are only supported when one "
+                    "stacked observation group supplies both history and current state."
+                )
             if history_set is None or current_obs_set is None:
                 raise ValueError("history_set and current_obs_set must be configured together.")
             for group in (history_set, current_obs_set):
@@ -109,17 +123,61 @@ class UniFPAdaptationActor(nn.Module):
                     raise ValueError(f"UniFP group '{group}' must be 2D, got {tuple(obs[group].shape)}.")
             self.history_dim = int(obs[history_set].shape[-1])
             self.num_single_obs = int(obs[current_obs_set].shape[-1])
+            self.encoder_history_length = int(history_length)
+        elif self.history_term_dims:
+            if history_length <= int(self.exclude_current_from_history):
+                raise ValueError(
+                    "history_length must leave at least one estimator frame, got "
+                    f"history_length={history_length}, exclude_current_from_history="
+                    f"{self.exclude_current_from_history}."
+                )
+            self.num_single_obs = sum(self.history_term_dims)
+            expected_obs_dim = int(history_length) * self.num_single_obs
+            if self.obs_dim != expected_obs_dim:
+                raise ValueError(
+                    f"Stacked history obs dim {self.obs_dim} does not match history_length "
+                    f"{history_length} * sum(history_term_dims) {self.num_single_obs} = "
+                    f"{expected_obs_dim}."
+                )
+            self.encoder_history_length = int(history_length) - int(
+                self.exclude_current_from_history
+            )
+            self.history_dim = self.encoder_history_length * self.num_single_obs
         else:
             self.history_dim = self.obs_dim
             self.num_single_obs = self.obs_dim // history_length
+            self.encoder_history_length = int(history_length)
 
-        if self.history_dim % history_length != 0:
+        history_indices: list[int] = []
+        current_indices: list[int] = []
+        if self.term_major_history:
+            offset = 0
+            for term_dim in self.history_term_dims:
+                estimator_width = self.encoder_history_length * term_dim
+                history_indices.extend(range(offset, offset + estimator_width))
+                current_start = offset + (int(history_length) - 1) * term_dim
+                current_indices.extend(range(current_start, current_start + term_dim))
+                offset += int(history_length) * term_dim
+        self.register_buffer(
+            "history_indices",
+            torch.tensor(history_indices, dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "current_indices",
+            torch.tensor(current_indices, dtype=torch.long),
+            persistent=False,
+        )
+
+        if not self.term_major_history and self.history_dim % history_length != 0:
             raise ValueError(
                 f"History obs dim {self.history_dim} is not divisible by history_length {history_length}."
             )
         self.history_length = history_length
-        self.num_history_frame_obs = self.history_dim // history_length
-        self.num_latent_dim = history_length * 2 if latent_dim is None else int(latent_dim)
+        self.num_history_frame_obs = self.history_dim // self.encoder_history_length
+        self.num_latent_dim = (
+            self.encoder_history_length * 2 if latent_dim is None else int(latent_dim)
+        )
         if self.num_latent_dim <= 0:
             raise ValueError(f"latent_dim must be positive, got {self.num_latent_dim}.")
         self.num_pred_obs = num_pred_obs
@@ -183,8 +241,22 @@ class UniFPAdaptationActor(nn.Module):
             current = self.current_obs_normalizer(obs[self.current_obs_set])
         else:
             history = self.obs_normalizer(self._flatten_obs(obs))
-            current = history[..., -self.num_single_obs :]
+            if self.term_major_history:
+                history, current = self._split_term_major_history(history)
+            else:
+                current = history[..., -self.num_single_obs :]
         return history, current
+
+    def _split_term_major_history(
+        self,
+        stacked: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Split Isaac Lab's term-major history into estimator history and current frame."""
+
+        return (
+            stacked.index_select(-1, self.history_indices),
+            stacked.index_select(-1, self.current_indices),
+        )
 
     def _latent_and_raw_prediction(self, obs: TensorDict) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         history, current = self._history_and_current(obs)
@@ -313,6 +385,17 @@ class _TorchUniFPAdaptationActor(nn.Module):
     def __init__(self, model: UniFPAdaptationActor) -> None:
         super().__init__()
         self.separate_history_and_current = model.separate_history_and_current
+        self.term_major_history = model.term_major_history
+        self.register_buffer(
+            "history_indices",
+            model.history_indices.detach().clone(),
+            persistent=False,
+        )
+        self.register_buffer(
+            "current_indices",
+            model.current_indices.detach().clone(),
+            persistent=False,
+        )
         if self.separate_history_and_current:
             self.history_normalizer = copy.deepcopy(model.history_normalizer)
             self.current_obs_normalizer = copy.deepcopy(model.current_obs_normalizer)
@@ -328,7 +411,9 @@ class _TorchUniFPAdaptationActor(nn.Module):
         self.use_prediction_in_actor = model.use_prediction_in_actor
         self.num_single_obs = model.num_single_obs
         self.input_size = model.obs_dim
-        self.history_input_size = model.history_dim
+        self.history_input_size = (
+            model.history_dim if model.separate_history_and_current else model.obs_dim
+        )
         self.current_input_size = model.num_single_obs
         if model.distribution is not None:
             self.deterministic_output = model.distribution.as_deterministic_output_module()
@@ -343,13 +428,25 @@ class _TorchUniFPAdaptationActor(nn.Module):
             current = self.current_obs_normalizer(current)
         else:
             history = self.obs_normalizer(history)
-            current = history[..., -self.num_single_obs :]
+            if self.term_major_history:
+                history, current = self._split_term_major_history(history)
+            else:
+                current = history[..., -self.num_single_obs :]
         latent = self.encoder(history)
         parts = [current, latent]
         if self.use_prediction_in_actor:
             parts.append(self.prediction_transform(self.decoder(latent)))
         out = self.actor_body(torch.cat(parts, dim=-1))
         return self.deterministic_output(out)
+
+    def _split_term_major_history(
+        self,
+        stacked: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return (
+            stacked.index_select(-1, self.history_indices),
+            stacked.index_select(-1, self.current_indices),
+        )
 
     @torch.jit.export
     def reset(self) -> None:

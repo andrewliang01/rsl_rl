@@ -87,3 +87,45 @@ def test_separated_history_actor_exposes_explicit_heads_and_reconstruction():
     assert actions.shape == (batch_size, 12)
     assert exported.input_names == ["history", "current_obs"]
     assert torch.allclose(exported_actions, actions, atol=1.0e-6, rtol=1.0e-6)
+
+
+def test_term_major_policy_history_uses_previous_frames_and_extracts_current():
+    history_length = 4
+    term_dims = (2, 1)
+    term_a = torch.tensor(
+        [[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]]
+    )
+    term_b = torch.tensor([[[10.0], [20.0], [30.0], [40.0]]])
+    stacked = torch.cat((term_a.flatten(start_dim=1), term_b.flatten(start_dim=1)), dim=-1)
+    obs = TensorDict({"policy": stacked}, batch_size=[1])
+    actor = UniFPAdaptationActor(
+        obs=obs,
+        obs_groups={"actor": ["policy"]},
+        obs_set="actor",
+        output_dim=3,
+        history_length=history_length,
+        history_term_dims=term_dims,
+        exclude_current_from_history=True,
+        latent_dim=5,
+        num_pred_obs=2,
+        encoder_hidden_dims=(8,),
+        decoder_hidden_dims=(8,),
+        hidden_dims=(8,),
+        obs_normalization=False,
+    ).eval()
+
+    estimator_history, current = actor._history_and_current(obs)
+    expected_history = torch.cat(
+        (term_a[:, :-1].flatten(start_dim=1), term_b[:, :-1].flatten(start_dim=1)),
+        dim=-1,
+    )
+    expected_current = torch.cat((term_a[:, -1], term_b[:, -1]), dim=-1)
+    scripted = torch.jit.script(actor.as_jit().eval())
+
+    assert actor.history_length == 4
+    assert actor.encoder_history_length == 3
+    assert actor.history_dim == 9
+    assert actor.num_single_obs == 3
+    torch.testing.assert_close(estimator_history, expected_history)
+    torch.testing.assert_close(current, expected_current)
+    torch.testing.assert_close(scripted(stacked), actor(obs))
