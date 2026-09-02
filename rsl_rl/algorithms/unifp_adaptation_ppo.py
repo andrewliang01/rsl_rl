@@ -185,7 +185,9 @@ class UniFPAdaptationMixin:
 
     def _get_adaptation_modules(self) -> tuple[torch.nn.Module, ...]:
         """Return all supervised modules, including legacy actors used by old checkpoints/tests."""
-        return getattr(self, "_adaptation_modules", (self.actor.encoder, self.actor.decoder))
+        if hasattr(self, "_adaptation_modules"):
+            return self._adaptation_modules
+        return (self.actor.encoder, self.actor.decoder)
 
     def _empty_adaptation_logs(self) -> dict[str, float]:
         logs: dict[str, float] = {

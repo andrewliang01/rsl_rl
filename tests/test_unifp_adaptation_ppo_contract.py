@@ -103,6 +103,14 @@ def test_legacy_adaptation_names_remain_backward_compatible():
     )
 
 
+def test_adaptation_modules_do_not_evaluate_legacy_actor_fallback_eagerly():
+    algorithm = UniFPAdaptationPPO.__new__(UniFPAdaptationPPO)
+    algorithm.actor = nn.Module()
+    algorithm._adaptation_modules = (nn.Linear(2, 2), nn.Linear(2, 2), nn.Linear(2, 2))
+
+    assert algorithm._get_adaptation_modules() is algorithm._adaptation_modules
+
+
 def test_adaptation_gradients_are_averaged_across_ranks(monkeypatch):
     algorithm = _algorithm(multi_gpu=True)
     for index, param in enumerate(algorithm._adaptation_params):
