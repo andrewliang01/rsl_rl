@@ -29,6 +29,7 @@ from .prop_mlp_elevation_unifp_fusion_model import PropMLPElevationUniFPFusionMo
 from .shared_prop_mlp_elevation_multi_head_critic import SharedPropMLPElevationMultiHeadCritic
 from .unifp_adaptation_actor import UniFPAdaptationActor
 from .unifp_dual_history_actor import UniFPDualHistoryActor
+from .unifp_gru_history_actor import UniFPGRUHistoryActor
 
 __all__ = [
     "AMPDiscriminator",
@@ -55,4 +56,5 @@ __all__ = [
     "SharedPropMLPElevationMultiHeadCritic",
     "UniFPAdaptationActor",
     "UniFPDualHistoryActor",
+    "UniFPGRUHistoryActor",
 ]
