@@ -227,6 +227,7 @@ class MultiPPO(PPO):
         # Record the rewards and dones
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
+        self.transition.next_observations = obs
 
         # Compute the intrinsic rewards and add to extrinsic rewards
         if self.rnd:
