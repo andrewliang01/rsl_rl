@@ -364,7 +364,11 @@ class AMPLoader:
                 self.trajectories.append(clip_trajectory)
                 self.trajectories_full.append(clip_trajectory)
                 self.trajectory_idxs.append(len(self.trajectory_idxs))
-                self.trajectory_weights.append(1.0)
+                # Sampling a concatenated NPZ by clip with equal weights would
+                # over-represent every frame in short clips.  Use the number of
+                # frames as the implicit weight so weighted-random sampling is
+                # uniform over the complete combined dataset.
+                self.trajectory_weights.append(float(clip_trajectory.shape[0]))
 
                 frame_duration = 1.0 / float(fps)
                 self.trajectory_frame_durations.append(frame_duration)
