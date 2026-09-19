@@ -2,6 +2,19 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
+
+class _CircularAzimuthConv2d(nn.Conv2d):
+    """Wrap width only, retaining Conv2d parameter names for old checkpoints."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        pad = self.padding[1]
+        x = F.pad(x, (pad, pad, 0, 0), mode="circular")
+        return F.conv2d(
+            x, self.weight, self.bias, self.stride,
+            (self.padding[0], 0), self.dilation, self.groups,
+        )
 
 
 class Elevation2DCNNEncoder(nn.Module):
@@ -13,14 +26,16 @@ class Elevation2DCNNEncoder(nn.Module):
                  kernel_sizes=[3, 3, 3],  # 每层卷积核大小
                  strides=[2, 2, 2],  # 每层卷积步长
                  out_dim=64,  # 最终输出特征向量维度
-                 vision_spatial_size=(25, 17)):  # 输入高程图的空间尺寸 (H, W)
+                 vision_spatial_size=(25, 17),  # 输入高程图的空间尺寸 (H, W)
+                 circular_azimuth: bool = False):  # 仅全景图的水平方向首尾相接
         super().__init__()
         
         # 构建2DCNN卷积层
         layers = []
+        conv_type = _CircularAzimuthConv2d if circular_azimuth else nn.Conv2d
         now_channels = in_channels
         for i, (hidden_dim, kernel_size, stride) in enumerate(zip(hidden_dims, kernel_sizes, strides)):
-            layers.append(nn.Conv2d(
+            layers.append(conv_type(
                 now_channels, 
                 hidden_dim, 
                 kernel_size=kernel_size,

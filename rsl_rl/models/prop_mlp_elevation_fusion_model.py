@@ -82,6 +82,7 @@ class PropMLPElevationFusionModel(nn.Module):
         cnn_hidden_dims: tuple[int, ...] | list[int] = (16, 32, 64),
         cnn_kernel_sizes: tuple[int, ...] | list[int] = (3, 3, 3),
         cnn_strides: tuple[int, ...] | list[int] = (2, 2, 2),
+        cnn_circular_azimuth: bool = False,
         cnn_history_index: int | None = None,
         prop_feature_dim: int = 64,
         prop_hidden_dims: tuple[int, ...] | list[int] = (128,),
@@ -150,6 +151,8 @@ class PropMLPElevationFusionModel(nn.Module):
             cnn_hidden_dims: Hidden channels of the elevation CNN.
             cnn_kernel_sizes: Kernel sizes of the elevation CNN.
             cnn_strides: Strides of the elevation CNN.
+            cnn_circular_azimuth: Wrap panorama width at every CNN layer; height
+                retains zero padding. Defaults to the legacy planar CNN.
             cnn_history_index: Optional history frame used by the CNN. ``None`` preserves
                 the baseline multi-frame input; an integer selects exactly one frame.
             prop_feature_dim: Output feature dimension of the proprio MLP encoder.
@@ -213,6 +216,8 @@ class PropMLPElevationFusionModel(nn.Module):
 
         self.obs_set = obs_set
         self.elevation_encoder_type = elevation_encoder_type.lower()
+        if cnn_circular_azimuth and self.elevation_encoder_type != "cnn":
+            raise ValueError("cnn_circular_azimuth is only supported by the CNN elevation encoder.")
         if self.elevation_encoder_type not in self._ELEVATION_ENCODER_TYPES:
             raise ValueError(
                 f"Unsupported elevation_encoder_type '{elevation_encoder_type}'. "
@@ -408,7 +413,7 @@ class PropMLPElevationFusionModel(nn.Module):
             self.prop_mlp = nn.Identity()
             fusion_prop_dim = self.obs_dim
 
-        # Elevation encoder. Keep the default CNN construction byte-for-byte compatible with existing checkpoints.
+        # Keep default CNN behavior and parameter keys compatible with existing checkpoints.
         if self.elevation_encoder_type == "cnn":
             self.elevation_encoder = Elevation2DCNNEncoder(
                 in_channels=1 if self._cnn_use_single_frame else elevation_history_length,
@@ -417,6 +422,7 @@ class PropMLPElevationFusionModel(nn.Module):
                 strides=list(cnn_strides),
                 out_dim=vision_feature_dim,
                 vision_spatial_size=vision_spatial_size,
+                circular_azimuth=cnn_circular_azimuth,
             )
         elif self.elevation_encoder_type == "r2plus1d":
             if self.cnn_observation_type != "elevationmap":
