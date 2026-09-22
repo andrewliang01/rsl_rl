@@ -59,12 +59,18 @@ class AMPLoader:
         motion_quat_convention: str = "xyzw",
         expert_sampling_mode: str = "continuous",
         expert_trajectory_sampling_mode: str = "weighted_random",
+        include_base_joint_obs: bool = False,
+        joint_names: Sequence[str] = (),
     ) -> None:
         self.device = device
         self.time_between_frames = time_between_frames
         self.preload_transitions = preload_transitions
         self.num_preload_transitions = num_preload_transitions
         self.loader_type = self._normalize_loader_type(loader_type)
+        self.include_base_joint_obs = include_base_joint_obs
+        self.joint_names = tuple(joint_names)
+        if include_base_joint_obs and (not self.joint_names or self.loader_type != self.BODY_KINEMATICS_LOADER_TYPE):
+            raise ValueError("Base/joint AMP observations require body_kinematics_npz and ordered joint_names")
         if expert_sampling_mode not in ("continuous", "adjacent"):
             raise ValueError(
                 "[AMPLoader] expert_sampling_mode must be 'continuous' or 'adjacent', "
@@ -224,7 +230,8 @@ class AMPLoader:
         body_indexes = [motion_body_names.index(name) for name in body_names]
         anchor_index = motion_body_names.index(anchor_name)
         num_bodies = len(body_indexes)
-        self._amp_obs_dim = num_bodies * (3 + 6 + 3 + 3)
+        body_obs_dim = num_bodies * (3 + 6 + 3 + 3)
+        self._amp_obs_dim = body_obs_dim + (6 + 2 * len(self.joint_names) if self.include_base_joint_obs else 0)
 
         for motion_file in self._expand_motion_files(motion_files, (".npz",)):
             data = np.load(motion_file)
@@ -296,7 +303,19 @@ class AMPLoader:
             # with the environment observation functions used by the policy.
             if "amp_obs" in data.files:
                 cached_amp_obs = torch.tensor(data["amp_obs"], dtype=torch.float32, device=self.device)
-                expected_shape = (body_pos_w.shape[0], self._amp_obs_dim)
+                # New Pure-B2 exports append base/joint state. Other tasks keep
+                # using the original body-only prefix of the same expert file.
+                fields = tuple(np.asarray(data["amp_obs_fields"]).astype(str).reshape(-1)) if "amp_obs_fields" in data.files else ()
+                extended_fields = (
+                    "body_pos_b", "body_ori_b", "body_lin_vel_b", "body_ang_vel_b",
+                    "base_lin_vel", "base_ang_vel", "joint_pos", "joint_vel",
+                )
+                if fields == extended_fields and "joint_names" in data.files:
+                    full_dim = body_obs_dim + 6 + 2 * np.asarray(data["joint_names"]).size
+                    if tuple(cached_amp_obs.shape) != (body_pos_w.shape[0], full_dim):
+                        raise ValueError(f"[AMPLoader] {motion_file} has invalid extended amp_obs shape")
+                    cached_amp_obs = cached_amp_obs[:, :body_obs_dim]
+                expected_shape = (body_pos_w.shape[0], body_obs_dim)
                 if tuple(cached_amp_obs.shape) != expected_shape:
                     raise ValueError(
                         f"[AMPLoader] {motion_file} amp_obs shape is {tuple(cached_amp_obs.shape)}, "
@@ -320,6 +339,26 @@ class AMPLoader:
                             f"cached={cached_anchor!r}, requested={anchor_name!r}"
                         )
                 trajectory = cached_amp_obs
+
+            if self.include_base_joint_obs:
+                extra_keys = ("base_lin_vel", "base_ang_vel", "joint_pos", "joint_vel", "joint_names")
+                missing = [key for key in extra_keys if key not in data.files]
+                if missing:
+                    raise ValueError(
+                        f"[AMPLoader] {motion_file} missing Pure AMP fields {missing}; "
+                        "re-export expert data with play_amp_animation.py --robot b2"
+                    )
+                saved_joint_names = tuple(np.asarray(data["joint_names"]).astype(str).reshape(-1))
+                if saved_joint_names != self.joint_names:
+                    raise ValueError(f"[AMPLoader] {motion_file} joint_names mismatch: {saved_joint_names} != {self.joint_names}")
+                extras = []
+                for key, width in (("base_lin_vel", 3), ("base_ang_vel", 3),
+                                   ("joint_pos", len(self.joint_names)), ("joint_vel", len(self.joint_names))):
+                    value = torch.tensor(data[key], dtype=torch.float32, device=self.device)
+                    if tuple(value.shape) != (body_pos_w.shape[0], width) or not torch.isfinite(value).all():
+                        raise ValueError(f"[AMPLoader] {motion_file} invalid {key}: expected finite (T, {width})")
+                    extras.append(value)
+                trajectory = torch.cat((trajectory, *extras), dim=-1)
 
             default_fps = float(np.asarray(data["fps"]).reshape(-1)[0])
             if "clip_lengths" in data.files:
