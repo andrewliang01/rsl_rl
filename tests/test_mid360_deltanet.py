@@ -245,6 +245,7 @@ def test_history_critic_and_real_ppo_update(distributed, monkeypatch):
         "cpu",
     )
     assert isinstance(algorithm.storage, DeltaNetRolloutStorage)
+    assert algorithm.storage.next_observations is None
     assert algorithm.is_multi_gpu is distributed
     before = algorithm.actor.estimator.map_head[-1].weight.detach().clone()
     with torch.no_grad():
