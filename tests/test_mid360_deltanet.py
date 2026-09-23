@@ -168,7 +168,8 @@ def test_explicit_state_deployment_matches_actor_step():
     torch.testing.assert_close(next_state, model.get_hidden_state())
 
 
-def test_history_critic_and_real_ppo_update():
+@pytest.mark.parametrize("distributed", [False, True])
+def test_history_critic_and_real_ppo_update(distributed, monkeypatch):
     obs = observations()
     value_model = critic(obs)
     assert value_model(obs).shape == (3, 1)
@@ -218,8 +219,25 @@ def test_history_critic_and_real_ppo_update():
             "clip_param": 0.2,
             "entropy_coef": 0.008,
         },
-        "multi_gpu": None,
+        "multi_gpu": (
+            {"global_rank": 0, "local_rank": 0, "world_size": 2}
+            if distributed
+            else None
+        ),
     }
+    collective_calls = []
+    if distributed:
+        def fake_all_reduce(tensor, op):
+            assert op == torch.distributed.ReduceOp.SUM
+            collective_calls.append(("all_reduce", tensor.numel()))
+
+        def fake_broadcast(tensor, src):
+            assert src == 0
+            collective_calls.append(("broadcast", tensor.numel()))
+
+        monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+        monkeypatch.setattr(torch.distributed, "broadcast", fake_broadcast)
+
     algorithm = DeltaNetPPO.construct_algorithm(
         obs,
         SimpleNamespace(num_envs=3, num_actions=29),
@@ -227,6 +245,7 @@ def test_history_critic_and_real_ppo_update():
         "cpu",
     )
     assert isinstance(algorithm.storage, DeltaNetRolloutStorage)
+    assert algorithm.is_multi_gpu is distributed
     before = algorithm.actor.estimator.map_head[-1].weight.detach().clone()
     with torch.no_grad():
         for step in range(4):
@@ -243,3 +262,7 @@ def test_history_critic_and_real_ppo_update():
     assert all(value == value for value in metrics.values())
     assert not torch.equal(before, algorithm.actor.estimator.map_head[-1].weight)
     assert algorithm.storage.initial_actor_state is None
+    if distributed:
+        assert ("broadcast", 1) in collective_calls
+        assert any(name == "all_reduce" and size > 1000 for name, size in collective_calls)
+        assert ("all_reduce", 6) in collective_calls
