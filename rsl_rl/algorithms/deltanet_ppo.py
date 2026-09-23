@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import math
+import time
 
 import torch
 from torch import nn
@@ -31,6 +32,8 @@ class DeltaNetPPO(PPO):
         map_target_set: str = "height_scan_critic",
         map_target_history_index: int | None = -1,
         velocity_target_set: str = "deltanet_velocity_target",
+        tbptt_steps: int | None = None,
+        profile_learning: bool = False,
         **kwargs,
     ) -> None:
         for extension in ("rnd_cfg", "symmetry_cfg", "dwaq_cfg"):
@@ -50,6 +53,17 @@ class DeltaNetPPO(PPO):
         self.map_target_set = map_target_set
         self.map_target_history_index = map_target_history_index
         self.velocity_target_set = velocity_target_set
+        self.tbptt_steps = storage.tbptt_steps if tbptt_steps is None else int(tbptt_steps)
+        if self.tbptt_steps != storage.tbptt_steps:
+            raise ValueError("DeltaNetPPO and storage tbptt_steps must match.")
+        self.profile_learning = bool(profile_learning)
+
+    def _profile_mark(self) -> float:
+        if not self.profile_learning:
+            return 0.0
+        if self.device.startswith("cuda"):
+            torch.cuda.synchronize(self.device)
+        return time.perf_counter()
 
     def act(self, obs):
         if self.actor.get_hidden_state() is None:
@@ -67,6 +81,7 @@ class DeltaNetPPO(PPO):
             "map_target_set": self.map_target_set,
             "map_target_history_index": self.map_target_history_index,
             "velocity_target_set": self.velocity_target_set,
+            "tbptt_steps": self.tbptt_steps,
         }
         return checkpoint
 
@@ -77,6 +92,7 @@ class DeltaNetPPO(PPO):
             "map_target_set": self.map_target_set,
             "map_target_history_index": self.map_target_history_index,
             "velocity_target_set": self.velocity_target_set,
+            "tbptt_steps": self.tbptt_steps,
         }
         if strict and loaded_dict.get("deltanet_actor_config") != self.actor.model_config:
             raise ValueError("Checkpoint DeltaNet architecture differs from the task configuration.")
@@ -88,20 +104,29 @@ class DeltaNetPPO(PPO):
         return resumed
 
     def update(self):
-        metrics = {
-            "value": 0.0,
-            "surrogate": 0.0,
-            "entropy": 0.0,
-            "kl": 0.0,
-            "map_mse": 0.0,
-            "velocity_mse": 0.0,
+        metric_names = ("value", "surrogate", "entropy", "kl", "map_mse", "velocity_mse")
+        metric_sums = {name: torch.zeros((), device=self.device) for name in metric_names}
+        profile_sums = {
+            name: 0.0
+            for name in ("batch_prepare", "actor", "critic_and_loss", "backward", "gradient_sync", "optimizer")
         }
         updates = 0
-        generator = self.storage.recurrent_mini_batch_generator(
-            self.num_mini_batches,
-            self.num_learning_epochs,
+        batches = iter(
+            self.storage.recurrent_mini_batch_generator(
+                self.num_mini_batches,
+                self.num_learning_epochs,
+            )
         )
-        for batch in generator:
+        while True:
+            phase_start = self._profile_mark()
+            try:
+                batch = next(batches)
+            except StopIteration:
+                break
+            if self.profile_learning:
+                profile_sums["batch_prepare"] += self._profile_mark() - phase_start
+
+            phase_start = self._profile_mark()
             self.actor(
                 batch.observations,
                 masks=batch.masks,
@@ -110,6 +135,10 @@ class DeltaNetPPO(PPO):
             )
             log_prob = self.actor.get_output_log_prob(batch.actions)
             entropy = self.actor.output_entropy.mean()
+            if self.profile_learning:
+                profile_sums["actor"] += self._profile_mark() - phase_start
+
+            phase_start = self._profile_mark()
             values = self.critic(batch.observations, masks=batch.masks)
             with torch.no_grad():
                 kl_mean = self.actor.get_kl_divergence(
@@ -169,13 +198,27 @@ class DeltaNetPPO(PPO):
 
             loss = surrogate + self.value_loss_coef * value_loss - self.entropy_coef * entropy
             loss = loss + self.map_loss_coef * map_loss + self.velocity_loss_coef * velocity_loss
+            if self.profile_learning:
+                profile_sums["critic_and_loss"] += self._profile_mark() - phase_start
+
+            phase_start = self._profile_mark()
             self.optimizer.zero_grad()
             loss.backward()
+            if self.profile_learning:
+                profile_sums["backward"] += self._profile_mark() - phase_start
+
+            phase_start = self._profile_mark()
             if self.is_multi_gpu:
                 self.reduce_parameters()
+            if self.profile_learning:
+                profile_sums["gradient_sync"] += self._profile_mark() - phase_start
+
+            phase_start = self._profile_mark()
             nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
             nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
             self.optimizer.step()
+            if self.profile_learning:
+                profile_sums["optimizer"] += self._profile_mark() - phase_start
 
             for name, value in (
                 ("value", value_loss),
@@ -185,23 +228,34 @@ class DeltaNetPPO(PPO):
                 ("map_mse", map_loss),
                 ("velocity_mse", velocity_loss),
             ):
-                metrics[name] += value.item()
+                metric_sums[name].add_(value.detach())
             updates += 1
 
         self.storage.clear()
         self.actor.detach_hidden_state()
-        metrics = {name: value / updates for name, value in metrics.items()}
+        if updates == 0:
+            raise RuntimeError("DeltaNetPPO update produced no mini-batches.")
+        metric_values = torch.stack([metric_sums[name] for name in metric_names]) / updates
         if self.is_multi_gpu:
-            metric_names = tuple(metrics)
-            metric_values = torch.tensor(
-                [metrics[name] for name in metric_names],
-                device=self.device,
-            )
             torch.distributed.all_reduce(metric_values, op=torch.distributed.ReduceOp.SUM)
             metric_values /= self.gpu_world_size
-            metrics = dict(zip(metric_names, metric_values.tolist(), strict=True))
+        metrics = dict(zip(metric_names, metric_values.tolist(), strict=True))
         metrics["map_rmse_m"] = math.sqrt(metrics["map_mse"])
         metrics["velocity_rmse_mps"] = math.sqrt(metrics["velocity_mse"])
+        if self.profile_learning:
+            profile_names = tuple(profile_sums)
+            profile_values = torch.tensor(
+                [profile_sums[name] for name in profile_names],
+                device=self.device,
+            )
+            if self.is_multi_gpu:
+                torch.distributed.all_reduce(profile_values, op=torch.distributed.ReduceOp.MAX)
+            metrics.update(
+                {
+                    f"profile_{name}_s": value
+                    for name, value in zip(profile_names, profile_values.tolist(), strict=True)
+                }
+            )
         return metrics
 
     @classmethod
@@ -222,6 +276,7 @@ class DeltaNetPPO(PPO):
 
         map_target_set = algorithm_cfg.get("map_target_set", "height_scan_critic")
         velocity_target_set = algorithm_cfg.get("velocity_target_set", "deltanet_velocity_target")
+        tbptt_steps = algorithm_cfg.get("tbptt_steps", cfg["num_steps_per_env"])
         required_sets = {
             actor_cfg.get("proprio_set", "policy"),
             actor_cfg.get("panorama_set", "height_scan_policy"),
@@ -250,6 +305,7 @@ class DeltaNetPPO(PPO):
             obs,
             [env.num_actions],
             device,
+            tbptt_steps=tbptt_steps,
         )
         return cls(
             actor,
