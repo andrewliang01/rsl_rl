@@ -21,6 +21,7 @@ from .bank_lidar_heightmap import (
     supervised_height_valid_mse,
     valid_masked_range_mse,
 )
+from .deltanet import DeltaNetBlock, RMSNorm, delta_rule_chunkwise
 from .distribution import Distribution, GaussianDistribution, HeteroscedasticGaussianDistribution
 from .mlp import MLP
 from .multimodal_ray_evidence_encoder import MultimodalRayEvidenceEncoder
@@ -68,9 +69,12 @@ __all__ = [
     "SparseSupportEvidenceBottleneck",
     "FixedBudgetSupportSelector",
     "Distribution",
+    "DeltaNetBlock",
     "EmpiricalDiscountedVariationNormalization",
     "EmpiricalNormalization",
     "GaussianDistribution",
     "HeteroscedasticGaussianDistribution",
     "HiddenState",
+    "RMSNorm",
+    "delta_rule_chunkwise",
 ]

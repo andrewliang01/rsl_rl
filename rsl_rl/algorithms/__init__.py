@@ -6,6 +6,7 @@
 """Learning algorithms."""
 
 from .amp_ppo import AMPPPO
+from .deltanet_ppo import DeltaNetPPO
 from .distillation import Distillation
 from .m2m_distillation import M2MLatentActionDistillation
 from .m2m_distillation_loss import M2MDistillationLossConfig, M2MMaskedLatentActionLoss
@@ -19,6 +20,7 @@ from .unifp_amp_ppo import UniFPAMPAdaptationPPO
 __all__ = [
     "AMPPPO",
     "Distillation",
+    "DeltaNetPPO",
     "M2MDistillationLossConfig",
     "M2MDirectPPO",
     "M2MLatentActionDistillation",

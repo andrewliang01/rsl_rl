@@ -5,6 +5,7 @@
 
 """Storage for the learning algorithms."""
 
+from .deltanet_rollout_storage import DeltaNetRolloutStorage
 from .m2m_sequence_storage import (
     M2MSequenceBatch,
     M2MSequenceRolloutStorage,
@@ -16,6 +17,7 @@ from .replay_buffer import ReplayBuffer
 from .rollout_storage import RolloutStorage
 
 __all__ = [
+    "DeltaNetRolloutStorage",
     "M2MSequenceBatch",
     "M2MSequenceRolloutStorage",
     "M2MSequenceTransition",
