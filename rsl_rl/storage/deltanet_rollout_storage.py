@@ -25,6 +25,11 @@ class DeltaNetRolloutStorage(RolloutStorage):
 
     initial_actor_state: torch.Tensor | None = None
 
+    def __init__(self, *args, **kwargs) -> None:
+        if kwargs.pop("store_next_observations", False):
+            raise ValueError("DeltaNetRolloutStorage does not store unused next observations.")
+        super().__init__(*args, store_next_observations=False, **kwargs)
+
     def _save_hidden_states(self, hidden_states) -> None:
         actor, critic = hidden_states
         if critic is not None:
