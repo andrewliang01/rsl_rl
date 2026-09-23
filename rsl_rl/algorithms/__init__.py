@@ -7,6 +7,7 @@
 
 from .amp_ppo import AMPPPO
 from .deltanet_ppo import DeltaNetPPO
+from .deltanet_dual_rate_ppo import DeltaNetDualRatePPO
 from .distillation import Distillation
 from .m2m_distillation import M2MLatentActionDistillation
 from .m2m_distillation_loss import M2MDistillationLossConfig, M2MMaskedLatentActionLoss
@@ -21,6 +22,7 @@ __all__ = [
     "AMPPPO",
     "Distillation",
     "DeltaNetPPO",
+    "DeltaNetDualRatePPO",
     "M2MDistillationLossConfig",
     "M2MDirectPPO",
     "M2MLatentActionDistillation",

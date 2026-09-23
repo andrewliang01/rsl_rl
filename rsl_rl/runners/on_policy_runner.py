@@ -21,6 +21,7 @@ from rsl_rl.models import MLPModel
 from rsl_rl.utils import check_nan, resolve_callable
 from rsl_rl.utils.formal_training_io import FormalTrainingIO, FormalTrainingIOError
 from rsl_rl.utils.logger import Logger
+from rsl_rl.utils.rollout_profiler import RolloutProfiler
 from rsl_rl.utils.training_receipt import (
     build_embedded_checkpoint_receipt,
     canonical_training_receipt_json_bytes,
@@ -618,24 +619,33 @@ class OnPolicyRunner:
         # Start training
         start_it = self.current_learning_iteration
         total_it = start_it + num_learning_iterations
+        nan_interval = self.cfg.get("check_for_nan_interval", 1)
+        if type(nan_interval) is not int or nan_interval < 1:
+            raise ValueError("check_for_nan_interval must be a positive integer.")
         for it in range(start_it, total_it):
+            profiler = RolloutProfiler(self.cfg.get("profile_collection", False), self.device)
+            profiler.mark()
             start = time.time()
             # Rollout
             with torch.inference_mode(): #禁用梯度计算相关的开销，从而提升性能。
-                for _ in range(self.cfg["num_steps_per_env"]): 
+                for rollout_step in range(self.cfg["num_steps_per_env"]):
                 # 每一次的学习迭代中，算法会在环境中执行cfg["num_steps_per_env"]步。
                 # 这意味着智能体将与环境进行多次交互，收集状态、奖励和其他相关信息，以用于后续的学习更新。
                 # 那为什么是环境收集24步信息，算法才优化迭代一次？
                     
                     # actor和critic的推理，更新分布参数（有了新的action的分布），存储obs、actions和values，返回actions
                     actions = self.alg.act(obs)
+                    profiler.mark("actor_critic")
                     
                     # 给定actions，环境去交互，得到obs、rewards、dones和extras
                     obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
+                    profiler.mark("env_step")
 
                     # 检查环境返回的有没有异常值（NaN），如果有则抛出错误。这是为了确保训练过程中的数值稳定性和正确性。
-                    if self.cfg.get("check_for_nan", True):
+                    step_index = it * self.cfg["num_steps_per_env"] + rollout_step
+                    if self.cfg.get("check_for_nan", True) and step_index % nan_interval == 0:
                         check_nan(obs, rewards, dones)
+                    profiler.mark("nan_check")
                     
                     # 转移到GPU上进行后续处理
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
@@ -643,6 +653,7 @@ class OnPolicyRunner:
                     # 基于最新的obs做归一化处理，记录reward、dones，self.storage.add_transition(self.transition)
                     # 对time_outs的情况做特殊处理，因为没有下一步的$V(s_{t+1})$, 得换成 $V(s_t)$
                     self.alg.process_env_step(obs, rewards, dones, extras)
+                    profiler.mark("storage")
 
                     # Extract intrinsic rewards if RND is used (only for logging)
                     # TODO： RND没学过不懂啊，下次学了再来看吧
@@ -668,6 +679,7 @@ class OnPolicyRunner:
                         }
 
                     self.logger.process_env_step(rewards_for_log, dones, extras, intrinsic_rewards, amp_rewards)
+                    profiler.mark("bookkeeping")
 
                 stop = time.time()
                 collect_time = stop - start
@@ -685,6 +697,7 @@ class OnPolicyRunner:
 
             stop = time.time()
             learn_time = stop - start
+            loss_dict.update(profiler.metrics(self.is_distributed))
             self.current_learning_iteration = it
 
             # Log information

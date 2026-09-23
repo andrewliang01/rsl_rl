@@ -8,7 +8,6 @@
 from __future__ import annotations
 
 import copy
-
 import torch
 from tensordict import TensorDict
 from torch import nn
@@ -16,7 +15,7 @@ from torch.nn import functional as F
 
 from rsl_rl.models.mlp_model import MLPModel
 from rsl_rl.models.prop_mlp_elevation_fusion_model import PropMLPElevationFusionModel
-from rsl_rl.modules import DeltaNetBlock, MLP, RMSNorm
+from rsl_rl.modules import MLP, DeltaNetBlock, RMSNorm
 from rsl_rl.utils import unpad_trajectories
 
 
@@ -142,13 +141,14 @@ class MID360DeltaEstimator(nn.Module):
         proprio: torch.Tensor,
         panorama: torch.Tensor,
         state: torch.Tensor,
+        reset_before: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         length, batch = proprio.shape[:2]
         vision = self.vision(panorama.flatten(0, 1)).reshape(length, batch, -1)
         x = torch.cat((vision, self.proprio(proprio)), dim=-1)
         next_states = []
         for index, block in enumerate(self.blocks):
-            x, next_state = block(x, state[index])
+            x, next_state = block(x, state[index], reset_before)
             next_states.append(next_state)
         x = self.norm(x)
         return self.map_head(x), self.velocity_head(x), torch.stack(next_states)

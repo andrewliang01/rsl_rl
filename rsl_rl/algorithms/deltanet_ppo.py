@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import math
 import time
-
 import torch
 from torch import nn
 
@@ -45,8 +44,7 @@ class DeltaNetPPO(PPO):
         ):
             if not math.isfinite(coefficient) or coefficient <= 0.0:
                 raise ValueError(f"{name} must be finite and positive.")
-        if not isinstance(storage, DeltaNetRolloutStorage) or critic.is_recurrent:
-            raise ValueError("DeltaNetPPO requires compact-state storage and a feed-forward critic.")
+        self._validate_storage(storage, critic)
         super().__init__(actor, critic, storage, **kwargs)
         self.map_loss_coef = map_loss_coef
         self.velocity_loss_coef = velocity_loss_coef
@@ -57,6 +55,37 @@ class DeltaNetPPO(PPO):
         if self.tbptt_steps != storage.tbptt_steps:
             raise ValueError("DeltaNetPPO and storage tbptt_steps must match.")
         self.profile_learning = bool(profile_learning)
+
+    @staticmethod
+    def _validate_storage(storage, critic):
+        if not isinstance(storage, DeltaNetRolloutStorage) or critic.is_recurrent:
+            raise ValueError("DeltaNetPPO requires compact-state storage and a feed-forward critic.")
+
+    def _batches(self):
+        return self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+
+    def _forward_actor(self, batch):
+        self.actor(
+            batch.observations,
+            masks=batch.masks,
+            hidden_state=batch.hidden_states[0],
+            stochastic_output=True,
+        )
+
+    def _auxiliary_losses(self, batch):
+        target_map = unpad_trajectories(batch.observations[self.map_target_set], batch.masks)
+        if self.map_target_history_index is not None:
+            target_map = target_map[..., self.map_target_history_index, :, :]
+        target_map = target_map.flatten(2).detach()
+        target_velocity = unpad_trajectories(
+            batch.observations[self.velocity_target_set],
+            batch.masks,
+        ).detach()
+        finite = torch.isfinite(target_map)
+        safe_target = torch.where(finite, target_map, 0.0)
+        map_error = self.actor.last_map - safe_target
+        map_loss = torch.where(finite, map_error.square(), 0.0).sum() / finite.sum().clamp_min(1)
+        return map_loss, (self.actor.last_velocity - target_velocity).square().mean()
 
     def _profile_mark(self) -> float:
         if not self.profile_learning:
@@ -111,12 +140,7 @@ class DeltaNetPPO(PPO):
             for name in ("batch_prepare", "actor", "critic_and_loss", "backward", "gradient_sync", "optimizer")
         }
         updates = 0
-        batches = iter(
-            self.storage.recurrent_mini_batch_generator(
-                self.num_mini_batches,
-                self.num_learning_epochs,
-            )
-        )
+        batches = iter(self._batches())
         while True:
             phase_start = self._profile_mark()
             try:
@@ -127,12 +151,7 @@ class DeltaNetPPO(PPO):
                 profile_sums["batch_prepare"] += self._profile_mark() - phase_start
 
             phase_start = self._profile_mark()
-            self.actor(
-                batch.observations,
-                masks=batch.masks,
-                hidden_state=batch.hidden_states[0],
-                stochastic_output=True,
-            )
+            self._forward_actor(batch)
             log_prob = self.actor.get_output_log_prob(batch.actions)
             entropy = self.actor.output_entropy.mean()
             if self.profile_learning:
@@ -178,23 +197,7 @@ class DeltaNetPPO(PPO):
                 value_loss = torch.maximum(value_loss, (clipped - batch.returns).square())
             value_loss = value_loss.mean()
 
-            target_map = unpad_trajectories(
-                batch.observations[self.map_target_set],
-                batch.masks,
-            )
-            if self.map_target_history_index is not None:
-                target_map = target_map[..., self.map_target_history_index, :, :]
-            target_map = target_map.flatten(2).detach()
-            target_velocity = unpad_trajectories(
-                batch.observations[self.velocity_target_set],
-                batch.masks,
-            ).detach()
-            finite = torch.isfinite(target_map)
-            safe_target = torch.where(finite, target_map, 0.0)
-            map_error = self.actor.last_map - safe_target
-            map_loss = torch.where(finite, map_error.square(), 0.0).sum()
-            map_loss = map_loss / finite.sum().clamp_min(1)
-            velocity_loss = (self.actor.last_velocity - target_velocity).square().mean()
+            map_loss, velocity_loss = self._auxiliary_losses(batch)
 
             loss = surrogate + self.value_loss_coef * value_loss - self.entropy_coef * entropy
             loss = loss + self.map_loss_coef * map_loss + self.velocity_loss_coef * velocity_loss
@@ -250,19 +253,14 @@ class DeltaNetPPO(PPO):
             )
             if self.is_multi_gpu:
                 torch.distributed.all_reduce(profile_values, op=torch.distributed.ReduceOp.MAX)
-            metrics.update(
-                {
-                    f"profile_{name}_s": value
-                    for name, value in zip(profile_names, profile_values.tolist(), strict=True)
-                }
-            )
+            metrics.update({
+                f"profile_{name}_s": value for name, value in zip(profile_names, profile_values.tolist(), strict=True)
+            })
         return metrics
 
     @classmethod
     def construct_algorithm(cls, obs, env, cfg, device):
-        actor_cfg, critic_cfg, algorithm_cfg = (
-            cfg[name].copy() for name in ("actor", "critic", "algorithm")
-        )
+        actor_cfg, critic_cfg, algorithm_cfg = (cfg[name].copy() for name in ("actor", "critic", "algorithm"))
         actor_class = resolve_callable(actor_cfg.pop("class_name"))
         critic_class = resolve_callable(critic_cfg.pop("class_name"))
         algorithm_cfg.pop("class_name")
@@ -290,15 +288,13 @@ class DeltaNetPPO(PPO):
             raise ValueError(f"DeltaNetPPO training observations are missing: {missing}.")
         map_shape = tuple(actor_cfg.get("map_shape", (28, 20)))
         if tuple(obs[map_target_set].shape[-2:]) != map_shape:
-            raise ValueError(
-                f"Map target must end in {map_shape}, got {tuple(obs[map_target_set].shape)}."
-            )
+            raise ValueError(f"Map target must end in {map_shape}, got {tuple(obs[map_target_set].shape)}.")
         if tuple(obs[velocity_target_set].shape[1:]) != (3,):
             raise ValueError("Velocity supervision must have shape [B,3].")
 
         actor = actor_class(obs, cfg["obs_groups"], "actor", env.num_actions, **actor_cfg).to(device)
         critic = critic_class(obs, cfg["obs_groups"], "critic", 1, **critic_cfg).to(device)
-        storage = DeltaNetRolloutStorage(
+        storage = cls._make_storage(
             "rl",
             env.num_envs,
             cfg["num_steps_per_env"],
@@ -306,6 +302,8 @@ class DeltaNetPPO(PPO):
             [env.num_actions],
             device,
             tbptt_steps=tbptt_steps,
+            actor=actor,
+            critic=critic,
         )
         return cls(
             actor,
@@ -315,6 +313,10 @@ class DeltaNetPPO(PPO):
             multi_gpu_cfg=cfg.get("multi_gpu"),
             **algorithm_cfg,
         )
+
+    @staticmethod
+    def _make_storage(*args, actor=None, critic=None, **kwargs):
+        return DeltaNetRolloutStorage(*args, **kwargs)
 
 
 __all__ = ["DeltaNetPPO"]
