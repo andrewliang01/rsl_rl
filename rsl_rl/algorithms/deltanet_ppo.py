@@ -36,8 +36,6 @@ class DeltaNetPPO(PPO):
         for extension in ("rnd_cfg", "symmetry_cfg", "dwaq_cfg"):
             if kwargs.get(extension) is not None:
                 raise ValueError(f"DeltaNetPPO does not support {extension}.")
-        if kwargs.get("multi_gpu_cfg") is not None:
-            raise ValueError("DeltaNetPPO currently supports one GPU.")
         for name, coefficient in (
             ("map_loss_coef", map_loss_coef),
             ("velocity_loss_coef", velocity_loss_coef),
@@ -114,15 +112,23 @@ class DeltaNetPPO(PPO):
             entropy = self.actor.output_entropy.mean()
             values = self.critic(batch.observations, masks=batch.masks)
             with torch.no_grad():
-                kl = self.actor.get_kl_divergence(
+                kl_mean = self.actor.get_kl_divergence(
                     batch.old_distribution_params,
                     self.actor.output_distribution_params,
                 ).mean()
+                if self.is_multi_gpu:
+                    torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
+                    kl_mean /= self.gpu_world_size
                 if self.desired_kl is not None and self.schedule == "adaptive":
-                    if kl > 2.0 * self.desired_kl:
-                        self.learning_rate = max(1.0e-5, self.learning_rate / 1.5)
-                    elif 0.0 < kl < self.desired_kl / 2.0:
-                        self.learning_rate = min(1.0e-2, self.learning_rate * 1.5)
+                    if self.gpu_global_rank == 0:
+                        if kl_mean > 2.0 * self.desired_kl:
+                            self.learning_rate = max(1.0e-5, self.learning_rate / 1.5)
+                        elif 0.0 < kl_mean < self.desired_kl / 2.0:
+                            self.learning_rate = min(1.0e-2, self.learning_rate * 1.5)
+                    if self.is_multi_gpu:
+                        learning_rate = torch.tensor(self.learning_rate, device=self.device)
+                        torch.distributed.broadcast(learning_rate, src=0)
+                        self.learning_rate = learning_rate.item()
                     for parameter_group in self.optimizer.param_groups:
                         parameter_group["lr"] = self.learning_rate
 
@@ -165,6 +171,8 @@ class DeltaNetPPO(PPO):
             loss = loss + self.map_loss_coef * map_loss + self.velocity_loss_coef * velocity_loss
             self.optimizer.zero_grad()
             loss.backward()
+            if self.is_multi_gpu:
+                self.reduce_parameters()
             nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
             nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
             self.optimizer.step()
@@ -173,7 +181,7 @@ class DeltaNetPPO(PPO):
                 ("value", value_loss),
                 ("surrogate", surrogate),
                 ("entropy", entropy),
-                ("kl", kl),
+                ("kl", kl_mean),
                 ("map_mse", map_loss),
                 ("velocity_mse", velocity_loss),
             ):
@@ -183,6 +191,15 @@ class DeltaNetPPO(PPO):
         self.storage.clear()
         self.actor.detach_hidden_state()
         metrics = {name: value / updates for name, value in metrics.items()}
+        if self.is_multi_gpu:
+            metric_names = tuple(metrics)
+            metric_values = torch.tensor(
+                [metrics[name] for name in metric_names],
+                device=self.device,
+            )
+            torch.distributed.all_reduce(metric_values, op=torch.distributed.ReduceOp.SUM)
+            metric_values /= self.gpu_world_size
+            metrics = dict(zip(metric_names, metric_values.tolist(), strict=True))
         metrics["map_rmse_m"] = math.sqrt(metrics["map_mse"])
         metrics["velocity_rmse_mps"] = math.sqrt(metrics["velocity_mse"])
         return metrics
