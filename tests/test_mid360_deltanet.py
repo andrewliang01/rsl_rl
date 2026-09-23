@@ -206,6 +206,8 @@ def test_history_critic_and_real_ppo_update(distributed, monkeypatch):
             "map_target_set": "height_scan_critic",
             "map_target_history_index": -1,
             "velocity_target_set": "deltanet_velocity_target",
+            "tbptt_steps": 2,
+            "profile_learning": not distributed,
             "num_learning_epochs": 1,
             "num_mini_batches": 1,
             "learning_rate": 1.0e-3,
@@ -248,9 +250,11 @@ def test_history_critic_and_real_ppo_update(distributed, monkeypatch):
     assert algorithm.storage.next_observations is None
     assert algorithm.is_multi_gpu is distributed
     before = algorithm.actor.estimator.map_head[-1].weight.detach().clone()
+    online_maps = []
     with torch.no_grad():
         for step in range(4):
             algorithm.act(obs)
+            online_maps.append(algorithm.actor.last_map.clone())
             obs = observations()
             algorithm.process_env_step(
                 obs,
@@ -259,8 +263,30 @@ def test_history_critic_and_real_ppo_update(distributed, monkeypatch):
                 {},
             )
         algorithm.compute_returns(obs)
+    assert algorithm.storage.tbptt_steps == 2
+    assert algorithm.storage.actor_boundary_states.shape[:3] == (2, 2, 3)
+    assert torch.count_nonzero(algorithm.storage.actor_boundary_states[1, :, 0]) == 0
+    batch = next(algorithm.storage.recurrent_mini_batch_generator(1, 1))
+    assert batch.observations.batch_size[0] == 2
+    assert batch.actions.shape[:2] == (2, 6)
+    assert batch.hidden_states[0].shape[1] == batch.masks.shape[1]
+    with torch.no_grad():
+        algorithm.actor(
+            batch.observations,
+            masks=batch.masks,
+            hidden_state=batch.hidden_states[0],
+            stochastic_output=True,
+        )
+    expected_maps = torch.cat(
+        (torch.stack(online_maps[:2]), torch.stack(online_maps[2:])),
+        dim=1,
+    )
+    torch.testing.assert_close(algorithm.actor.last_map, expected_maps)
     metrics = algorithm.update()
     assert all(value == value for value in metrics.values())
+    if not distributed:
+        assert metrics["profile_batch_prepare_s"] >= 0.0
+        assert metrics["profile_backward_s"] >= 0.0
     assert not torch.equal(before, algorithm.actor.estimator.map_head[-1].weight)
     assert algorithm.storage.initial_actor_state is None
     if distributed:
