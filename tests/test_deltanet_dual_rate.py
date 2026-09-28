@@ -51,9 +51,9 @@ def test_parallel_matches_recurrent_outputs_states_and_gradients(length, conv_si
         torch.testing.assert_close(a.grad, b.grad, rtol=1e-6, atol=1e-8)
 
 
-def make_algorithm(distributed=None):
+def make_algorithm(distributed=None, encoders=False):
     obs = observations(4)
-    policy, value = actor(obs, 2), critic(obs)
+    policy, value = actor(obs, 2, use_actor_input_encoders=encoders), critic(obs)
     storage = DeltaNetDualRatePPO._make_storage(
         "rl",
         4,
@@ -92,8 +92,10 @@ def collect(alg, rollout_id=0, rank=0):
         alg.compute_returns(obs)
 
 
-def test_dual_rate_preserves_samples_and_isolates_gradients_and_replay():
-    alg = make_algorithm()
+@pytest.mark.parametrize("encoders", [False, True])
+def test_dual_rate_preserves_samples_and_isolates_gradients_and_replay(encoders):
+    alg = make_algorithm(encoders=encoders)
+    initial_encoder = copy.deepcopy(alg.actor.policy_encoder.state_dict())
     initial_policy = copy.deepcopy(alg.actor.mlp.state_dict())
     expected_tails = [3, 6, 1, 4, 7, 2, 5, 0]
     expected_updates = [0, 0, 1, 1, 1, 2, 2, 3]
@@ -108,6 +110,7 @@ def test_dual_rate_preserves_samples_and_isolates_gradients_and_replay():
         assert alg.storage.next_observations is None
         assert alg.storage.saved_hidden_state_a is None
         assert "height_scan_policy" not in alg.storage.observations
+        assert alg.storage.observations[alg.cached_input_key].shape[-1] == 659
         tail = alg.estimator_storage.step - 8
         if tail >= 0:
             expected_data = alg.estimator_storage.data[8 : alg.estimator_storage.step].clone()
@@ -129,10 +132,17 @@ def test_dual_rate_preserves_samples_and_isolates_gradients_and_replay():
         assert all(p.grad is None for p in alg.actor.estimator.parameters())
         assert alg.actor.get_hidden_state().grad_fn is None
     assert any(not torch.equal(v, alg.actor.mlp.state_dict()[k]) for k, v in initial_policy.items())
+    if encoders:
+        for branch in ("map_conv.", "map_projection.", "state_mlp."):
+            assert any(
+                not torch.equal(v, alg.actor.policy_encoder.state_dict()[k])
+                for k, v in initial_encoder.items() if k.startswith(branch)
+            )
 
 
-def test_estimator_isolation_and_resume_restores_both_optimizers():
-    alg = make_algorithm()
+@pytest.mark.parametrize("encoders", [False, True])
+def test_estimator_isolation_and_resume_restores_both_optimizers(encoders):
+    alg = make_algorithm(encoders=encoders)
     for i in range(3):
         collect(alg, i)
         if i < 2:
@@ -140,26 +150,34 @@ def test_estimator_isolation_and_resume_restores_both_optimizers():
         else:
             super(DeltaNetDualRatePPO, alg).update()
     before_actor = copy.deepcopy(alg.actor.mlp.state_dict())
+    before_encoder = copy.deepcopy(alg.actor.policy_encoder.state_dict())
     before_critic = copy.deepcopy(alg.critic.state_dict())
     alg._update_estimator()
     for key, value in before_actor.items():
         torch.testing.assert_close(value, alg.actor.mlp.state_dict()[key], rtol=0, atol=0)
+    for key, value in before_encoder.items():
+        torch.testing.assert_close(value, alg.actor.policy_encoder.state_dict()[key], rtol=0, atol=0)
     for key, value in before_critic.items():
         torch.testing.assert_close(value, alg.critic.state_dict()[key], rtol=0, atol=0)
     saved = copy.deepcopy(alg.save())
-    restored = make_algorithm()
+    restored = make_algorithm(encoders=encoders)
     assert restored.load(saved)
     assert restored.estimator_updates == alg.estimator_updates
     assert restored.estimator_storage.step == 0
     assert restored.actor.get_hidden_state() is None
     assert restored.optimizer.state_dict()["state"]
     assert restored.estimator_optimizer.state_dict()["state"]
+    for key, value in alg.actor.state_dict().items():
+        torch.testing.assert_close(value, restored.actor.state_dict()[key], rtol=0, atol=0)
+    incompatible = make_algorithm(encoders=not encoders)
+    with pytest.raises(ValueError, match="architecture differs"):
+        incompatible.load(saved)
     del saved["deltanet_dual_rate_config"]
     with pytest.raises(ValueError, match="dual-rate schedule"):
         restored.load(saved)
 
 
-def distributed_worker(rank, rendezvous):
+def distributed_worker(rank, rendezvous, encoders):
     from datetime import timedelta
 
     torch.set_num_threads(1)
@@ -171,7 +189,7 @@ def distributed_worker(rank, rendezvous):
         timeout=timedelta(seconds=45),
     )
     try:
-        alg = make_algorithm({"global_rank": rank, "local_rank": rank, "world_size": 2})
+        alg = make_algorithm({"global_rank": rank, "local_rank": rank, "world_size": 2}, encoders=encoders)
         alg.broadcast_parameters()
         torch.manual_seed(100 + rank)
         for rollout in range(3):
@@ -187,5 +205,8 @@ def distributed_worker(rank, rendezvous):
         torch.distributed.destroy_process_group()
 
 
-def test_two_rank_updates_with_different_resets_remain_synchronized(tmp_path):
-    torch.multiprocessing.spawn(distributed_worker, args=(str(tmp_path / "rendezvous"),), nprocs=2, join=True)
+@pytest.mark.parametrize("encoders", [False, True])
+def test_two_rank_updates_with_different_resets_remain_synchronized(tmp_path, encoders):
+    torch.multiprocessing.spawn(
+        distributed_worker, args=(str(tmp_path / "rendezvous"), encoders), nprocs=2, join=True
+    )

@@ -105,7 +105,7 @@ class DeltaNetDualRatePPO(DeltaNetPPO):
         critic: SequenceElevationHistoryCritic,
     ) -> DeltaNetPolicyStorage:
         inputs = obs.select(*critic.obs_groups, critic.elevation_set).clone()
-        inputs[cls.cached_input_key] = torch.zeros(num_envs, actor._get_latent_dim(), device=device)
+        inputs[cls.cached_input_key] = torch.zeros(num_envs, actor.policy_input_dim, device=device)
         storage = DeltaNetPolicyStorage(
             training_type,
             num_envs,
@@ -165,7 +165,7 @@ class DeltaNetDualRatePPO(DeltaNetPPO):
     def _forward_actor(self, batch: RolloutStorage.Batch) -> None:
         # Replay precisely the normalized inputs used by the behavior policy.
         latent = batch.observations[self.cached_input_key]
-        self.actor.distribution.update(self.actor.mlp(latent))
+        self.actor.distribution.update(self.actor.mlp(self.actor.encode_policy_input(latent)))
 
     def _auxiliary_losses(self, batch: RolloutStorage.Batch) -> tuple[torch.Tensor, torch.Tensor]:
         zero = batch.values.new_zeros(())

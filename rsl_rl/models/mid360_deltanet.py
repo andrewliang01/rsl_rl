@@ -154,6 +154,60 @@ class MID360DeltaEstimator(nn.Module):
         return self.map_head(x), self.velocity_head(x), torch.stack(next_states)
 
 
+class DeltaNetPolicyEncoder(nn.Module):
+    """Encode detached predicted terrain and state for the policy head.
+
+    Cartesian maps use ordinary padding and retain metric heights. There is no
+    batch-dependent normalization, preserving behavior log-probabilities when
+    PPO shuffles the cached inputs. Only the encoders receive policy gradients.
+    """
+
+    def __init__(
+        self,
+        proprio_dim: int,
+        map_shape: tuple[int, int],
+        map_feature_dim: int,
+        state_feature_dim: int,
+        cnn_hidden_dims: tuple[int, ...],
+        cnn_kernel_sizes: tuple[int, ...],
+        cnn_strides: tuple[int, ...],
+        state_hidden_dims: tuple[int, ...],
+        activation: str,
+    ) -> None:
+        super().__init__()
+        if min(*map_shape, map_feature_dim, state_feature_dim) <= 0:
+            raise ValueError("Actor map shape and feature dimensions must be positive.")
+        if not (len(cnn_hidden_dims) == len(cnn_kernel_sizes) == len(cnn_strides) and cnn_hidden_dims):
+            raise ValueError("Actor map CNN channels, kernels and strides must have equal non-zero lengths.")
+        if any(value <= 0 for values in (cnn_hidden_dims, cnn_kernel_sizes, cnn_strides) for value in values):
+            raise ValueError("Actor map CNN dimensions must be positive.")
+        if not state_hidden_dims or any(value <= 0 for value in state_hidden_dims):
+            raise ValueError("Actor state MLP must have positive hidden dimensions.")
+        self.proprio_dim = proprio_dim
+        self.map_shape = tuple(map_shape)
+        self.map_size = map_shape[0] * map_shape[1]
+        self.map_feature_dim = map_feature_dim
+        layers: list[nn.Module] = []
+        channels = 1
+        for width, kernel, stride in zip(cnn_hidden_dims, cnn_kernel_sizes, cnn_strides):
+            layers.extend((nn.Conv2d(channels, width, kernel, stride, kernel // 2), nn.ELU()))
+            channels = width
+        self.map_conv = nn.Sequential(*layers)
+        with torch.no_grad():
+            conv_size = self.map_conv(torch.zeros(1, 1, *map_shape)).numel()
+        self.map_projection = nn.Linear(conv_size, map_feature_dim)
+        self.state_mlp = MLP(proprio_dim + 3, state_feature_dim, state_hidden_dims, activation)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        inputs = inputs.detach()
+        height = inputs[..., self.proprio_dim : self.proprio_dim + self.map_size]
+        height = height.reshape(-1, 1, *self.map_shape)
+        map_features = F.elu(self.map_projection(self.map_conv(height).flatten(1)))
+        map_features = map_features.reshape(*inputs.shape[:-1], self.map_feature_dim)
+        state = torch.cat((inputs[..., : self.proprio_dim], inputs[..., -3:]), dim=-1)
+        return torch.cat((self.state_mlp(state), map_features), dim=-1)
+
+
 class MID360DeltaNetActor(MLPModel):
     """Recurrent actor driven by current inputs and implicit DeltaNet memory."""
 
@@ -185,6 +239,13 @@ class MID360DeltaNetActor(MLPModel):
         cnn_circular_azimuth: bool = True,
         near: float = 0.05,
         far: float = 1.857,
+        use_actor_input_encoders: bool = False,
+        actor_map_feature_dim: int = 64,
+        actor_state_feature_dim: int = 64,
+        actor_map_cnn_hidden_dims: tuple[int, ...] = (8, 16),
+        actor_map_cnn_kernel_sizes: tuple[int, ...] = (3, 3),
+        actor_map_cnn_strides: tuple[int, ...] = (2, 2),
+        actor_state_hidden_dims: tuple[int, ...] = (128,),
         hidden_dims: tuple[int, ...] = (512, 256, 128),
         activation: str = "elu",
         obs_normalization: bool = True,
@@ -213,6 +274,10 @@ class MID360DeltaNetActor(MLPModel):
         self.panorama_shape = tuple(panorama_shape)
         self.map_shape = tuple(map_shape)
         self.map_size = self.map_shape[0] * self.map_shape[1]
+        self.policy_input_dim = self.proprio_dim + self.map_size + 3
+        self.use_actor_input_encoders = use_actor_input_encoders
+        self.actor_map_feature_dim = actor_map_feature_dim
+        self.actor_state_feature_dim = actor_state_feature_dim
         distribution_contract = copy.deepcopy(
             distribution_cfg
             or {"class_name": "GaussianDistribution", "init_std": 1.0, "std_type": "scalar"}
@@ -245,6 +310,21 @@ class MID360DeltaNetActor(MLPModel):
             near=near,
             far=far,
         )
+        self.policy_encoder = (
+            DeltaNetPolicyEncoder(
+                self.proprio_dim,
+                self.map_shape,
+                actor_map_feature_dim,
+                actor_state_feature_dim,
+                actor_map_cnn_hidden_dims,
+                actor_map_cnn_kernel_sizes,
+                actor_map_cnn_strides,
+                actor_state_hidden_dims,
+                activation,
+            )
+            if use_actor_input_encoders
+            else nn.Identity()
+        )
         self.model_config = {
             "proprio_set": proprio_set,
             "expected_proprio_dim": expected_proprio_dim,
@@ -270,12 +350,29 @@ class MID360DeltaNetActor(MLPModel):
             "obs_normalization": obs_normalization,
             "distribution_cfg": distribution_contract,
         }
+        # Keep the original config dictionary intact for legacy flat actors.
+        if use_actor_input_encoders:
+            self.model_config.update({
+                "use_actor_input_encoders": True,
+                "actor_map_feature_dim": actor_map_feature_dim,
+                "actor_state_feature_dim": actor_state_feature_dim,
+                "actor_map_cnn_hidden_dims": list(actor_map_cnn_hidden_dims),
+                "actor_map_cnn_kernel_sizes": list(actor_map_cnn_kernel_sizes),
+                "actor_map_cnn_strides": list(actor_map_cnn_strides),
+                "actor_state_hidden_dims": list(actor_state_hidden_dims),
+            })
         self._hidden_state: torch.Tensor | None = None
         self.last_map: torch.Tensor | None = None
         self.last_velocity: torch.Tensor | None = None
 
     def _get_latent_dim(self) -> int:
-        return self.proprio_dim + self.map_size + 3
+        if self.use_actor_input_encoders:
+            return self.actor_map_feature_dim + self.actor_state_feature_dim
+        return self.policy_input_dim
+
+    def encode_policy_input(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Encode cached behavior inputs without rerunning the estimator."""
+        return self.policy_encoder(inputs)
 
     def get_latent(self, obs, masks=None, hidden_state=None):
         proprio = self.obs_normalizer(obs[self.proprio_set])
@@ -304,7 +401,7 @@ class MID360DeltaNetActor(MLPModel):
             proprio = proprio.squeeze(0)
         self.last_map = height
         self.last_velocity = velocity
-        return torch.cat((proprio, height, velocity), dim=-1)
+        return self.encode_policy_input(torch.cat((proprio, height, velocity), dim=-1))
 
     def get_hidden_state(self):
         return self._hidden_state
@@ -336,6 +433,7 @@ class MID360DeltaNetDeployment(nn.Module):
         super().__init__()
         self.obs_normalizer = copy.deepcopy(actor.obs_normalizer)
         self.estimator = copy.deepcopy(actor.estimator)
+        self.policy_encoder = copy.deepcopy(actor.policy_encoder)
         self.mlp = copy.deepcopy(actor.mlp)
         self.output = actor.distribution.as_deterministic_output_module()
 
@@ -353,7 +451,8 @@ class MID360DeltaNetDeployment(nn.Module):
         )
         height = height.squeeze(0)
         velocity = velocity.squeeze(0)
-        action = self.output(self.mlp(torch.cat((proprio, height, velocity), dim=-1)))
+        latent = self.policy_encoder(torch.cat((proprio, height, velocity), dim=-1))
+        action = self.output(self.mlp(latent))
         return action, height, velocity, next_state
 
 

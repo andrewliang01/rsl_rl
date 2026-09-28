@@ -7,11 +7,11 @@
 
 from __future__ import annotations
 
+import torch
+from tensordict import TensorDict
 from types import SimpleNamespace
 
 import pytest
-import torch
-from tensordict import TensorDict
 
 from rsl_rl.algorithms import DeltaNetPPO
 from rsl_rl.models import MID360DeltaNetActor, SequenceElevationHistoryCritic
@@ -47,7 +47,7 @@ OBS_GROUPS = {
 }
 
 
-def actor(obs: TensorDict, layers: int = 3) -> MID360DeltaNetActor:
+def actor(obs: TensorDict, layers: int = 3, **kwargs) -> MID360DeltaNetActor:
     return MID360DeltaNetActor(
         obs,
         OBS_GROUPS,
@@ -62,6 +62,7 @@ def actor(obs: TensorDict, layers: int = 3) -> MID360DeltaNetActor:
         hidden_dims=(32,),
         obs_normalization=False,
         cnn_circular_azimuth=True,
+        **kwargs,
     )
 
 
