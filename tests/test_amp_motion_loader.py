@@ -12,7 +12,8 @@ import torch
 from rsl_rl.utils.motion_loader import AMPLoader
 
 
-def test_combined_npz_clip_weights_follow_frame_counts(tmp_path, monkeypatch):
+@pytest.mark.parametrize("weights, expected", [(None, [.25, .75]), ([3., 1.], [.75, .25])])
+def test_combined_npz_clip_weights(tmp_path, monkeypatch, weights, expected):
     math_utils = ModuleType("isaaclab.utils.math")
     math_utils.convert_quat = lambda quat, to: quat
     math_utils.subtract_frame_transforms = (
@@ -44,6 +45,7 @@ def test_combined_npz_clip_weights_follow_frame_counts(tmp_path, monkeypatch):
         clip_names=np.asarray(["short", "long"]),
         clip_lengths=np.asarray([2, 6]),
         clip_fps=np.asarray([50.0, 50.0]),
+        **({"clip_weights": np.asarray(weights)} if weights is not None else {}),
         body_pos_w=body_pos_w,
         body_quat_w=body_quat_w,
         body_lin_vel_w=body_velocity_w,
@@ -62,7 +64,7 @@ def test_combined_npz_clip_weights_follow_frame_counts(tmp_path, monkeypatch):
         preload_transitions=False,
     )
 
-    np.testing.assert_allclose(loader.trajectory_weights, np.asarray([0.25, 0.75]))
+    np.testing.assert_allclose(loader.trajectory_weights, np.asarray(expected))
 
 
 @pytest.mark.parametrize("convention", ("wxyz", "xyzw"))
