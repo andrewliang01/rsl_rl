@@ -138,6 +138,8 @@ class RolloutStorage:
         actions_shape: tuple[int, ...] | list[int],
         device: str = "cpu",
         num_critics: int = 1,
+        *,
+        store_next_observations: bool = True,
     ) -> None:
         """Allocate rollout buffers for a specific training mode and batch shape.
 
@@ -171,19 +173,21 @@ class RolloutStorage:
             batch_size=[num_transitions_per_env, num_envs],
             device=self.device,
         )
-        self.next_observations = TensorDict(
-            {
-                key: torch.zeros(
-                    num_transitions_per_env,
-                    *value.shape,
-                    device=device,
-                    dtype=value.dtype,
-                )
-                for key, value in obs.items()
-            },
-            batch_size=[num_transitions_per_env, num_envs],
-            device=self.device,
-        )
+        self.next_observations = None
+        if store_next_observations:
+            self.next_observations = TensorDict(
+                {
+                    key: torch.zeros(
+                        num_transitions_per_env,
+                        *value.shape,
+                        device=device,
+                        dtype=value.dtype,
+                    )
+                    for key, value in obs.items()
+                },
+                batch_size=[num_transitions_per_env, num_envs],
+                device=self.device,
+            )
         # Support multi-critic: rewards are [T, N, num_critics] instead of [T, N, 1]
         self.rewards = torch.zeros(num_transitions_per_env, num_envs, num_critics, device=self.device)
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
@@ -221,8 +225,13 @@ class RolloutStorage:
 
         # Core
         self.observations[self.step].copy_(transition.observations)
-        next_observations = transition.next_observations if transition.next_observations is not None else transition.observations
-        self.next_observations[self.step].copy_(next_observations)
+        if self.next_observations is not None:
+            next_observations = (
+                transition.next_observations
+                if transition.next_observations is not None
+                else transition.observations
+            )
+            self.next_observations[self.step].copy_(next_observations)
         self.actions[self.step].copy_(transition.actions)  # type: ignore
         # Handle multi-critic rewards: [N] or [N, 1] -> [N, num_critics]
         if transition.rewards.dim() == 1:

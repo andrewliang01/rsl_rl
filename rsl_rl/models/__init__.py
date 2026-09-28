@@ -23,6 +23,14 @@ from .m2m_recurrent_student import M2MMapFreeRecurrentStudent, M2MStrictFrameTok
 from .m2m_livox_deformable_memory_actor import M2MLivoxDeformableMemoryActor
 from .m2m_sequence_compatible_critic import M2MSequenceCompatibleCritic
 from .m2m_student_only import M2MStudentOnlyPolicy, normalize_m2m_student_network_config
+from .mid360_deltanet import (
+    CurrentPanoramaEncoder,
+    MID360DeltaEstimator,
+    MID360DeltaNetActor,
+    MID360DeltaNetDeployment,
+    MID360DeltaNetOnnxDeployment,
+    SequenceElevationHistoryCritic,
+)
 from .rnn_model import RNNModel
 from .prop_mlp_elevation_fusion_model import PropMLPElevationFusionModel
 from .prop_mlp_elevation_unifp_fusion_model import PropMLPElevationUniFPFusionModel
@@ -48,6 +56,12 @@ __all__ = [
     "M2MLivoxDeformableMemoryActor",
     "M2MStrictFrameTokenizer",
     "M2MSequenceCompatibleCritic",
+    "CurrentPanoramaEncoder",
+    "MID360DeltaEstimator",
+    "MID360DeltaNetActor",
+    "MID360DeltaNetDeployment",
+    "MID360DeltaNetOnnxDeployment",
+    "SequenceElevationHistoryCritic",
     "M2MStudentOnlyPolicy",
     "normalize_m2m_student_network_config",
     "RNNModel",
