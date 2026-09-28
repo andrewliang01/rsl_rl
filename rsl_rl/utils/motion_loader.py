@@ -248,9 +248,10 @@ class AMPLoader:
 
             body_pos_w = torch.tensor(data["body_pos_w"], dtype=torch.float32, device=self.device)
             body_quat_w = torch.tensor(data["body_quat_w"], dtype=torch.float32, device=self.device)
-            if motion_quat_convention == "wxyz":
-                body_quat_w = math_utils.convert_quat(body_quat_w, to="xyzw")
-            elif motion_quat_convention != "xyzw":
+            # Isaac Lab math functions use wxyz, matching the simulator APIs.
+            if motion_quat_convention == "xyzw":
+                body_quat_w = math_utils.convert_quat(body_quat_w, to="wxyz")
+            elif motion_quat_convention != "wxyz":
                 raise ValueError(
                     "[AMPLoader] motion_quat_convention must be 'xyzw' or 'wxyz', "
                     f"got {motion_quat_convention!r}"
