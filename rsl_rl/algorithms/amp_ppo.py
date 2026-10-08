@@ -65,6 +65,7 @@ class AMPPPO(MultiPPO):
             motion_quat_convention=amp_cfg.get("motion_quat_convention", "xyzw"),
             include_base_joint_obs=amp_cfg.get("include_base_joint_obs", False),
             include_joint_obs=amp_cfg.get("include_joint_obs", False),
+            joint_obs_first=amp_cfg.get("joint_obs_first", False),
             joint_names=amp_cfg.get("joint_names", ()),
             expert_sampling_mode=amp_cfg.get("expert_sampling_mode", "continuous"),
             expert_trajectory_sampling_mode=amp_cfg.get(

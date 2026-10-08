@@ -25,6 +25,7 @@ class AMPLoader:
         motion_files: List of paths to motion JSON files.
         preload_transitions: Whether to preload transitions into memory.
         num_preload_transitions: Number of transitions to preload.
+        joint_obs_first: Place requested joint features before body features in NPZ observations.
     """
 
     # Default observation dimensions for G1 robot
@@ -62,6 +63,7 @@ class AMPLoader:
         include_base_joint_obs: bool = False,
         joint_names: Sequence[str] = (),
         include_joint_obs: bool = False,
+        joint_obs_first: bool = False,
     ) -> None:
         self.device = device
         self.time_between_frames = time_between_frames
@@ -70,6 +72,7 @@ class AMPLoader:
         self.loader_type = self._normalize_loader_type(loader_type)
         self.include_base_joint_obs = include_base_joint_obs
         self.include_joint_obs = include_joint_obs or include_base_joint_obs
+        self.joint_obs_first = joint_obs_first
         self.joint_names = tuple(joint_names)
         if self.include_joint_obs and (not self.joint_names or self.loader_type != self.BODY_KINEMATICS_LOADER_TYPE):
             raise ValueError("Base/joint AMP observations require body_kinematics_npz and ordered joint_names")
@@ -374,7 +377,7 @@ class AMPLoader:
                     if tuple(value.shape) != (body_pos_w.shape[0], width) or not torch.isfinite(value).all():
                         raise ValueError(f"[AMPLoader] {motion_file} invalid {key}: expected finite (T, {width})")
                     extras.append(value)
-                trajectory = torch.cat((trajectory, *extras), dim=-1)
+                trajectory = torch.cat((*extras, trajectory) if self.joint_obs_first else (trajectory, *extras), dim=-1)
 
             default_fps = float(np.asarray(data["fps"]).reshape(-1)[0])
             if "clip_lengths" in data.files:
