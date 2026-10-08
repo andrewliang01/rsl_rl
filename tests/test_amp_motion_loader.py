@@ -12,6 +12,35 @@ import torch
 from rsl_rl.utils.motion_loader import AMPLoader
 
 
+def test_coverage_weighted_samples_every_clip_in_each_update():
+    """Twenty expert batches must cover all sixty clips and retain sampling mass."""
+    loader = object.__new__(AMPLoader)
+    loader.device = torch.device("cpu")
+    loader.preload_transitions = False
+    loader.expert_sampling_mode = "adjacent"
+    loader.expert_trajectory_sampling_mode = "coverage_weighted"
+    loader.trajectory_idxs = list(range(60))
+    loader.trajectory_weights = np.asarray([0.25] + [0.75 / 59] * 59)
+    loader.trajectory_num_frames = np.full(60, 3)
+    loader._amp_obs_dim = 2
+    loader.trajectories_full = [
+        torch.tensor([[clip_idx, 0], [clip_idx, 1], [clip_idx, 2]], dtype=torch.float32)
+        for clip_idx in range(60)
+    ]
+    loader.trajectories = loader.trajectories_full
+
+    clip_ids = []
+    for states, next_states in loader.feed_forward_generator(20, 1024):
+        torch.testing.assert_close(states[:, 0], next_states[:, 0])
+        torch.testing.assert_close(next_states[:, 1] - states[:, 1], torch.ones(1024))
+        clip_ids.append(states[:, 0].numpy().astype(np.int64))
+
+    counts = np.bincount(np.concatenate(clip_ids), minlength=60)
+    assert len(clip_ids) == 20
+    assert np.all(counts >= 8)
+    assert counts[0] / counts.sum() == pytest.approx(0.25, abs=0.02)
+
+
 @pytest.mark.parametrize("weights, expected", [(None, [.25, .75]), ([3., 1.], [.75, .25])])
 def test_combined_npz_clip_weights(tmp_path, monkeypatch, weights, expected):
     math_utils = ModuleType("isaaclab.utils.math")

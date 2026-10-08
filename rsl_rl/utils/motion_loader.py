@@ -82,15 +82,15 @@ class AMPLoader:
                 f"got {expert_sampling_mode!r}"
             )
         self.expert_sampling_mode = expert_sampling_mode
-        if expert_trajectory_sampling_mode not in ("weighted_random", "round_robin"):
+        if expert_trajectory_sampling_mode not in ("weighted_random", "round_robin", "coverage_weighted"):
             raise ValueError(
-                "[AMPLoader] expert_trajectory_sampling_mode must be 'weighted_random' or "
-                f"'round_robin', got {expert_trajectory_sampling_mode!r}"
+                "[AMPLoader] expert_trajectory_sampling_mode must be 'weighted_random', "
+                f"'round_robin', or 'coverage_weighted', got {expert_trajectory_sampling_mode!r}"
             )
-        if expert_trajectory_sampling_mode == "round_robin" and preload_transitions:
+        if expert_trajectory_sampling_mode in ("round_robin", "coverage_weighted") and preload_transitions:
             raise ValueError(
-                "[AMPLoader] round_robin trajectory sampling requires preload_transitions=False "
-                "so each minibatch can be sampled from one selected motion clip."
+                "[AMPLoader] round_robin and coverage_weighted trajectory sampling require "
+                "preload_transitions=False so transitions can be sampled from the selected clips."
             )
         self.expert_trajectory_sampling_mode = expert_trajectory_sampling_mode
         self._amp_obs_dim = 0
@@ -497,6 +497,25 @@ class AMPLoader:
         """Sample a batch of trajectory indices."""
         return np.random.choice(self.trajectory_idxs, size=size, p=self.trajectory_weights, replace=True)
 
+    def coverage_weighted_traj_idx_sample_batches(self, num_batches: int, batch_size: int) -> np.ndarray:
+        """Draw weighted clip IDs while covering every positive-weight clip each update."""
+        active_idxs = np.asarray(self.trajectory_idxs)[self.trajectory_weights > 0]
+        total_samples = num_batches * batch_size
+        if total_samples < len(active_idxs):
+            raise ValueError(
+                "[AMPLoader] coverage_weighted requires at least one expert sample per "
+                f"positive-weight clip: {total_samples} samples for {len(active_idxs)} clips"
+            )
+
+        # Eight transitions per clip give even short motions a useful minimum.
+        # The remaining mass follows the NPZ clip_weights/motion_weight values.
+        minimum_per_clip = min(8, total_samples // len(active_idxs))
+        guaranteed = np.repeat(active_idxs, minimum_per_clip)
+        weighted = self.weighted_traj_idx_sample_batch(total_samples - len(guaranteed))
+        traj_idxs = np.concatenate((guaranteed, weighted))
+        np.random.shuffle(traj_idxs)
+        return traj_idxs.reshape(num_batches, batch_size)
+
     def traj_time_sample(self, traj_idx: int) -> float:
         """Sample a random time for a trajectory."""
         subst = self.time_between_frames + self.trajectory_frame_durations[traj_idx]
@@ -580,6 +599,9 @@ class AMPLoader:
         Yields:
             Tuple of (state, next_state) tensors.
         """
+        coverage_batches = None
+        if self.expert_trajectory_sampling_mode == "coverage_weighted":
+            coverage_batches = self.coverage_weighted_traj_idx_sample_batches(num_mini_batch, mini_batch_size)
         for batch_idx in range(num_mini_batch):
             if self.preload_transitions:
                 idxs = np.random.choice(self.preloaded_s.shape[0], size=mini_batch_size)
@@ -591,6 +613,8 @@ class AMPLoader:
                     # from one clip, and clips are traversed deterministically.
                     traj_idx = self.trajectory_idxs[batch_idx % len(self.trajectory_idxs)]
                     traj_idxs = np.full(mini_batch_size, traj_idx, dtype=np.int64)
+                elif coverage_batches is not None:
+                    traj_idxs = coverage_batches[batch_idx]
                 else:
                     traj_idxs = self.weighted_traj_idx_sample_batch(mini_batch_size)
                 if self.expert_sampling_mode == "adjacent":
