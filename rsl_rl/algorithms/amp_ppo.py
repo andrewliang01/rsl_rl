@@ -68,11 +68,10 @@ class AMPPPO(MultiPPO):
             joint_obs_first=amp_cfg.get("joint_obs_first", False),
             joint_names=amp_cfg.get("joint_names", ()),
             expert_sampling_mode=amp_cfg.get("expert_sampling_mode", "continuous"),
-            expert_trajectory_sampling_mode=amp_cfg.get(
-                "expert_trajectory_sampling_mode", "weighted_random"
-            ),
-            preload_transitions=amp_cfg.get("preload_transitions", True),
-            num_preload_transitions=amp_cfg.get("num_preload_transitions", 100000),
+            expert_sampling=amp_cfg.get("expert_sampling"),
+            motion_categories=amp_cfg.get("motion_categories"),
+            # Read old saved configs at this boundary only.
+            expert_trajectory_sampling_mode=amp_cfg.get("expert_trajectory_sampling_mode"),
         )
 
         amp_obs_dim = self.amp_expert_data.amp_obs_dim
@@ -279,6 +278,7 @@ class AMPPPO(MultiPPO):
         else:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
 
+        amp_policy_generator = amp_expert_generator = None
         if (
             self.amp_discriminator is not None
             and self.amp_storage is not None
@@ -289,11 +289,7 @@ class AMPPPO(MultiPPO):
             batch_size = self.storage.num_transitions_per_env * self.storage.num_envs // self.num_mini_batches
             amp_policy_generator = self.amp_storage.feed_forward_generator(total_batches, batch_size)
             amp_expert_generator = self.amp_expert_data.feed_forward_generator(total_batches, batch_size)
-            combined_generator = zip(generator, amp_policy_generator, amp_expert_generator)
-        else:
-            combined_generator = ((batch, None, None) for batch in generator)
-
-        for batch, amp_policy_data, amp_expert_data in combined_generator:
+        for batch in generator:
             original_batch_size = batch.observations.batch_size[0]
 
             if self.is_multi_critic:
@@ -449,10 +445,10 @@ class AMPPPO(MultiPPO):
             if self.rnd_optimizer:
                 self.rnd_optimizer.step()
 
-            if amp_policy_data is not None and amp_expert_data is not None:
+            if amp_policy_generator is not None and amp_expert_generator is not None:
                 if self.disc_update_counter % self.disc_update_decimation == 0:
                     amp_loss, grad_pen_loss, policy_pred, expert_pred = self._update_discriminator(
-                        amp_policy_data, amp_expert_data
+                        next(amp_policy_generator), next(amp_expert_generator)
                     )
                     mean_amp_loss += amp_loss
                     mean_grad_pen_loss += grad_pen_loss

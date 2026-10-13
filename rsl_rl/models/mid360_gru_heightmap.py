@@ -5,6 +5,7 @@ import hashlib
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 from torch import nn
 
 from rsl_rl.modules.elevation_2D_cnn_encoder import Elevation2DCNNEncoder
@@ -208,15 +209,39 @@ class FrozenECMMMapPolicy(nn.Module):
             self.hidden = self.hidden.detach()
 
 
-def update_estimator(policy, optimizer, losses):
+@torch.no_grad()
+def broadcast_estimator(estimator):
+    """Start every worker from rank zero's parameters and normalization state."""
+    for tensor in estimator.state_dict().values():
+        dist.broadcast(tensor, src=0)
+
+
+def update_estimator(policy, optimizer, losses, *, distributed=False):
     """One supervised update; no PPO, critic or action loss is involved."""
     if not losses:
         raise ValueError("Cannot update without supervised losses.")
     optimizer.zero_grad(set_to_none=True)
     loss = torch.stack(losses).mean()
-    if not torch.isfinite(loss):
+    finite = torch.isfinite(loss).to(torch.int32)
+    if distributed:
+        dist.all_reduce(finite, op=dist.ReduceOp.MIN)
+    if not finite.item():
         raise FloatingPointError("Non-finite heightmap MSE.")
     loss.backward()
+    if distributed:
+        # TBPTT retains multiple forwards in a single graph. Reduce once after
+        # backward, before clipping/Adam, so each rank applies the same update.
+        parameters = [p for p in policy.estimator.parameters() if p.requires_grad]
+        gradient = torch.cat([
+            (p.grad if p.grad is not None else torch.zeros_like(p)).reshape(-1)
+            for p in parameters
+        ])
+        dist.all_reduce(gradient, op=dist.ReduceOp.SUM)
+        gradient.div_(dist.get_world_size())
+        offset = 0
+        for parameter in parameters:
+            parameter.grad = gradient[offset:offset + parameter.numel()].view_as(parameter)
+            offset += parameter.numel()
     torch.nn.utils.clip_grad_norm_(policy.estimator.parameters(), 1.0, error_if_nonfinite=True)
     if any(p.requires_grad or p.grad is not None for p in policy.actor.parameters()):
         raise RuntimeError("Frozen actor gradient boundary was violated.")

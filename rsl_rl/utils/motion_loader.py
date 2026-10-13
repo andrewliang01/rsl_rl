@@ -7,6 +7,7 @@
 
 import json
 import os
+import warnings
 from collections.abc import Sequence
 
 import numpy as np
@@ -16,15 +17,17 @@ import torch
 class AMPLoader:
     """Loads and samples motion data for AMP training.
 
-    This loader supports loading motion clips from JSON files and sampling
-    transitions for discriminator training.
+    Load JSON/NPZ motions and sample fresh expert transitions online.
 
     Args:
         device: Device to load data on.
         time_between_frames: Time step between frames (should match env step_dt).
         motion_files: List of paths to motion JSON files.
-        preload_transitions: Whether to preload transitions into memory.
-        num_preload_transitions: Number of transitions to preload.
+        expert_sampling: Uniform categories/files or metadata-weighted clips.
+        expert_sampling_mode: Uniform valid time (continuous) or frame pairs (adjacent).
+        motion_categories: Explicit file groups for equal category/file probability.
+        preload_transitions: Deprecated compatibility argument; no random-pair cache is built.
+        num_preload_transitions: Deprecated compatibility argument; ignored.
         joint_obs_first: Place requested joint features before body features in NPZ observations.
     """
 
@@ -55,20 +58,24 @@ class AMPLoader:
         anchor_name: str = "",
         motion_body_names: Sequence[str] = (),
         all_body_names: Sequence[str] = (),
-        preload_transitions: bool = True,
+        preload_transitions: bool = False,
         num_preload_transitions: int = 100000,
         motion_quat_convention: str = "xyzw",
         expert_sampling_mode: str = "continuous",
-        expert_trajectory_sampling_mode: str = "weighted_random",
+        expert_trajectory_sampling_mode: str | None = None,
         include_base_joint_obs: bool = False,
         joint_names: Sequence[str] = (),
         include_joint_obs: bool = False,
         joint_obs_first: bool = False,
+        expert_sampling: str | None = None,
+        motion_categories: dict[str, list[str]] | None = None,
     ) -> None:
         self.device = device
         self.time_between_frames = time_between_frames
-        self.preload_transitions = preload_transitions
-        self.num_preload_transitions = num_preload_transitions
+        # Legacy arguments remain readable, but random transition caches are no
+        # longer used: every batch samples directly from the complete motions.
+        if preload_transitions:
+            warnings.warn("AMP transition preloading is retired; sampling full motions online.", stacklevel=2)
         self.loader_type = self._normalize_loader_type(loader_type)
         self.include_base_joint_obs = include_base_joint_obs
         self.include_joint_obs = include_joint_obs or include_base_joint_obs
@@ -82,23 +89,30 @@ class AMPLoader:
                 f"got {expert_sampling_mode!r}"
             )
         self.expert_sampling_mode = expert_sampling_mode
-        if expert_trajectory_sampling_mode not in ("weighted_random", "round_robin", "coverage_weighted"):
-            raise ValueError(
-                "[AMPLoader] expert_trajectory_sampling_mode must be 'weighted_random', "
-                f"'round_robin', or 'coverage_weighted', got {expert_trajectory_sampling_mode!r}"
+        if expert_trajectory_sampling_mode is not None:
+            legacy_modes = {"weighted_random": "weighted", "round_robin": "uniform", "coverage_weighted": "weighted"}
+            if expert_trajectory_sampling_mode not in legacy_modes:
+                raise ValueError(f"Unknown legacy AMP sampling: {expert_trajectory_sampling_mode!r}")
+            migrated = legacy_modes[expert_trajectory_sampling_mode]
+            if expert_sampling is not None and expert_sampling != migrated:
+                raise ValueError("Conflicting new and legacy AMP sampling settings")
+            expert_sampling = migrated
+            warnings.warn(
+                f"expert_trajectory_sampling_mode={expert_trajectory_sampling_mode!r} is retired; "
+                f"using expert_sampling={migrated!r} with independent online samples.", stacklevel=2,
             )
-        if expert_trajectory_sampling_mode in ("round_robin", "coverage_weighted") and preload_transitions:
-            raise ValueError(
-                "[AMPLoader] round_robin and coverage_weighted trajectory sampling require "
-                "preload_transitions=False so transitions can be sampled from the selected clips."
-            )
-        self.expert_trajectory_sampling_mode = expert_trajectory_sampling_mode
+        self.expert_sampling = expert_sampling or "weighted"
+        if self.expert_sampling not in ("uniform", "weighted"):
+            raise ValueError("expert_sampling must be 'uniform' or 'weighted'")
+        if motion_categories and self.expert_sampling != "uniform":
+            raise ValueError("motion_categories requires expert_sampling='uniform'")
         self._amp_obs_dim = 0
 
         # Load trajectories from motion files
         self.trajectories = []
         self.trajectories_full = []
         self.trajectory_names = []
+        self.trajectory_files = []
         self.trajectory_idxs = []
         self.trajectory_lens = []  # Trajectory length in seconds
         self.trajectory_weights = []
@@ -120,21 +134,28 @@ class AMPLoader:
         if len(self.trajectories) == 0:
             raise ValueError(f"[AMPLoader] No motion files loaded for loader_type={self.loader_type}")
 
-        # Normalize trajectory weights for sampling
+        self.trajectory_frame_durations = np.asarray(self.trajectory_frame_durations, dtype=np.float64)
+        self.trajectory_lens = np.asarray(self.trajectory_lens, dtype=np.float64)
+        self.trajectory_num_frames = np.asarray(self.trajectory_num_frames, dtype=np.int64)
+        self._validate_transition_timing()
+        if self.expert_sampling == "uniform":
+            self.trajectory_weights = self._uniform_category_weights(motion_categories)
+
+        # Normalize the chosen distribution (NPZ weights are ignored in uniform mode).
         self.trajectory_weights = np.asarray(self.trajectory_weights, dtype=np.float64)
         if (not np.isfinite(self.trajectory_weights).all() or np.any(self.trajectory_weights < 0)
                 or not np.isfinite(self.trajectory_weights.sum()) or self.trajectory_weights.sum() <= 0):
             raise ValueError("[AMPLoader] Motion weights must be finite, non-negative, and have a positive sum")
         self.trajectory_weights = self.trajectory_weights / np.sum(self.trajectory_weights)
-        self.trajectory_frame_durations = np.array(self.trajectory_frame_durations)
-        self.trajectory_lens = np.array(self.trajectory_lens)
-        self.trajectory_num_frames = np.array(self.trajectory_num_frames)
-
-        # Preload transitions if requested
-        if self.preload_transitions:
-            print(f"[AMPLoader] Preloading {num_preload_transitions} transitions...")
-            self._preload_transitions()
-            print("[AMPLoader] Preloading complete")
+        # Store every original frame once in a contiguous tensor for batched
+        # gathers. This is the full dataset, not a randomly sampled pair cache.
+        self._packed_frames = torch.cat(self.trajectories_full, dim=0)
+        self._frame_offsets = np.concatenate(([0], np.cumsum(self.trajectory_num_frames[:-1])))
+        self.trajectories_full = list(torch.split(self._packed_frames, self.trajectory_num_frames.tolist()))
+        self.trajectories = self.trajectories_full
+        print(f"[AMPLoader] expert_sampling={self.expert_sampling}, "
+              f"time_sampling={self.expert_sampling_mode}, online sampling, "
+              f"transition_dt={self.time_between_frames:g}s")
 
     @staticmethod
     def _normalize_loader_type(loader_type: str) -> str:
@@ -175,6 +196,7 @@ class AMPLoader:
         self._amp_obs_dim = AMPLoader.END_POS_END_IDX - AMPLoader.JOINT_POSE_START_IDX
         for i, motion_file in enumerate(self._expand_motion_files(motion_files, (".txt", ".json"))):
             self.trajectory_names.append(os.path.splitext(motion_file)[0])
+            self.trajectory_files.append(os.path.realpath(motion_file))
             with open(motion_file) as f:
                 motion_json = json.load(f)
                 motion_data = np.array(motion_json["Frames"], dtype=np.float32)
@@ -193,7 +215,9 @@ class AMPLoader:
             self.trajectories.append(trajectory)
             self.trajectories_full.append(trajectory)
             self.trajectory_idxs.append(i)
-            self.trajectory_weights.append(float(motion_json.get("MotionWeight", 1.0)))
+            self.trajectory_weights.append(
+                1.0 if self.expert_sampling == "uniform" else float(motion_json.get("MotionWeight", 1.0))
+            )
 
             frame_duration = float(motion_json.get("FrameDuration", 0.02))
             self.trajectory_frame_durations.append(frame_duration)
@@ -408,11 +432,15 @@ class AMPLoader:
                 clip_lengths = np.asarray([trajectory.shape[0]], dtype=np.int64)
                 clip_fps = np.asarray([default_fps], dtype=np.float64)
                 clip_names = np.asarray([os.path.basename(os.path.splitext(motion_file)[0])])
+            if not np.isfinite(clip_fps).all() or np.any(clip_fps <= 0):
+                raise ValueError(f"[AMPLoader] Invalid FPS in {motion_file}: {clip_fps}")
 
             # Explicit weights are per-clip sampling masses, not frame multipliers.
             # Missing weights retain the historical frame-count distribution.
             weight_key = "motion_weight" if "motion_weight" in data.files else "MotionWeight"
-            if "clip_weights" in data.files:
+            if self.expert_sampling == "uniform":
+                clip_weights = np.ones(len(clip_lengths), dtype=np.float64)
+            elif "clip_weights" in data.files:
                 clip_weights = np.asarray(data["clip_weights"], dtype=np.float64).reshape(-1)
             elif weight_key in data.files:
                 weight = np.asarray(data[weight_key], dtype=np.float64).reshape(-1)
@@ -435,6 +463,7 @@ class AMPLoader:
                     trajectory_name = f"{trajectory_name}::{clip_name}"
 
                 self.trajectory_names.append(trajectory_name)
+                self.trajectory_files.append(os.path.realpath(motion_file))
                 self.trajectories.append(clip_trajectory)
                 self.trajectories_full.append(clip_trajectory)
                 self.trajectory_idxs.append(len(self.trajectory_idxs))
@@ -451,18 +480,6 @@ class AMPLoader:
                     f"{clip_name!r} from {motion_file} with amp_obs_dim={self._amp_obs_dim}"
                 )
                 frame_start = frame_end
-
-    def _preload_transitions(self) -> None:
-        """Preload transitions into memory for faster sampling."""
-        traj_idxs = self.weighted_traj_idx_sample_batch(self.num_preload_transitions)
-        if self.expert_sampling_mode == "adjacent":
-            self.preloaded_s, self.preloaded_s_next = self.get_adjacent_frame_batch(traj_idxs)
-        else:
-            times = self.traj_time_sample_batch(traj_idxs)
-            self.preloaded_s = self.get_full_frame_at_time_batch(traj_idxs, times)
-            self.preloaded_s_next = self.get_full_frame_at_time_batch(
-                traj_idxs, times + self.time_between_frames
-            )
 
     def get_adjacent_frame_batch(self, traj_idxs: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
         """Sample exact ``frame[i] -> frame[i + 1]`` transitions from each selected trajectory."""
@@ -497,39 +514,76 @@ class AMPLoader:
         """Sample a batch of trajectory indices."""
         return np.random.choice(self.trajectory_idxs, size=size, p=self.trajectory_weights, replace=True)
 
-    def coverage_weighted_traj_idx_sample_batches(self, num_batches: int, batch_size: int) -> np.ndarray:
-        """Draw weighted clip IDs while covering every positive-weight clip each update."""
-        active_idxs = np.asarray(self.trajectory_idxs)[self.trajectory_weights > 0]
-        total_samples = num_batches * batch_size
-        if total_samples < len(active_idxs):
+    def _validate_transition_timing(self) -> None:
+        if not np.isfinite(self.time_between_frames) or self.time_between_frames <= 0:
+            raise ValueError("AMP transition dt must be finite and positive")
+        invalid = (~np.isfinite(self.trajectory_frame_durations)
+                   | (self.trajectory_frame_durations <= 0)
+                   | (self.trajectory_num_frames < 2))
+        if self.expert_sampling_mode == "adjacent":
+            invalid |= ~np.isclose(self.trajectory_frame_durations, self.time_between_frames, rtol=1e-4, atol=1e-8)
+        else:
+            invalid |= self.trajectory_lens + 1e-9 < self.time_between_frames
+        if invalid.any():
+            details = [f"{self.trajectory_names[i]}: frames={self.trajectory_num_frames[i]}, "
+                       f"fps={1.0 / self.trajectory_frame_durations[i]:g}"
+                       for i in np.flatnonzero(invalid)]
             raise ValueError(
-                "[AMPLoader] coverage_weighted requires at least one expert sample per "
-                f"positive-weight clip: {total_samples} samples for {len(active_idxs)} clips"
+                f"Invalid AMP transitions for {self.expert_sampling_mode}, dt={self.time_between_frames:g}s. "
+                "Adjacent requires matching FPS; continuous requires at least dt of motion. "
+                "Re-export at the required FPS or choose continuous.\n" + "\n".join(details)
             )
 
-        # Eight transitions per clip give even short motions a useful minimum.
-        # The remaining mass follows the NPZ clip_weights/motion_weight values.
-        minimum_per_clip = min(8, total_samples // len(active_idxs))
-        guaranteed = np.repeat(active_idxs, minimum_per_clip)
-        weighted = self.weighted_traj_idx_sample_batch(total_samples - len(guaranteed))
-        traj_idxs = np.concatenate((guaranteed, weighted))
-        np.random.shuffle(traj_idxs)
-        return traj_idxs.reshape(num_batches, batch_size)
+    def _uniform_category_weights(self, categories: dict[str, list[str]] | None) -> np.ndarray:
+        """Equal category mass, equal file mass, uniform valid positions within a file.
+
+        A packed NPZ may contain multiple clips. Their mass within that file is
+        proportional to valid time (continuous) or valid frame pairs (adjacent),
+        so packing clips does not introduce transitions across clip boundaries.
+        """
+        files = np.asarray(self.trajectory_files)
+        unique_files = set(files)
+        categories = categories if categories is not None else {"all": sorted(unique_files)}
+        if not categories:
+            raise ValueError("AMP motion_categories must not be empty")
+        normalized = {}
+        assigned = set()
+        for name, members in categories.items():
+            if not isinstance(name, str) or not name or not isinstance(members, (list, tuple)) or not members:
+                raise ValueError(f"Invalid or empty AMP category: {name!r}")
+            paths = [os.path.realpath(path) for path in members]
+            if len(set(paths)) != len(paths) or assigned.intersection(paths):
+                raise ValueError(f"Duplicate AMP file assignment in category {name!r}")
+            normalized[name] = paths
+            assigned.update(paths)
+        if assigned != unique_files:
+            raise ValueError(f"AMP category/file mismatch: unassigned={sorted(unique_files - assigned)}, "
+                             f"not_loaded={sorted(assigned - unique_files)}")
+        weights = np.zeros(len(files), dtype=np.float64)
+        spans = (np.maximum(self.trajectory_lens - self.time_between_frames, 0.0)
+                 if self.expert_sampling_mode == "continuous" else self.trajectory_num_frames - 1)
+        for name, members in normalized.items():
+            for path in members:
+                ids = np.flatnonzero(files == path)
+                mass = spans[ids].astype(np.float64)
+                if mass.sum() == 0:  # Clips consisting of exactly one valid transition.
+                    mass = np.ones(len(ids))
+                weights[ids] = mass / mass.sum() / len(members) / len(normalized)
+            print(f"[AMPLoader] category={name}: {len(members)} files, "
+                  f"probability={1 / len(normalized):.2%}, per_file={1 / len(normalized) / len(members):.4%}")
+        return weights
 
     def traj_time_sample(self, traj_idx: int) -> float:
-        """Sample a random time for a trajectory."""
-        subst = self.time_between_frames + self.trajectory_frame_durations[traj_idx]
-        return max(0.0, (self.trajectory_lens[traj_idx] * np.random.uniform() - subst))
+        """Uniform time on the valid interval, without clamping probability onto frame zero."""
+        return float(np.random.uniform() * max(0.0, self.trajectory_lens[traj_idx] - self.time_between_frames))
 
     def traj_time_sample_batch(self, traj_idxs: np.ndarray) -> np.ndarray:
-        """Sample random times for multiple trajectories."""
-        subst = self.time_between_frames + self.trajectory_frame_durations[traj_idxs]
-        time_samples = self.trajectory_lens[traj_idxs] * np.random.uniform(size=len(traj_idxs)) - subst
-        return np.maximum(np.zeros_like(time_samples), time_samples)
+        valid_duration = np.maximum(0.0, self.trajectory_lens[traj_idxs] - self.time_between_frames)
+        return np.random.uniform(size=len(traj_idxs)) * valid_duration
 
     @staticmethod
     def slerp(frame1: torch.Tensor, frame2: torch.Tensor, blend: torch.Tensor | float) -> torch.Tensor:
-        """Spherical linear interpolation between frames."""
+        """Linear interpolation of AMP features (the legacy method name is retained)."""
         return (1.0 - blend) * frame1 + blend * frame2
 
     def get_frame_at_time(self, traj_idx: int, time: float) -> torch.Tensor:
@@ -574,57 +628,27 @@ class AMPLoader:
         return self.slerp(frame_start, frame_end, blend)
 
     def get_full_frame_at_time_batch(self, traj_idxs: np.ndarray, times: np.ndarray) -> torch.Tensor:
-        """Get full AMP frames at specific times for multiple trajectories."""
-        n = self.trajectory_num_frames[traj_idxs].astype(np.int64)
+        """Vectorized interpolation of full AMP features without crossing clips."""
+        n = self.trajectory_num_frames[traj_idxs]
         frame = np.clip(times / self.trajectory_frame_durations[traj_idxs], 0.0, n - 1)
-        idx_low = np.floor(frame).astype(np.int64)
-        idx_high = np.minimum(idx_low + 1, n - 1)
-
-        amp_obs_dim = self.amp_obs_dim
-        all_frame_starts = torch.zeros(len(traj_idxs), amp_obs_dim, device=self.device)
-        all_frame_ends = torch.zeros(len(traj_idxs), amp_obs_dim, device=self.device)
-
-        for traj_idx in set(traj_idxs):
-            trajectory = self.trajectories_full[traj_idx]
-            traj_mask = traj_idxs == traj_idx
-            all_frame_starts[traj_mask] = trajectory[idx_low[traj_mask]]
-            all_frame_ends[traj_mask] = trajectory[idx_high[traj_mask]]
-
-        blend = torch.tensor(frame - idx_low, device=self.device, dtype=torch.float32).unsqueeze(-1)
-        return self.slerp(all_frame_starts, all_frame_ends, blend)
+        low = np.floor(frame).astype(np.int64)
+        high = np.minimum(low + 1, n - 1)
+        offsets = self._frame_offsets[traj_idxs]
+        indices = torch.as_tensor(np.stack((offsets + low, offsets + high)), device=self.device)
+        start, end = self._packed_frames[indices]
+        blend = torch.as_tensor(frame - low, device=self.device, dtype=torch.float32).unsqueeze(-1)
+        return self.slerp(start, end, blend)
 
     def feed_forward_generator(self, num_mini_batch: int, mini_batch_size: int):
-        """Generate batches of AMP transitions for discriminator training.
-
-        Yields:
-            Tuple of (state, next_state) tensors.
-        """
-        coverage_batches = None
-        if self.expert_trajectory_sampling_mode == "coverage_weighted":
-            coverage_batches = self.coverage_weighted_traj_idx_sample_batches(num_mini_batch, mini_batch_size)
-        for batch_idx in range(num_mini_batch):
-            if self.preload_transitions:
-                idxs = np.random.choice(self.preloaded_s.shape[0], size=mini_batch_size)
-                s = self.preloaded_s[idxs]
-                s_next = self.preloaded_s_next[idxs]
+        """Fresh independent expert samples in every batch; no per-update file cursor."""
+        for _ in range(num_mini_batch):
+            traj_idxs = self.weighted_traj_idx_sample_batch(mini_batch_size)
+            if self.expert_sampling_mode == "adjacent":
+                yield self.get_adjacent_frame_batch(traj_idxs)
             else:
-                if self.expert_trajectory_sampling_mode == "round_robin":
-                    # Match AMP_mjlab: each discriminator expert minibatch comes
-                    # from one clip, and clips are traversed deterministically.
-                    traj_idx = self.trajectory_idxs[batch_idx % len(self.trajectory_idxs)]
-                    traj_idxs = np.full(mini_batch_size, traj_idx, dtype=np.int64)
-                elif coverage_batches is not None:
-                    traj_idxs = coverage_batches[batch_idx]
-                else:
-                    traj_idxs = self.weighted_traj_idx_sample_batch(mini_batch_size)
-                if self.expert_sampling_mode == "adjacent":
-                    s, s_next = self.get_adjacent_frame_batch(traj_idxs)
-                else:
-                    times = self.traj_time_sample_batch(traj_idxs)
-                    s = self.get_full_frame_at_time_batch(traj_idxs, times)
-                    s_next = self.get_full_frame_at_time_batch(traj_idxs, times + self.time_between_frames)
-
-            yield s, s_next
+                times = self.traj_time_sample_batch(traj_idxs)
+                yield (self.get_full_frame_at_time_batch(traj_idxs, times),
+                       self.get_full_frame_at_time_batch(traj_idxs, times + self.time_between_frames))
 
     @property
     def observation_dim(self) -> int:
