@@ -694,6 +694,9 @@ class OnPolicyRunner:
             # TODO： symmetry我同样不太懂，先不管了。总之就是在切数据的时候要保证对称性的数据在一起被切到同一个batch里。
 
             loss_dict = self.alg.update()
+            curriculum_hook = getattr(getattr(self.env, "unwrapped", self.env), "update_payload_curriculum", None)
+            if curriculum_hook is not None:
+                curriculum_hook(it)
 
             stop = time.time()
             learn_time = stop - start
@@ -863,6 +866,9 @@ class OnPolicyRunner:
                     self.alg.compute_returns(obs)
 
                 loss_dict = self.alg.update()
+                curriculum_hook = getattr(getattr(self.env, "unwrapped", self.env), "update_payload_curriculum", None)
+                if curriculum_hook is not None:
+                    curriculum_hook(it)
                 self._assert_formal_optimizer_live_consistency()
                 stop = time.time()
                 learn_time = stop - start
@@ -917,6 +923,9 @@ class OnPolicyRunner:
         saved_dict = self.alg.save()
         saved_dict["iter"] = self.current_learning_iteration
         saved_dict["infos"] = infos
+        env_state_hook = getattr(getattr(self.env, "unwrapped", self.env), "get_payload_curriculum_state", None)
+        if env_state_hook is not None:
+            saved_dict["payload_curriculum"] = env_state_hook()
         torch.save(saved_dict, path)
         # Upload model to external logging services
         self.logger.save_model(path, self.current_learning_iteration)
@@ -988,6 +997,9 @@ class OnPolicyRunner:
             result["iter"] = iteration
             result["infos"] = infos
             result["training_receipt"] = embedded
+            env_state_hook = getattr(getattr(self.env, "unwrapped", self.env), "get_payload_curriculum_state", None)
+            if env_state_hook is not None:
+                result["payload_curriculum"] = env_state_hook()
             return result
 
         publication = formal_io.publish_checkpoint(
@@ -1026,6 +1038,9 @@ class OnPolicyRunner:
         load_iteration = self.alg.load(loaded_dict, load_cfg, strict)
         if load_iteration:
             self.current_learning_iteration = loaded_dict["iter"]
+        env_state_hook = getattr(getattr(self.env, "unwrapped", self.env), "load_payload_curriculum_state", None)
+        if env_state_hook is not None and "payload_curriculum" in loaded_dict:
+            env_state_hook(loaded_dict["payload_curriculum"])
         return loaded_dict["infos"]
 
     def _load_formal(
@@ -1096,6 +1111,9 @@ class OnPolicyRunner:
                 self._formal_updates_completed - 1
             )
             self._formal_resume_loaded = True
+            env_state_hook = getattr(getattr(self.env, "unwrapped", self.env), "load_payload_curriculum_state", None)
+            if env_state_hook is not None and "payload_curriculum" in loaded_dict:
+                env_state_hook(loaded_dict["payload_curriculum"])
             return loaded_dict.get("infos")
         except Exception:
             formal_io.close()

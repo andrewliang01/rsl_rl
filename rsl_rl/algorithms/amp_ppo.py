@@ -27,6 +27,7 @@ class AMPPPO(MultiPPO):
         super().__init__(actor=actor, critic=critic, storage=storage, **kwargs)
 
         self.amp_cfg = amp_cfg
+        self._gmq_compat = bool(amp_cfg and amp_cfg.get("loader_type") == "chitu_max_gmq")
         self.amp_discriminator: AMPDiscriminator | None = None
         self.amp_expert_data: AMPLoader | None = None
         self.amp_storage: ReplayBuffer | None = None
@@ -53,7 +54,11 @@ class AMPPPO(MultiPPO):
 
     def _init_amp(self, amp_cfg: dict) -> None:
         motion_files = amp_cfg.get("motion_files", [])
-        self.amp_expert_data = AMPLoader(
+        loader = AMPLoader
+        if amp_cfg.get("loader_type") == "chitu_max_gmq":
+            from rsl_rl.utils.gmq_motion import GMQMotionLoader
+            loader = GMQMotionLoader
+        self.amp_expert_data = loader(
             device=self.device,
             time_between_frames=amp_cfg.get("time_between_frames", 0.02),
             motion_files=motion_files,
@@ -110,6 +115,13 @@ class AMPPPO(MultiPPO):
             ],
             lr=discriminator_lr,
         )
+        if self._gmq_compat:
+            from rsl_rl.utils.gmq_motion import GMQNormalizer
+            self.amp_discriminator.obs_normalizer = GMQNormalizer(amp_obs_dim).to(self.device)
+            # Source uses one Adam step for actor, critic, and discriminator.
+            for group in self.amp_optimizer.param_groups:
+                self.optimizer.add_param_group({k: v for k, v in group.items() if k in ("params", "weight_decay", "name")})
+            self.amp_optimizer = self.optimizer
         self.disc_update_decimation = amp_cfg.get("discriminator_update_decimation", 1)
         self.min_normalized_std = self._resolve_min_normalized_std(
             amp_cfg.get("min_normalized_std", 0.0)
@@ -203,7 +215,7 @@ class AMPPPO(MultiPPO):
                     self.final_rewards[reward_mask] = valid_final_rewards
                     self.style_rewards[reward_mask] = valid_style_rewards
 
-                valid_mask = ~done_mask
+                valid_mask = torch.ones_like(done_mask) if self._gmq_compat and has_terminal_safe_next_obs else ~done_mask
                 if valid_mask.any():
                     self.amp_storage.insert(current_amp_obs[valid_mask], next_amp_obs[valid_mask])
                 elif has_terminal_safe_next_obs:
@@ -428,6 +440,10 @@ class AMPPPO(MultiPPO):
                 target_embedding = self.rnd.target(rnd_state).detach()
                 rnd_loss = torch.nn.MSELoss()(predicted_embedding, target_embedding)
 
+            gmq_amp = None
+            if self._gmq_compat and amp_policy_generator is not None and amp_expert_generator is not None:
+                gmq_amp = self._gmq_discriminator_loss(next(amp_policy_generator), next(amp_expert_generator))
+                loss = loss + gmq_amp[0]
             self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
             if self.rnd:
@@ -437,15 +453,28 @@ class AMPPPO(MultiPPO):
             if self.is_multi_gpu:
                 self.reduce_parameters()
 
-            nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-            for critic in self.critics:
-                nn.utils.clip_grad_norm_(critic.parameters(), self.max_grad_norm)
+            if self._gmq_compat:
+                nn.utils.clip_grad_norm_(list(self.actor.parameters()) + [p for c in self.critics for p in c.parameters()], self.max_grad_norm)
+            else:
+                nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+                for critic in self.critics:
+                    nn.utils.clip_grad_norm_(critic.parameters(), self.max_grad_norm)
             self.optimizer.step()
             self._clamp_actor_std()
             if self.rnd_optimizer:
                 self.rnd_optimizer.step()
 
-            if amp_policy_generator is not None and amp_expert_generator is not None:
+            if gmq_amp is not None:
+                _, amp_loss, grad_pen_loss, policy_pred, expert_pred, policy_state, expert_state = gmq_amp
+                mean_amp_loss += amp_loss
+                mean_grad_pen_loss += grad_pen_loss
+                mean_policy_pred += policy_pred
+                mean_expert_pred += expert_pred
+                disc_actual_updates += 1
+                # Preserve source update order, including its update on normalized states.
+                self.amp_discriminator.update_normalization(policy_state)
+                self.amp_discriminator.update_normalization(expert_state)
+            if not self._gmq_compat and amp_policy_generator is not None and amp_expert_generator is not None:
                 if self.disc_update_counter % self.disc_update_decimation == 0:
                     amp_loss, grad_pen_loss, policy_pred, expert_pred = self._update_discriminator(
                         next(amp_policy_generator), next(amp_expert_generator)
@@ -495,6 +524,19 @@ class AMPPPO(MultiPPO):
             loss_dict["amp_learning_rate"] = self.amp_optimizer.param_groups[0]["lr"]
 
         return loss_dict
+
+    def _gmq_discriminator_loss(self, policy_data, expert_data):
+        disc = self.amp_discriminator
+        with torch.no_grad():
+            policy_state, policy_next = [disc.normalize_observation(x) for x in policy_data]
+            expert_state, expert_next = [disc.normalize_observation(x) for x in expert_data]
+        policy_d = disc(torch.cat((policy_state, policy_next), -1))
+        expert_input = torch.cat((expert_state, expert_next), -1).requires_grad_(True)
+        expert_d = disc(expert_input)
+        amp_loss = 0.5 * ((policy_d + 1).square().mean() + (expert_d - 1).square().mean())
+        penalty = disc.compute_grad_pen_from_disc(expert_input, expert_d, lambda_=10.0)
+        return (amp_loss + penalty, amp_loss.detach(), penalty.detach(), policy_d.detach().mean(),
+                expert_d.detach().mean(), policy_state, expert_state)
 
     def _update_discriminator(
         self, policy_data: tuple[torch.Tensor, torch.Tensor], expert_data: tuple[torch.Tensor, torch.Tensor]

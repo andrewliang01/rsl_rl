@@ -11,6 +11,13 @@ import torch.nn as nn
 from torch.distributions import Normal
 
 
+def _validate_std_range(std_range: tuple[float, float]) -> tuple[float, float]:
+    lower, upper = map(float, std_range)
+    if not 0.0 < lower <= upper < float("inf"):
+        raise ValueError("std_range must contain finite bounds with 0 < min <= max.")
+    return lower, upper
+
+
 class Distribution(nn.Module):
     """Base class for distribution modules.
 
@@ -141,6 +148,7 @@ class GaussianDistribution(Distribution):
         output_dim: int,
         init_std: float = 1.0,
         std_type: str = "scalar",
+        std_range: tuple[float, float] = (1.0e-6, 1.0e6),
     ) -> None:
         """Initialize the Gaussian distribution module.
 
@@ -148,9 +156,11 @@ class GaussianDistribution(Distribution):
             output_dim: Dimension of the action/output space.
             init_std: Initial standard deviation.
             std_type: Parameterization of the standard deviation: "scalar" or "log".
+            std_range: Minimum and maximum standard deviation used for sampling.
         """
         super().__init__(output_dim)
         self.std_type = std_type
+        self.std_range = _validate_std_range(std_range)
 
         # Learnable std parameters
         if std_type == "scalar":
@@ -175,10 +185,10 @@ class GaussianDistribution(Distribution):
             # cannot fail in the next PPO minibatch. Log-space parameterization
             # remains preferred for task-specific bounded exploration.
             with torch.no_grad():
-                self.std_param.clamp_(min=1.0e-6)
+                self.std_param.clamp_(*self.std_range)
             std = self.std_param.expand_as(mean)
         elif self.std_type == "log":
-            std = torch.exp(self.log_std_param).expand_as(mean)
+            std = torch.exp(self.log_std_param).clamp(*self.std_range).expand_as(mean)
         self._distribution = Normal(mean, std)
 
     def sample(self) -> torch.Tensor:
@@ -244,6 +254,7 @@ class HeteroscedasticGaussianDistribution(GaussianDistribution):
         output_dim: int,
         init_std: float = 1.0,
         std_type: str = "scalar",
+        std_range: tuple[float, float] = (1.0e-6, 1.0e6),
     ) -> None:
         """Initialize the heteroscedastic Gaussian distribution module.
 
@@ -251,11 +262,13 @@ class HeteroscedasticGaussianDistribution(GaussianDistribution):
             output_dim: Dimension of the action/output space.
             init_std: Initial standard deviation (used to initialize MLP std head bias).
             std_type: Parameterization of the standard deviation: "scalar" or "log".
+            std_range: Minimum and maximum standard deviation used for sampling.
         """
         # Skip GaussianDistribution.__init__ to avoid creating unnecessary learnable std parameters.
         Distribution.__init__(self, output_dim)
         self.std_type = std_type
         self.init_std = init_std
+        self.std_range = _validate_std_range(std_range)
 
         if std_type not in ("scalar", "log"):
             raise ValueError(f"Unknown standard deviation type: {std_type}. Should be 'scalar' or 'log'.")
@@ -273,6 +286,7 @@ class HeteroscedasticGaussianDistribution(GaussianDistribution):
         elif self.std_type == "log":
             mean, log_std = torch.unbind(mlp_output, dim=-2)
             std = torch.exp(log_std)
+        std = std.clamp(*self.std_range)
         self._distribution = Normal(mean, std)
 
     def deterministic_output(self, mlp_output: torch.Tensor) -> torch.Tensor:
