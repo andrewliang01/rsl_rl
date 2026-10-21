@@ -19,10 +19,11 @@ from .ppo_builders import construct_multi_critic_algorithm
 from rsl_rl.models.range_jepa import RangeJEPA
 from rsl_rl.storage.perception_storage import PerceptionStorage
 from rsl_rl.utils.range_aux_profiler import RangeAuxProfiler
+from rsl_rl.utils.range_online_profiler import RangeOnlineProfiler
 
 def _model_configuration(perception_cfg):
     cfg = deepcopy(perception_cfg or {})
-    for key in ("num_learning_epochs", "tbptt_steps", "sequence_batch_size", "learning_rate", "max_grad_norm", "weights", "profile_timing", "profile_aux_breakdown"):
+    for key in ("num_learning_epochs", "tbptt_steps", "sequence_batch_size", "learning_rate", "max_grad_norm", "weights", "profile_timing", "profile_aux_breakdown", "profile_online_breakdown"):
         cfg.pop(key, None)
     model_cfg = cfg.pop("model", {})
     if set(model_cfg) & set(cfg):
@@ -89,13 +90,20 @@ class RangeJEPAInferencePolicy(nn.Module):
 
     @torch.inference_mode(False)
     @torch.no_grad()
-    def prepare(self, obs: TensorDict, record=None, record_indexed=None) -> TensorDict:
+    def prepare(self, obs: TensorDict, record=None, record_indexed=None, profile=None) -> TensorDict:
+        if profile is not None:
+            profile.mark("validate_select")
         if record is not None and record_indexed is not None:
             raise ValueError("Choose either a selected-row or indexed capture recorder.")
         if "range_obs" not in obs:
             if "range_features" not in obs:
                 raise KeyError("Expected raw range_obs/capture_id or cached range_features.")
-            return compact_range_observations(obs, obs["range_features"])
+            if profile is not None:
+                profile.mark("publish")
+            result = compact_range_observations(obs, obs["range_features"])
+            if profile is not None:
+                profile.mark()
+            return result
         image = obs["range_obs"]
         if image.ndim != 4 or image.shape[1] != 2:
             raise ValueError("range_obs must be [B,2,H,W] depth and effective-validity mask.")
@@ -133,6 +141,8 @@ class RangeJEPAInferencePolicy(nn.Module):
         fresh = (capture >= 0) & (capture != self.last_capture)
         indices = fresh.nonzero(as_tuple=False).flatten()
         if indices.numel():
+            if profile is not None:
+                profile.mark("cache_enqueue")
             if record is not None or record_indexed is not None:
                 for key in ("range_map", "range_sim"):
                     if key not in obs or obs[key].shape != image.shape:
@@ -150,15 +160,28 @@ class RangeJEPAInferencePolicy(nn.Module):
                 if record is not None:
                     record(fresh_image, obs["range_map"][indices], obs["range_sim"][indices],
                            pre_hidden, indices, self.episode[indices], capture[indices])
-            prediction = self.perception.step(fresh_image, pre_hidden)
+            if profile is None:
+                prediction = self.perception.step(fresh_image, pre_hidden)
+            else:
+                profile.mark("online_cnn")
+                encoded = self.perception.encode(fresh_image)
+                profile.mark("memory_attention")
+                prediction = self.perception._step_encoded(encoded, pre_hidden)
+            if profile is not None:
+                profile.mark("publish")
             if prediction["features"].shape != (indices.numel(), 512):
                 raise ValueError("RangeJEPA must produce [fresh,512] cached features.")
             self.hidden[indices] = prediction["hidden"].detach()
             self.features[indices] = prediction["features"].detach()
             self.last_capture[indices] = capture[indices]
+        if profile is not None and not indices.numel():
+            profile.mark("publish")
         # New tensor ownership is essential: env.step/reset must not mutate PPO's
         # previous transition observations or inference tensors saved for autograd.
-        return compact_range_observations(obs, self.features.clone())
+        result = compact_range_observations(obs, self.features.clone())
+        if profile is not None:
+            profile.mark()
+        return result
 
     def forward(self, obs, *args, **kwargs):
         return self.actor(self.prepare(obs), *args, **kwargs)
@@ -188,6 +211,8 @@ class RangeJEPAAMPPPO(AMPPPO):
             raise ValueError("Perception learning rate and max_grad_norm must be positive.")
         self.profile_timing = bool(cfg.pop("profile_timing", False))
         self.profile_aux_breakdown = bool(cfg.pop("profile_aux_breakdown", False))
+        self.profile_online_breakdown = bool(cfg.pop("profile_online_breakdown", False))
+        self._online_profile = RangeOnlineProfiler(self.profile_online_breakdown, self.device)
         self.perception_weights = cfg.pop("weights", None)
         model_cfg = cfg.pop("model", {})
         if set(model_cfg) & set(cfg):
@@ -207,7 +232,14 @@ class RangeJEPAAMPPPO(AMPPPO):
     def act(self, obs: TensorDict) -> torch.Tensor:
         if "range_obs" not in obs:
             raise KeyError("Training act requires raw range_obs; only PPO minibatches consume cached features.")
-        return super().act(self._live_policy.prepare(obs, record_indexed=self.perception_storage.add_indexed))
+        if not self.profile_online_breakdown:
+            return super().act(self._live_policy.prepare(obs, record_indexed=self.perception_storage.add_indexed))
+        compact = self._live_policy.prepare(obs, record_indexed=self.perception_storage.add_indexed, profile=self._online_profile)
+        self._online_profile.mark("parent_act")
+        try:
+            return super().act(compact)
+        finally:
+            self._online_profile.mark()
 
     def process_env_step(self, obs, rewards, dones, extras):
         # obs is NEXT frame. Never run/ack its new capture here; the next act
@@ -225,7 +257,9 @@ class RangeJEPAAMPPPO(AMPPPO):
             torch.cuda.synchronize(self.device)
 
     def update(self):
+        # Read online CUDA events once at the rollout boundary, before learning.
         self._timing_barrier()
+        online_metrics = self._online_profile.finish(synchronize=not (self.profile_timing or self.profile_aux_breakdown))
         begin = time.perf_counter()
         loss = super().update()
         self._timing_barrier()
@@ -245,6 +279,10 @@ class RangeJEPAAMPPPO(AMPPPO):
             loss[prefix + "other_s"] = aux_s - sum(loss[prefix + name + "_s"] for name in RangeAuxProfiler.TOP_PHASES)
             self.last_perception_receipt["profile_aux_breakdown"] = {k[len(prefix):]: v for k, v in loss.items() if k.startswith(prefix)}
         loss.update({"range_jepa/parent_AMPPPO_s": parent_s, "range_jepa/aux_total_s": aux_s})
+        if online_metrics:
+            prefix = f"range_profile/rank{self.gpu_global_rank}/online/"
+            loss.update({prefix+k: v for k, v in online_metrics.items()})
+            self.last_perception_receipt["profile_online_breakdown"] = online_metrics
         return loss
 
     @torch.inference_mode(False)
