@@ -23,7 +23,7 @@ from rsl_rl.utils.range_online_profiler import RangeOnlineProfiler
 
 def _model_configuration(perception_cfg):
     cfg = deepcopy(perception_cfg or {})
-    for key in ("num_learning_epochs", "tbptt_steps", "sequence_batch_size", "learning_rate", "max_grad_norm", "weights", "profile_timing", "profile_aux_breakdown", "profile_online_breakdown"):
+    for key in ("num_learning_epochs", "tbptt_steps", "sequence_batch_size", "learning_rate", "max_grad_norm", "weights", "profile_timing", "profile_aux_breakdown", "profile_online_breakdown", "cudnn_benchmark"):
         cfg.pop(key, None)
     model_cfg = cfg.pop("model", {})
     if set(model_cfg) & set(cfg):
@@ -199,6 +199,17 @@ class RangeJEPAAMPPPO(AMPPPO):
         super().__init__(actor, critic, storage, **kwargs)
         cfg = deepcopy(perception_cfg or {})
         self.perception_cfg = deepcopy(cfg)
+        # ManagerBasedEnv.seed() can override train.py's initial cuDNN flag.
+        # Apply an explicit task-local request after env construction; None
+        # preserves existing behavior for every other configuration.
+        self.cudnn_benchmark_requested = cfg.pop("cudnn_benchmark", None)
+        if self.cudnn_benchmark_requested is not None and type(self.cudnn_benchmark_requested) is not bool:
+            raise ValueError("perception_cfg.cudnn_benchmark must be bool or None.")
+        if self.cudnn_benchmark_requested is not None:
+            previous = torch.backends.cudnn.benchmark
+            torch.backends.cudnn.benchmark = self.cudnn_benchmark_requested
+            print(f"RangeJEPA cuDNN benchmark: requested={self.cudnn_benchmark_requested}, "
+                  f"previous={previous}, actual={torch.backends.cudnn.benchmark}")
         self.perception_epochs = cfg.pop("num_learning_epochs", 5)
         self.perception_tbptt_steps = cfg.pop("tbptt_steps", 8)
         self.perception_sequence_batch_size = cfg.pop("sequence_batch_size", 128)
@@ -227,7 +238,8 @@ class RangeJEPAAMPPPO(AMPPPO):
         self._live_policy = RangeJEPAInferencePolicy(self.actor, self.perception)
         self._inference_policy = RangeJEPAInferencePolicy(self.actor, self.perception)
         self.perception_update_count = 0
-        self.last_perception_receipt: dict = {}
+        self.last_perception_receipt: dict = {"cudnn_benchmark_requested": self.cudnn_benchmark_requested,
+                                             "cudnn_benchmark_actual": torch.backends.cudnn.benchmark}
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         if "range_obs" not in obs:
@@ -269,7 +281,9 @@ class RangeJEPAAMPPPO(AMPPPO):
         if not self.profile_aux_breakdown:  # breakdown.finish already synchronized once
             self._timing_barrier()
         aux_s = time.perf_counter() - begin
-        self.last_perception_receipt.update(parent_AMPPPO_s=parent_s, aux_total_s=aux_s,
+        self.last_perception_receipt.update(cudnn_benchmark_requested=self.cudnn_benchmark_requested,
+                                            cudnn_benchmark_actual=torch.backends.cudnn.benchmark,
+                                            parent_AMPPPO_s=parent_s, aux_total_s=aux_s,
                                             timing_gpu_synchronized=(self.profile_timing or self.profile_aux_breakdown))
         if self.profile_aux_breakdown:
             prefix = f"range_profile/rank{self.gpu_global_rank}/"
@@ -278,7 +292,8 @@ class RangeJEPAAMPPPO(AMPPPO):
             loss[prefix + "aux_wall_s"] = aux_s
             loss[prefix + "other_s"] = aux_s - sum(loss[prefix + name + "_s"] for name in RangeAuxProfiler.TOP_PHASES)
             self.last_perception_receipt["profile_aux_breakdown"] = {k[len(prefix):]: v for k, v in loss.items() if k.startswith(prefix)}
-        loss.update({"range_jepa/parent_AMPPPO_s": parent_s, "range_jepa/aux_total_s": aux_s})
+        loss.update({"range_jepa/parent_AMPPPO_s": parent_s, "range_jepa/aux_total_s": aux_s,
+                     "range_jepa/cudnn_benchmark_actual": float(torch.backends.cudnn.benchmark)})
         if online_metrics:
             prefix = f"range_profile/rank{self.gpu_global_rank}/online/"
             loss.update({prefix+k: v for k, v in online_metrics.items()})
