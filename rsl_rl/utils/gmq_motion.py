@@ -66,9 +66,10 @@ class GMQMotionLoader:
     distribution online to retain the workspace's AMP memory model.
     """
 
-    def __init__(self, device, time_between_frames, motion_files, **_):
+    def __init__(self, device, time_between_frames, motion_files, fk_params=None, height_offset=0.0, **_):
         self.device = device
         self.time_between_frames = time_between_frames
+        self.fk_params = FK_PARAMS if fk_params is None else fk_params
         files = [motion_files] if isinstance(motion_files, str) else motion_files
         self.trajectory_files = sorted(
             str(f) for p in files for f in (Path(p).glob("*.txt") if Path(p).is_dir() else [Path(p)])
@@ -93,7 +94,18 @@ class GMQMotionLoader:
             q /= np.linalg.norm(q, axis=1, keepdims=True)
             q[q[:, 3] < 0] *= -1
             frame = torch.as_tensor(a[:, :49], dtype=torch.float32, device=device)
-            frame[:, 19:31] = foot_fk(frame[:, 7:19])
+            feet = foot_fk(frame[:, 7:19], self.fk_params).reshape(-1, 4, 3)
+            if fk_params is not None:
+                # Preserve the mean reference support height after changing the
+                # leg geometry and replacing point feet with wheel centers.
+                old_feet = foot_fk(frame[:, 7:19]).reshape(-1, 4, 3)
+                rotation = frame[:, None, 3:7].expand(-1, 4, -1)
+                height_delta = quat_apply(rotation, old_feet - feet)[:, :, 2].mean(-1)
+                frame[:, 2] += height_delta + height_offset
+                vertical_velocity = torch.zeros_like(frame[:, 31:34])
+                vertical_velocity[:, 2] = torch.gradient(height_delta, spacing=dt)[0]
+                frame[:, 31:34] += quat_inverse_apply(frame[:, 3:7], vertical_velocity)
+            frame[:, 19:31] = feet.flatten(1)
             self.trajectories_full.append(frame)
             durations.append(dt)
             weights.append(float(data["MotionWeight"]))

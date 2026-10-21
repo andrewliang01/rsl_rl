@@ -55,9 +55,14 @@ class AMPPPO(MultiPPO):
     def _init_amp(self, amp_cfg: dict) -> None:
         motion_files = amp_cfg.get("motion_files", [])
         loader = AMPLoader
+        loader_kwargs = {}
         if amp_cfg.get("loader_type") == "chitu_max_gmq":
             from rsl_rl.utils.gmq_motion import GMQMotionLoader
             loader = GMQMotionLoader
+            loader_kwargs = {
+                "fk_params": amp_cfg.get("gmq_fk_params"),
+                "height_offset": amp_cfg.get("gmq_height_offset", 0.0),
+            }
         self.amp_expert_data = loader(
             device=self.device,
             time_between_frames=amp_cfg.get("time_between_frames", 0.02),
@@ -77,6 +82,7 @@ class AMPPPO(MultiPPO):
             motion_categories=amp_cfg.get("motion_categories"),
             # Read old saved configs at this boundary only.
             expert_trajectory_sampling_mode=amp_cfg.get("expert_trajectory_sampling_mode"),
+            **loader_kwargs,
         )
 
         amp_obs_dim = self.amp_expert_data.amp_obs_dim
