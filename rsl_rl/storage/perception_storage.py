@@ -16,6 +16,8 @@ class PerceptionSequenceBatch:
     episode_ids: torch.Tensor
     capture_ids: torch.Tensor
     anchor_count: int
+    history_ids: torch.Tensor | None = None
+    history_age: torch.Tensor | None = None
 
 
 class PerceptionStorage:
@@ -119,6 +121,7 @@ class PerceptionStorage:
                 initial_hidden=data["pre_hidden"][index[0]], active=active,
                 # PRE hidden already equals zero at reset. Never reset at arbitrary TBPTT boundaries.
                 reset=torch.zeros_like(active), anchor_count=sum(map(len, seqs)),
+                **{key: data[key][index] for key in ("history_ids", "history_age") if key in data},
             ))
         if sum(batch.anchor_count for batch in result) != self.num_anchors:
             raise RuntimeError("TBPTT packing lost fresh captures.")
