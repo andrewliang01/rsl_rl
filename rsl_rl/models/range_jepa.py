@@ -184,7 +184,11 @@ class RangeJEPA(nn.Module):
         covariance_loss = off_diagonal.square().sum((1, 2)) / self.channels
         return torch.where(count > 1, variance_loss + self.covariance_weight * covariance_loss, torch.zeros_like(count))
 
-    def auxiliary_loss(self, observed, mapped, simulated, initial_hidden=None, reset=None, support=None, active=None, weights=None, profile=None):
+    def _auxiliary_extra_terms(self, output, targets, coverage, temporal_valid):
+        """Optional experiment losses; the original A0 objective is unchanged."""
+        return {}
+
+    def auxiliary_loss(self, observed, mapped, simulated, initial_hidden=None, reset=None, support=None, active=None, weights=None, profile=None, temporal_valid=None):
         """Fresh shared-encoder sequence objective; gradients cross GRU timesteps.
 
         Input images: [T,B,2,H,W] (or one [B,2,H,W] frame). Reset [T,B]
@@ -211,6 +215,13 @@ class RangeJEPA(nn.Module):
                 raise ValueError("Sequence reset/active flags must have shape [T,B]")
             return value.reshape(T, B).bool()
         reset, active = flags(reset, False), flags(active, True)
+        if temporal_valid is not None:
+            temporal_valid = flags(temporal_valid, False) & active & ~reset
+            # The first replay state is a detached online snapshot, not a
+            # freshly learned predecessor. Never supervise a boundary pair.
+            temporal_valid = temporal_valid.clone()
+            temporal_valid[0] = False
+            temporal_valid[1:] &= active[:-1]
         if support is not None:
             if support.numel() != T * B * self.image_height * self.image_width:
                 raise ValueError("support must have shape [T,B,H,W]")
@@ -245,6 +256,10 @@ class RangeJEPA(nn.Module):
                 terms["mem"].append(self._weighted((output["e"] - tok[1].detach()).square().mean(-1), recovery.squeeze(-1)))
                 terms["full"].append(self._weighted((output["z"] - tok[2].detach()).square().mean(-1), cov[2].squeeze(-1)))
                 terms["range"].append(self._reconstruction(predictions[4], clean[2]))
+                for key, value in self._auxiliary_extra_terms(
+                    output, tok, cov, None if temporal_valid is None else temporal_valid[t]
+                ).items():
+                    terms[key].append(value)
         with profile.phase("loss_regularizer_mask", "forward") if profile is not None else nullcontext():
             denominator = active.sum().clamp_min(1)
             results = {key: (torch.stack(values) * active).sum() / denominator for key, values in terms.items()}
@@ -252,6 +267,8 @@ class RangeJEPA(nn.Module):
             results["hidden"] = hidden
             results["anchors"] = active.sum()
             results["anchor_count"] = active.sum()
+            if temporal_valid is not None:
+                results["future_pair_fraction"] = temporal_valid.sum() / denominator
         return results
 
 

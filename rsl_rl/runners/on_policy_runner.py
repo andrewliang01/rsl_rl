@@ -926,6 +926,9 @@ class OnPolicyRunner:
         env_state_hook = getattr(getattr(self.env, "unwrapped", self.env), "get_payload_curriculum_state", None)
         if env_state_hook is not None:
             saved_dict["payload_curriculum"] = env_state_hook()
+        training_state_hook = getattr(getattr(self.env, "unwrapped", self.env), "get_training_state", None)
+        if training_state_hook is not None:
+            saved_dict["env_training_state"] = training_state_hook()
         torch.save(saved_dict, path)
         # Upload model to external logging services
         self.logger.save_model(path, self.current_learning_iteration)
@@ -1041,6 +1044,9 @@ class OnPolicyRunner:
         env_state_hook = getattr(getattr(self.env, "unwrapped", self.env), "load_payload_curriculum_state", None)
         if env_state_hook is not None and "payload_curriculum" in loaded_dict:
             env_state_hook(loaded_dict["payload_curriculum"])
+        training_state_hook = getattr(getattr(self.env, "unwrapped", self.env), "load_training_state", None)
+        if training_state_hook is not None and "env_training_state" in loaded_dict:
+            training_state_hook(loaded_dict["env_training_state"])
         return loaded_dict["infos"]
 
     def _load_formal(

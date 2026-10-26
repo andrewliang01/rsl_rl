@@ -34,6 +34,9 @@ def _model_configuration(perception_cfg):
     if variant == "A0":
         merged.pop("variant", None)
         cls = RangeJEPA
+    elif variant == "G":
+        from rsl_rl.models.range_predictive import RangePredictiveJEPA
+        cls = RangePredictiveJEPA
     else:
         from rsl_rl.models.range_experiments import RangeExperiment
         cls = RangeExperiment
@@ -266,7 +269,10 @@ class RangeJEPAAMPPPO(AMPPPO):
         if set(model_cfg) & set(cfg):
             raise ValueError("Duplicate perception model configuration keys.")
         self.perception_model_cfg = _model_configuration(perception_cfg)
-        if "variant" in self.perception_model_cfg:
+        if self.perception_model_cfg.get("variant") == "G":
+            from rsl_rl.models.range_predictive import RangePredictiveJEPA
+            self.perception = RangePredictiveJEPA(**self.perception_model_cfg).to(self.device)
+        elif "variant" in self.perception_model_cfg:
             from rsl_rl.models.range_experiments import RangeExperiment
             self.perception = RangeExperiment(**self.perception_model_cfg).to(self.device)
         else:
@@ -346,7 +352,7 @@ class RangeJEPAAMPPPO(AMPPPO):
     def _update_perception(self):
         profile = RangeAuxProfiler(self.profile_aux_breakdown, self.device)
         with profile.phase("pack_sequences"):
-            batches = self.perception_storage.sequence_batches(self.perception_tbptt_steps, self.perception_sequence_batch_size)
+            batches = self.perception_storage.sequence_plan(self.perception_tbptt_steps, self.perception_sequence_batch_size)
         local_n = self.perception_storage.num_anchors
         count = torch.tensor(float(local_n), device=self.device, dtype=torch.float64)
         if self.is_multi_gpu:
@@ -373,6 +379,13 @@ class RangeJEPAAMPPPO(AMPPPO):
                         event_start.record()
                     with profile.phase("forward_loss"):
                         history_kwargs = {}
+                        if getattr(self.perception, "uses_temporal_prediction", False):
+                            pair = torch.zeros_like(batch.active)
+                            pair[1:] = (batch.active[1:] & batch.active[:-1] & ~batch.reset[1:]
+                                        & (batch.capture_ids[1:] == batch.capture_ids[:-1] + 1)
+                                        & (batch.episode_ids[1:] == batch.episode_ids[:-1])
+                                        & (batch.env_ids[1:] == batch.env_ids[:-1]))
+                            history_kwargs["temporal_valid"] = pair
                         if batch.history_ids is not None:
                             history_kwargs = self._live_policy.history.replay(
                                 batch.history_ids, batch.history_age, self.perception, self.history_encode_batch_size)
@@ -423,7 +436,7 @@ class RangeJEPAAMPPPO(AMPPPO):
         self.last_perception_receipt = {
             "local_fresh_anchors": local_n, "global_fresh_anchors": int(global_n),
             "auxiliary_optimizer_steps": steps, "full_fresh_passes": steps,
-            "anchors_per_local_pass": sum(b.anchor_count for b in batches),
+            "anchors_per_local_pass": batches.anchor_count,
             "tbptt_steps": self.perception_tbptt_steps, "sequence_batches": len(batches),
             "aux_encode_loss_s": encode_s, "aux_encode_loss_includes_backward": True,
             "aux_encode_loss_timing": "CUDA_events" if cuda_timing else "host_wall_unsynchronized",

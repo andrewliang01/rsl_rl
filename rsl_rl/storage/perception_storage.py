@@ -2,6 +2,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 import torch
+from bisect import bisect_right
 
 
 @dataclass(frozen=True)
@@ -93,6 +94,14 @@ class PerceptionStorage:
         self._batches.clear()
         self.num_anchors = 0
 
+    def sequence_plan(self, tbptt_steps: int, sequence_batch_size: int):
+        """Replayable plan: materialize one batch, not every image sequence.
+
+        Tensor snapshots remain owned until the pass ends. Only small identity
+        metadata is concatenated; image gathers read directly from snapshots.
+        """
+        return PerceptionSequencePlan(self._batches, tbptt_steps, sequence_batch_size)
+
     @torch.inference_mode(False)
     @torch.no_grad()
     def sequence_batches(self, tbptt_steps: int, sequence_batch_size: int) -> list[PerceptionSequenceBatch]:
@@ -126,3 +135,75 @@ class PerceptionStorage:
         if sum(batch.anchor_count for batch in result) != self.num_anchors:
             raise RuntimeError("TBPTT packing lost fresh captures.")
         return result
+
+
+class PerceptionSequencePlan:
+    """Same ordering/padding as sequence_batches, with bounded image scratch."""
+
+    def __init__(self, snapshots, tbptt_steps, sequence_batch_size):
+        if tbptt_steps < 1 or sequence_batch_size < 1:
+            raise ValueError("TBPTT length and sequence batch size must be positive.")
+        self.snapshots = tuple(snapshots)
+        self.groups = []
+        self.offsets = [0]
+        self.anchor_count = 0
+        if not snapshots:
+            return
+        for snapshot in snapshots:
+            self.offsets.append(self.offsets[-1] + snapshot["env_ids"].numel())
+        metadata = torch.cat([torch.stack([s[k] for k in ("env_ids", "episode_ids", "capture_ids")], 1)
+                              for s in snapshots]).cpu().tolist()
+        groups = {}
+        for index, (env, episode, capture) in enumerate(metadata):
+            group = groups.setdefault((env, episode), [])
+            if group and capture <= metadata[group[-1]][2]:
+                raise ValueError("Capture IDs must increase strictly within an environment episode.")
+            group.append(index)
+        sequences = [g[i:i + tbptt_steps] for g in groups.values() for i in range(0, len(g), tbptt_steps)]
+        for start in range(0, len(sequences), sequence_batch_size):
+            self.groups.append(sequences[start:start + sequence_batch_size])
+        self.anchor_count = sum(len(s) for group in self.groups for s in group)
+        if self.anchor_count != self.offsets[-1]:
+            raise RuntimeError("TBPTT planning lost fresh captures.")
+
+    def __len__(self):
+        return len(self.groups)
+
+    def _selectors(self, indices, device):
+        buckets = {}
+        for destination, index in enumerate(indices):
+            source = bisect_right(self.offsets, index) - 1
+            dest, rows = buckets.setdefault(source, ([], []))
+            dest.append(destination)
+            rows.append(index - self.offsets[source])
+        return [(source, torch.tensor(dest, device=device), torch.tensor(rows, device=device))
+                for source, (dest, rows) in buckets.items()]
+
+    def _gather(self, key, selectors, shape):
+        reference = self.snapshots[0][key]
+        count = 1
+        for size in shape:
+            count *= size
+        result = reference.new_empty((count, *reference.shape[1:]))
+        for source, destinations, rows in selectors:
+            result.index_copy_(0, destinations, self.snapshots[source][key].index_select(0, rows))
+        return result.reshape(*shape, *reference.shape[1:])
+
+    @torch.inference_mode(False)
+    @torch.no_grad()
+    def __iter__(self):
+        for sequences in self.groups:
+            length, width = max(map(len, sequences)), len(sequences)
+            device = self.snapshots[0]["observed"].device
+            indices = [s[min(t, len(s)-1)] for t in range(length) for s in sequences]
+            selectors = self._selectors(indices, device)
+            initial = self._selectors([s[0] for s in sequences], device)
+            active = torch.arange(length, device=device)[:, None] < torch.tensor([len(s) for s in sequences], device=device)[None]
+            yield PerceptionSequenceBatch(
+                **{k: self._gather(k, selectors, (length, width))
+                   for k in ("observed", "mapped", "simulated", "env_ids", "episode_ids", "capture_ids")},
+                initial_hidden=self._gather("pre_hidden", initial, (width,)),
+                active=active, reset=torch.zeros_like(active), anchor_count=sum(map(len, sequences)),
+                **{k: self._gather(k, selectors, (length, width))
+                   for k in ("history_ids", "history_age") if k in self.snapshots[0]},
+            )
