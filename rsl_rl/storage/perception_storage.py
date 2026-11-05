@@ -19,6 +19,9 @@ class PerceptionSequenceBatch:
     anchor_count: int
     history_ids: torch.Tensor | None = None
     history_age: torch.Tensor | None = None
+    body_observations: torch.Tensor | None = None
+    control_steps: torch.Tensor | None = None
+    terrain_targets: torch.Tensor | None = None
 
 
 class PerceptionStorage:
@@ -57,7 +60,7 @@ class PerceptionStorage:
 
     @torch.inference_mode(False)
     @torch.no_grad()
-    def add_indexed(self, observed, mapped, simulated, pre_hidden, env_ids, episode_ids, capture_ids):
+    def add_indexed(self, observed, mapped, simulated, pre_hidden, env_ids, episode_ids, capture_ids, *, control_step=None):
         """Select fresh rows once, own their snapshots, and return them for online reuse.
 
         Images, PRE hidden and episode/capture IDs are full environment batches;
@@ -86,6 +89,10 @@ class PerceptionStorage:
         owned["env_ids"] = env_ids.detach().clone()
         if torch.any(torch.stack([owned[k] for k in ("env_ids", "episode_ids", "capture_ids")]) < 0):
             raise ValueError("Source env/episode/capture IDs must be nonnegative.")
+        if control_step is not None:
+            if type(control_step) is not int or control_step < 0:
+                raise ValueError("PPO control_step must be a nonnegative integer.")
+            owned["control_steps"] = torch.full_like(owned["env_ids"], control_step)
         self._batches.append(owned)
         self.num_anchors += n
         return owned
@@ -130,7 +137,7 @@ class PerceptionStorage:
                 initial_hidden=data["pre_hidden"][index[0]], active=active,
                 # PRE hidden already equals zero at reset. Never reset at arbitrary TBPTT boundaries.
                 reset=torch.zeros_like(active), anchor_count=sum(map(len, seqs)),
-                **{key: data[key][index] for key in ("history_ids", "history_age") if key in data},
+                **{key: data[key][index] for key in ("history_ids", "history_age", "body_observations", "control_steps", "terrain_targets") if key in data},
             ))
         if sum(batch.anchor_count for batch in result) != self.num_anchors:
             raise RuntimeError("TBPTT packing lost fresh captures.")
@@ -205,5 +212,5 @@ class PerceptionSequencePlan:
                 initial_hidden=self._gather("pre_hidden", initial, (width,)),
                 active=active, reset=torch.zeros_like(active), anchor_count=sum(map(len, sequences)),
                 **{k: self._gather(k, selectors, (length, width))
-                   for k in ("history_ids", "history_age") if k in self.snapshots[0]},
+                   for k in ("history_ids", "history_age", "body_observations", "control_steps", "terrain_targets") if k in self.snapshots[0]},
             )

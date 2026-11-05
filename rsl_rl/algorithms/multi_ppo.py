@@ -163,6 +163,10 @@ class MultiPPO(PPO):
 
         In multi-critic mode, computes values from all critics.
         """
+        if self.dwaq is not None:
+            if self.is_multi_critic:
+                raise ValueError("DWAQ with multiple critics is not supported")
+            return super().act(obs)
         # Record the hidden states for recurrent policies
         self.transition.hidden_states = (self.actor.get_hidden_state(), self._first_critic.get_hidden_state())
 
@@ -199,6 +203,10 @@ class MultiPPO(PPO):
         In multi-critic mode, expects rewards of shape [num_envs, num_critics].
         Single critic mode accepts rewards of shape [num_envs] or [num_envs, 1].
         """
+        if self.dwaq is not None:
+            if self.is_multi_critic:
+                raise ValueError("DWAQ with multiple critics is not supported")
+            return super().process_env_step(obs, rewards, dones, extras)
         # Update the normalizers
         self.actor.update_normalization(obs)
         self._first_critic.update_normalization(obs)
@@ -547,6 +555,9 @@ class MultiPPO(PPO):
 
     def get_policy(self) -> MLPModel:
         """Get the policy model."""
+        if self.dwaq:
+            from rsl_rl.models.dwaq_policy import DWAQInferencePolicy
+            return DWAQInferencePolicy(self.actor, self.dwaq)
         return self.actor
 
     def save(self) -> dict:
@@ -570,10 +581,18 @@ class MultiPPO(PPO):
             saved_dict["rnd_state_dict"] = self.rnd.state_dict()
             saved_dict["rnd_optimizer_state_dict"] = self.rnd_optimizer.state_dict()
 
+        if self.dwaq:
+            saved_dict["dwaq_state_dict"] = self.dwaq.state_dict()
+            saved_dict["dwaq_optimizer_state_dict"] = self.dwaq_optimizer.state_dict()
         return saved_dict
 
     def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
         """Load specified models from a saved dict."""
+        if self.dwaq and ("dwaq_state_dict" not in loaded_dict or "dwaq_optimizer_state_dict" not in loaded_dict):
+            raise ValueError("DWAQ checkpoint must include estimator and optimizer states")
+        if self.dwaq:
+            self.dwaq.load_state_dict(loaded_dict["dwaq_state_dict"], strict=strict)
+            self.dwaq_optimizer.load_state_dict(loaded_dict["dwaq_optimizer_state_dict"])
         if load_cfg is None:
             load_cfg = {
                 "actor": True,

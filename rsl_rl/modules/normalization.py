@@ -15,7 +15,8 @@ from torch import nn
 class EmpiricalNormalization(nn.Module):
     """Normalize mean and variance of values based on empirical values."""
 
-    def __init__(self, shape: int | tuple[int, ...] | list[int], eps: float = 1e-2, until: int | None = None) -> None:
+    def __init__(self, shape: int | tuple[int, ...] | list[int], eps: float = 1e-2, until: int | None = None,
+                 synchronize_distributed: bool = False) -> None:
         """Initialize EmpiricalNormalization module.
 
         .. note:: The normalization parameters are computed over the whole batch, not for each environment separately.
@@ -28,6 +29,7 @@ class EmpiricalNormalization(nn.Module):
         super().__init__()
         self.eps = eps
         self.until = until
+        self.synchronize_distributed = synchronize_distributed
         self.register_buffer("_mean", torch.zeros(shape).unsqueeze(0))
         self.register_buffer("_var", torch.ones(shape).unsqueeze(0))
         self.register_buffer("_std", torch.ones(shape).unsqueeze(0))
@@ -56,10 +58,24 @@ class EmpiricalNormalization(nn.Module):
             return
 
         count_x = x.shape[0]
-        self.count += count_x
-        rate = count_x / self.count
         var_x = torch.var(x, dim=0, unbiased=False, keepdim=True)
         mean_x = torch.mean(x, dim=0, keepdim=True)
+        if self.synchronize_distributed and torch.distributed.is_initialized():
+            # Merge this batch across ranks before updating running moments.
+            # Counts may differ; averaging local variances misses the variance
+            # between rank means. Float64 communication avoids cancellation.
+            packed = torch.cat((mean_x.flatten().double() * count_x,
+                                mean_x.new_tensor([count_x], dtype=torch.float64)))
+            torch.distributed.all_reduce(packed)
+            global_count = packed[-1]
+            global_mean = (packed[:-1] / global_count).reshape_as(mean_x)
+            variance_sum = count_x * (var_x.double() + (mean_x.double() - global_mean).square())
+            torch.distributed.all_reduce(variance_sum)
+            mean_x = global_mean.to(mean_x.dtype)
+            var_x = (variance_sum / global_count).to(var_x.dtype)
+            count_x = global_count.to(dtype=self.count.dtype)
+        self.count += count_x
+        rate = count_x / self.count
         delta_mean = mean_x - self._mean
         self._mean += rate * delta_mean
         self._var += rate * (var_x - self._var + delta_mean * (mean_x - self._mean))

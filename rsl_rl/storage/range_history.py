@@ -23,6 +23,7 @@ class RangeHistory:
         self.captures = torch.full_like(self.ids, -1)
         self.tokens = self.valid = None
         self.chunks = {}
+        self.body_observations = {}
         self.next_chunk = 0
         self.replay_cache = None
         self.replay_cache_bytes = 0
@@ -47,8 +48,12 @@ class RangeHistory:
         tokens.masked_fill_(~valid[..., None], 0)
         return ids, age, {"history_tokens": tokens, "history_valid": valid, "history_age": age}
 
-    def append(self, env_ids, capture_ids, images, encoded):
+    def append(self, env_ids, capture_ids, images, encoded, body_observations=None):
         tokens, valid = encoded["tokens"].detach(), encoded["valid"].detach().bool()
+        if body_observations is not None and (
+            body_observations.ndim != 2 or body_observations.shape[0] != env_ids.numel()
+        ):
+            raise ValueError("Body observations must align with selected capture rows [B,D].")
         if self.tokens is None:
             self.tokens = torch.zeros(
                 (self.batch_size, self.capacity, *tokens.shape[1:]), device=self.device, dtype=torch.float16
@@ -62,6 +67,8 @@ class RangeHistory:
         chunk = self.next_chunk
         self.next_chunk += 1
         self.chunks[chunk] = (env_ids.detach().clone(), images.detach().to(torch.float16).clone())
+        if body_observations is not None:
+            self.body_observations[chunk] = body_observations.detach().clone()
         self.ids[env_ids, slots] = chunk * self.batch_size + env_ids
         self.captures[env_ids, slots] = capture_ids
         self.tokens[env_ids, slots] = tokens.to(torch.float16)
@@ -72,6 +79,7 @@ class RangeHistory:
         # raw tensors are never copied back to the CPU.
         keep = set(torch.div(self.ids[self.ids >= 0], self.batch_size, rounding_mode="floor").unique().cpu().tolist())
         self.chunks = {k: v for k, v in self.chunks.items() if k in keep}
+        self.body_observations = {k: v for k, v in self.body_observations.items() if k in keep}
 
     def begin_replay_pass(self, cache_budget_bytes=256 * 1024**2):
         """A cache lives only while encoder parameters are unchanged in one pass."""
@@ -84,7 +92,7 @@ class RangeHistory:
         self.replay_cache_bytes = 0
 
     @torch.no_grad()
-    def replay(self, ids, age, model, batch_size=256):
+    def replay(self, ids, age, model, batch_size=256, body_encoder=None):
         """Encode each unique selected raw scan once using CURRENT parameters.
 
         History encoding is explicitly truncated (no history-CNN gradient); the
@@ -127,7 +135,15 @@ class RangeHistory:
                 selected = where[request]
                 raw_rows = positions[request]
                 images = raw[raw_rows].to(torch.float32)
-                value = model.encode_history(images)
+                if body_encoder is None:
+                    if getattr(model, "requires_body_features", False):
+                        raise ValueError("F2 history replay requires the PPO-owned body encoder.")
+                    value = model.encode_history(images)
+                else:
+                    if chunk not in self.body_observations:
+                        raise ValueError("Capture has no paired historical body observations.")
+                    body = body_encoder(self.body_observations[chunk][raw_rows]).detach()
+                    value = model.encode_history(images, body_features=body)
                 encoded[selected] = value["tokens"].detach()
                 valid[selected] = value["valid"].bool()
                 if cache is not None:

@@ -176,8 +176,13 @@ class RangeExperiment(RangeJEPA):
             )
         return offsets
 
-    def encode_history(self, image):
-        return self.history_from_encoded(self.encode(image))
+    def condition_context(self, encoded, body_features=None):
+        if body_features is not None:
+            raise ValueError("Body conditioning is available only for F2.")
+        return encoded
+
+    def encode_history(self, image, body_features=None):
+        return self.history_from_encoded(self.condition_context(self.encode(image), body_features))
 
     def history_from_encoded(self, encoded):
         spatial = encoded["tokens"].transpose(1, 2).reshape(-1, self.channels, self.token_height, self.token_width)
@@ -281,15 +286,17 @@ class RangeExperiment(RangeJEPA):
             result["features"] = self.bev_projector(self.decode(z), mask_logits=True).flatten(1)
         return result
 
-    def step(self, image, hidden, reset=None, history_tokens=None, history_valid=None, history_age=None):
-        encoded = self.encode(image)
+    def step(self, image, hidden, reset=None, history_tokens=None, history_valid=None, history_age=None,
+             body_features=None):
+        encoded = self.condition_context(self.encode(image), body_features)
         result = self._step_encoded(encoded, hidden, reset, history_tokens, history_valid, history_age)
         if self.variant != "A1":
             result["history_encoded"] = self.history_from_encoded(encoded)
         return result
 
-    def forward(self, image, hidden, reset=None, history_tokens=None, history_valid=None, history_age=None):
-        return self.step(image, hidden, reset, history_tokens, history_valid, history_age)
+    def forward(self, image, hidden, reset=None, history_tokens=None, history_valid=None, history_age=None,
+                body_features=None):
+        return self.step(image, hidden, reset, history_tokens, history_valid, history_age, body_features)
 
     def decode(self, tokens):
         if self.variant == "F":
@@ -346,6 +353,7 @@ class RangeExperiment(RangeJEPA):
         history_valid=None,
         history_age=None,
         history_images=None,
+        body_features=None,
     ):
         """Same anchor objective as A0, plus optional prior observed context.
 
@@ -361,11 +369,16 @@ class RangeExperiment(RangeJEPA):
             history_valid = None if history_valid is None else history_valid[None]
             history_age = None if history_age is None else history_age[None]
             history_images = None if history_images is None else history_images[None]
+            body_features = None if body_features is None else body_features[None]
         if observed.ndim != 5 or observed.shape != mapped.shape or observed.shape != simulated.shape:
             raise ValueError("obs/map/sim must have identical [T,B,2,H,W] shapes")
         T, B = observed.shape[:2]
         if not T or not B:
             raise ValueError("Auxiliary sequence cannot be empty")
+        if body_features is not None and body_features.shape != (T, B, 64):
+            raise ValueError("Body features must align with auxiliary captures [T,B,64].")
+        if getattr(self, "requires_body_features", False) and history_images is not None:
+            raise ValueError("F2 raw history needs paired body observations; use RangeHistory.replay.")
 
         def flags(value, default):
             if value is None:
@@ -413,7 +426,8 @@ class RangeExperiment(RangeJEPA):
                     hv = token_valid
             with phase("memory_readout_completion"):
                 output = self._step_encoded(
-                    {"tokens": tok[0], "coverage": cov[0]},
+                    self.condition_context({"tokens": tok[0], "coverage": cov[0]},
+                                           None if body_features is None else body_features[t]),
                     hidden,
                     reset[t] & active[t],
                     ht,

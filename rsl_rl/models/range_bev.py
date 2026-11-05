@@ -306,14 +306,22 @@ class RangeBEVActor(MLPModel):
     def _get_latent_dim(self):
         return 128
 
+    def proprioceptive_observations(self, obs):
+        """Raw current policy inputs, before normalization, for aligned F2 replay."""
+        return torch.cat([obs[key] for key in self.obs_groups], -1)
+
+    def encode_proprioception(self, observations):
+        """The existing PPO-owned 64D body encoder, also read-only for F2."""
+        return self.prop_mlp(self.obs_normalizer(observations))
+
     def get_latent(self, obs, masks=None, hidden_state=None):
-        prop = self.obs_normalizer(torch.cat([obs[key] for key in self.obs_groups], -1))
+        prop = self.proprioceptive_observations(obs)
         feat = obs[self.range_features_set].detach()
         if feat.shape[:-1] != prop.shape[:-1] or feat.shape[-1] != self.feature_size:
             raise ValueError("BEV feature dimensions mismatch")
         spatial = feat.reshape(-1, self.feature_channels, self.feature_grid, self.feature_grid)
         visual = self.bev_cnn(spatial).reshape(*feat.shape[:-1], -1)
-        return torch.cat((self.prop_mlp(prop), self.range_adapter(visual)), -1)
+        return torch.cat((self.encode_proprioception(prop), self.range_adapter(visual)), -1)
 
     def as_jit(self):
         return _RangeBEVActorExport(self)

@@ -1,0 +1,113 @@
+{
+  "upstream": "https://github.com/ASIG-X/JEPLO",
+  "commit": "460e2272907af053d6e66b57fec71fdbe6ca1774",
+  "note": "Core networks/losses/CTS/PPO/sampling retained. Imports isolated; optional DDP gradient synchronization hook added. G1/image/sensor/AMP adaptations live outside this directory. LeJEPA contains only the EppsPulley/Slicing dependency closure. CTS minibatches now use an equivalent fixed index plan with streaming gathers to avoid O(epochs * observations) memory; original policy/loss/optimizer/sample order retained.",
+  "files": [
+    {
+      "source": "training/rsl_rl/rsl_rl/modules/actor_critic.py",
+      "destination": "actor_critic.py",
+      "source_sha256": "95768e4a4b2e0d9cebbcad52b1b07ba27418988a1ff9c1577f7d7f36465cb3c4",
+      "ported_sha256": "95768e4a4b2e0d9cebbcad52b1b07ba27418988a1ff9c1577f7d7f36465cb3c4",
+      "edits": []
+    },
+    {
+      "source": "training/rsl_rl/rsl_rl/modules/actor_critic_teacher.py",
+      "destination": "actor_critic_teacher.py",
+      "source_sha256": "5d6bf78db8c5c01c440e694914b6503916cf1bc24468be0d13d4a142a5be9442",
+      "ported_sha256": "bac1eeba199763c070fd37ab86d0f04e6dd1228d42c18c0f9a781b7ceb4a06e1",
+      "edits": [
+        {
+          "old": "from rsl_rl.modules import ActorCritic, ActorCriticRecurrent",
+          "new": "from .actor_critic import ActorCritic"
+        },
+        {
+          "old": "from rsl_rl.networks import Memory\n",
+          "new": ""
+        }
+      ]
+    },
+    {
+      "source": "training/rsl_rl/rsl_rl/modules/actor_critic_teacher_cts.py",
+      "destination": "actor_critic_teacher_cts.py",
+      "source_sha256": "c7a31334bede6052b769b8bf401a9d5e54484f5d6fa04c0c3500e5244df86523",
+      "ported_sha256": "67f06ecff5f6a1cd3df911f282137de3e5e8d24eaaca35e7745ca7e28135ac53",
+      "edits": [
+        {
+          "old": "from rsl_rl.modules.actor_critic_teacher import ActorCriticTeacher",
+          "new": "from .actor_critic_teacher import ActorCriticTeacher"
+        }
+      ]
+    },
+    {
+      "source": "training/rsl_rl/rsl_rl/modules/jepa_estimator_sensor_ss.py",
+      "destination": "jepa_estimator_sensor_ss.py",
+      "source_sha256": "4187a03ddd7c83106c035ffe0c859239bee910af50077aa05e54237b9f31ae9d",
+      "ported_sha256": "9c7c22fdf4463ffcbaaee3cf4d92d73e93527165d8db7a96681774026a2a4c88",
+      "edits": [
+        {
+          "old": "import lejepa\n",
+          "new": "from . import lejepa\n"
+        },
+        {
+          "old": "        total_loss.backward()\n        nn.utils.clip_grad_norm_(self.parameters(), self.max_grad_norm)",
+          "new": "        total_loss.backward()\n        # Integration hook: synchronize auxiliary gradients before clipping in DDP.\n        if getattr(self, \"gradient_sync\", None) is not None:\n            self.gradient_sync(self.parameters())\n        nn.utils.clip_grad_norm_(self.parameters(), self.max_grad_norm)"
+        }
+      ]
+    },
+    {
+      "source": "training/rsl_rl/rsl_rl/algorithms/teacher_cts.py",
+      "destination": "teacher_cts.py",
+      "source_sha256": "b2045a56feebf0115d9a24cff4c3aa7b7d8005c1978d3984518776d4e59b6943",
+      "ported_sha256": "b638128e170e6160fdf4952997918fd9c8d2a81729085335415b8cfd133f8382",
+      "edits": [
+        {
+          "old": "from rsl_rl.modules.actor_critic_teacher_cts import ActorCriticTeacherCTS",
+          "new": "from .actor_critic_teacher_cts import ActorCriticTeacherCTS"
+        },
+        {
+          "old": "from rsl_rl.storage.rollout_storage_teacher_cts import RolloutStorageTeacherCTS",
+          "new": "from .rollout_storage_teacher_cts import RolloutStorageTeacherCTS"
+        },
+        {
+          "old": "        data = list(self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs))",
+          "new": "        # G1 integration: retain the same sampled order without caching all epoch tensors.\n        data = self.storage.reusable_batches(self.num_mini_batches, self.num_learning_epochs)"
+        }
+      ]
+    },
+    {
+      "source": "training/rsl_rl/rsl_rl/storage/rollout_storage_teacher_cts.py",
+      "destination": "rollout_storage_teacher_cts.py",
+      "source_sha256": "5ee18d39bb2847544329fc690657cea8b9112840fc992fd2d9e217f876addfbc",
+      "ported_sha256": "5ee18d39bb2847544329fc690657cea8b9112840fc992fd2d9e217f876addfbc",
+      "edits": []
+    },
+    {
+      "source": "training/rsl_rl/rsl_rl/storage/rollout_storage_jepa_ss.py",
+      "destination": "rollout_storage_jepa_ss.py",
+      "source_sha256": "f7b4798525702fcbc85d923c4c0a53b4afc7ae8847a2633142f47f38be9c8cdd",
+      "ported_sha256": "f7b4798525702fcbc85d923c4c0a53b4afc7ae8847a2633142f47f38be9c8cdd",
+      "edits": []
+    },
+    {
+      "source": "training/lejepa/lejepa/univariate/base.py",
+      "destination": "lejepa/univariate/base.py",
+      "source_sha256": "08d4f115990656ea3459dacbba5991622725f9040ebc64ae8d34f4e76299eef6",
+      "ported_sha256": "08d4f115990656ea3459dacbba5991622725f9040ebc64ae8d34f4e76299eef6",
+      "edits": []
+    },
+    {
+      "source": "training/lejepa/lejepa/univariate/epps_pulley.py",
+      "destination": "lejepa/univariate/epps_pulley.py",
+      "source_sha256": "e6554ee42de27b74d62befb5f353d4d7a4f92c6c1eade25edaa6595a6b593149",
+      "ported_sha256": "e6554ee42de27b74d62befb5f353d4d7a4f92c6c1eade25edaa6595a6b593149",
+      "edits": []
+    },
+    {
+      "source": "training/lejepa/lejepa/multivariate/slicing.py",
+      "destination": "lejepa/multivariate/slicing.py",
+      "source_sha256": "86c0fe3a714dc945ba3e23ab4093f6ed41966039f9681bd53c733e3ca5dff56b",
+      "ported_sha256": "86c0fe3a714dc945ba3e23ab4093f6ed41966039f9681bd53c733e3ca5dff56b",
+      "edits": []
+    }
+  ]
+}

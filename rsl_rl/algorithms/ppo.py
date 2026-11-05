@@ -604,6 +604,7 @@ class PPO:
         values = self.storage.values.flatten(0, 1)
         returns = self.storage.returns.flatten(0, 1)
         old_actions_log_prob = self.storage.actions_log_prob.flatten(0, 1)
+        terminal_dones = self.storage.dones.flatten(0, 1)
 
         advantages = self.storage.advantages.flatten(0, 1)
         if self.storage.num_critics == 1:
@@ -628,6 +629,7 @@ class PPO:
                     old_distribution_params=tuple(p[batch_idx] for p in old_distribution_params),
                 )
                 batch.actor_observations = actor_observations[batch_idx]
+                batch.terminal_dones = terminal_dones[batch_idx]
                 yield batch
 
     def train_mode(self) -> None:

@@ -37,8 +37,10 @@ class _PanoramaConv(nn.Module):
 class RangeJEPA(nn.Module):
     """Shared CNN -> GRU bank -> geometric readout -> completion attention.
 
-    Images are ``[range_metres/max_range, valid_mask]`` by default. Rows run from the first to the
-    second elevation in ``vertical_fov``; columns cover a full 360 degrees.
+    Images are ``[range_metres/max_range, valid_mask]`` by default. Explicit
+    ``depth_elevation`` uses a positive elevation-position channel for CNN input;
+    reconstruction and coverage always use a separate binary validity mask.
+    Rows run between the elevations in ``vertical_fov``; columns cover 360 degrees.
     ``features`` is the flattened ``[B, 8, 64]`` concatenation of sector-pooled
     recovery e and completion z. Only the actor's fusion consumes these features.
     """
@@ -59,6 +61,7 @@ class RangeJEPA(nn.Module):
         input_normalized: bool = True,
         variance_floor: float = 0.5,
         covariance_weight: float = 0.01,
+        image_encoding: str = "depth_valid",
     ):
         super().__init__()
         if min(image_height, image_width, channels, hidden_size, bank_size, sectors) <= 0:
@@ -67,9 +70,13 @@ class RangeJEPA(nn.Module):
             raise ValueError("The compact actor contract requires 32 channels and 8 sectors; heads must divide channels")
         if max_range <= 0 or not all(-90 <= v <= 90 for v in vertical_fov) or vertical_fov[0] == vertical_fov[1]:
             raise ValueError("Positive max_range and distinct elevation endpoints in [-90,90] are required")
+        if image_encoding not in ("depth_valid", "depth_elevation", "depth_center"):
+            raise ValueError("image_encoding must be depth_valid, depth_elevation or depth_center")
+        self.image_encoding = image_encoding
         self.image_height, self.image_width = int(image_height), int(image_width)
         self.channels, self.hidden_size, self.bank_size, self.sectors = channels, hidden_size, bank_size, sectors
         self.max_range = float(max_range)
+        self.set_depth_huber_beta_m(None)
         self.input_normalized = bool(input_normalized)
         self.variance_floor, self.covariance_weight = float(variance_floor), float(covariance_weight)
         self.token_height = (image_height + 3) // 4
@@ -97,19 +104,48 @@ class RangeJEPA(nn.Module):
         return torch.zeros(batch_size, self.hidden_size, device=device or parameter.device, dtype=dtype or parameter.dtype)
 
     def _clean(self, image: torch.Tensor) -> torch.Tensor:
+        """Return normalized depth and binary validity for every loss and weight."""
         if image.ndim != 4 or image.shape[1:] != (2, self.image_height, self.image_width):
             raise ValueError("Expected [B,2,image_height,image_width] depth/mask image")
         if not image.is_floating_point():
             raise ValueError("Depth/mask image must be floating point")
         depth, supplied = image[:, :1], image[:, 1:2]
-        valid = (supplied > 0.5) & torch.isfinite(depth) & (depth > 0) & (depth <= (1.0 if self.input_normalized else self.max_range))
+        supplied_valid = (
+            torch.isfinite(supplied) & (supplied > 0)
+            if self.image_encoding in ("depth_elevation", "depth_center") else supplied > 0.5
+        )
+        valid = supplied_valid & torch.isfinite(depth) & (depth > 0) & (depth <= (1.0 if self.input_normalized else self.max_range))
         depth = torch.where(valid, depth, torch.zeros_like(depth)) / (1.0 if self.input_normalized else self.max_range)
         return torch.cat((depth, valid.to(depth.dtype)), 1)
+
+    def set_depth_huber_beta_m(self, beta_m: float | None) -> None:
+        """Configure only the depth criterion; None preserves legacy beta=1.
+
+        Input normalization, decoder outputs, parameters and inference remain
+        unchanged. This training option is deliberately absent from model I/O
+        metadata and is saved separately by the algorithm.
+        """
+        if beta_m is not None and (
+            isinstance(beta_m, bool) or not isinstance(beta_m, (int, float))
+            or not math.isfinite(beta_m) or beta_m <= 0
+        ):
+            raise ValueError("depth_huber_beta_m must be finite, positive, or None.")
+        self.depth_huber_beta_m = None if beta_m is None else float(beta_m)
+        self.depth_huber_beta_normalized = 1.0 if beta_m is None else float(beta_m) / self.max_range
 
     def encode(self, image: torch.Tensor) -> dict[str, torch.Tensor]:
         """Encode any of obs/map/sim using the same trainable CNN."""
         clean = self._clean(image)
-        spatial = self.encoder(clean)
+        encoder_image = clean
+        if self.image_encoding == "depth_elevation":
+            # C is a position cue, never coverage, a loss weight or a BCE target.
+            # Keep positive finite excursions unchanged, as in the fixed codec.
+            elevation = torch.where(clean[:, 1:2].bool(), image[:, 1:2], torch.zeros_like(image[:, 1:2]))
+            encoder_image = torch.cat((clean[:, :1], elevation), 1)
+        elif self.image_encoding == "depth_center":
+            # Scale-only control: no within-pixel angle can reach the CNN.
+            encoder_image = torch.cat((clean[:, :1], clean[:, 1:2] * 0.5), 1)
+        spatial = self.encoder(encoder_image)
         tokens = spatial.flatten(2).transpose(1, 2)
         coverage = F.adaptive_avg_pool2d(clean[:, 1:2], spatial.shape[-2:]).flatten(2).transpose(1, 2)
         return {"tokens": tokens, "coverage": coverage, "image": clean}
@@ -167,7 +203,7 @@ class RangeJEPA(nn.Module):
         return (value * weight).sum(dims) / weight.sum(dims).clamp_min(1e-6)
 
     def _reconstruction(self, prediction, target, *, predict_mask=True):
-        depth = self._weighted(F.smooth_l1_loss(prediction[:, :1], target[:, :1], reduction="none"), target[:, 1:2])
+        depth = self._weighted(F.smooth_l1_loss(prediction[:, :1], target[:, :1], reduction="none", beta=self.depth_huber_beta_normalized), target[:, 1:2])
         if predict_mask:
             depth = depth + F.binary_cross_entropy_with_logits(prediction[:, 1:2], target[:, 1:2], reduction="none").mean((1, 2, 3))
         return depth
@@ -188,7 +224,7 @@ class RangeJEPA(nn.Module):
         """Optional experiment losses; the original A0 objective is unchanged."""
         return {}
 
-    def auxiliary_loss(self, observed, mapped, simulated, initial_hidden=None, reset=None, support=None, active=None, weights=None, profile=None, temporal_valid=None):
+    def auxiliary_loss(self, observed, mapped, simulated, initial_hidden=None, reset=None, support=None, active=None, weights=None, profile=None, temporal_valid=None, feature_loss_fn=None, feature_loss_weight=1.0):
         """Fresh shared-encoder sequence objective; gradients cross GRU timesteps.
 
         Input images: [T,B,2,H,W] (or one [B,2,H,W] frame). Reset [T,B]
@@ -233,6 +269,7 @@ class RangeJEPA(nn.Module):
             w.update(weights)
         hidden = self.initial_hidden(B, observed.device, observed.dtype) if initial_hidden is None else initial_hidden
         terms = {key: [] for key in self.default_weights}
+        task_terms = [] if feature_loss_fn is not None else None
         for t in range(T):
             # One shared encoder invocation per view; obs features are reused by prediction and codec.
             with profile.phase("shared_cnn", "forward") if profile is not None else nullcontext():
@@ -260,10 +297,18 @@ class RangeJEPA(nn.Module):
                     output, tok, cov, None if temporal_valid is None else temporal_valid[t]
                 ).items():
                     terms[key].append(value)
+            if feature_loss_fn is not None:
+                task = feature_loss_fn(output["features"], t)
+                if task.shape != (B,):
+                    raise ValueError("Feature loss must return one scalar per sequence row.")
+                task_terms.append(task)
         with profile.phase("loss_regularizer_mask", "forward") if profile is not None else nullcontext():
             denominator = active.sum().clamp_min(1)
             results = {key: (torch.stack(values) * active).sum() / denominator for key, values in terms.items()}
             results["loss"] = sum(w[key] * results[key] for key in terms)
+            if task_terms is not None:
+                results["task"] = (torch.stack(task_terms) * active).sum() / denominator
+                results["loss"] = results["loss"] + feature_loss_weight * results["task"]
             results["hidden"] = hidden
             results["anchors"] = active.sum()
             results["anchor_count"] = active.sum()
@@ -307,6 +352,17 @@ class RangeJEPAActor(MLPModel):
         directions = self.sector_directions.expand(*sectors.shape[:-2], 8, 2)
         visual = F.silu(self.fusion(torch.cat((sectors, directions), -1))).flatten(-2)
         return torch.cat((self.prop_mlp(prop), self.range_adapter(visual)), -1)
+
+    def task_bridge_mean(self, proprioception, features):
+        """Training-only differentiable visual input; normal policy remains detached."""
+        prop = self.obs_normalizer(proprioception)
+        if features.shape[-1] != 512 or features.shape[:-1] != prop.shape[:-1]:
+            raise ValueError("Task bridge needs matching proprioception and 512 visual features.")
+        sectors = features.reshape(*features.shape[:-1], 8, 64)
+        directions = self.sector_directions.expand(*sectors.shape[:-2], 8, 2)
+        visual = F.silu(self.fusion(torch.cat((sectors, directions), -1))).flatten(-2)
+        latent = torch.cat((self.prop_mlp(prop), self.range_adapter(visual)), -1)
+        return self.mlp(latent)
 
     def update_normalization(self, obs):
         # Explicitly use only original proprioception, not the learned cache.

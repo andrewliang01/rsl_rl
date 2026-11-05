@@ -52,6 +52,24 @@ class AMPPPO(MultiPPO):
         if amp_cfg is not None:
             self._init_amp(amp_cfg)
 
+    def broadcast_parameters(self) -> None:
+        super().broadcast_parameters()
+        # Every distributed AMP run needs the same initial reward model,
+        # including the separate discriminator optimizer used without DWAQ.
+        if self.amp_discriminator is not None:
+            for tensor in list(self.amp_discriminator.parameters()) + list(self.amp_discriminator.buffers()):
+                torch.distributed.broadcast(tensor.data, src=0)
+
+    def _sync_gmq_normalizer(self) -> None:
+        norm = self.amp_discriminator.obs_normalizer
+        packed = torch.cat((norm.mean, norm.var + norm.mean.square()))
+        torch.distributed.all_reduce(packed, op=torch.distributed.ReduceOp.SUM)
+        packed /= self.gpu_world_size
+        size = norm.mean.numel()
+        mean = packed[:size]
+        norm.var.copy_((packed[size:] - mean.square()).clamp_min(0.0))
+        norm.mean.copy_(mean)
+
     def _init_amp(self, amp_cfg: dict) -> None:
         motion_files = amp_cfg.get("motion_files", [])
         loader = AMPLoader
@@ -287,7 +305,11 @@ class AMPPPO(MultiPPO):
             [torch.zeros((), device=self.device) for _ in range(self.num_critics)] if self.is_multi_critic else None
         )
 
-        if self.actor.is_recurrent or self._first_critic.is_recurrent:
+        if self.dwaq and (self.actor.is_recurrent or self._first_critic.is_recurrent or self.is_multi_critic or self.symmetry):
+            raise ValueError("AMP+DWAQ requires a feedforward single critic without symmetry")
+        if self.dwaq and self._actor_observations_storage is not None:
+            generator = self._dwaq_mini_batch_generator()
+        elif self.actor.is_recurrent or self._first_critic.is_recurrent:
             generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         elif self.is_multi_critic:
             generator = self.storage.mini_batch_generator(
@@ -307,6 +329,15 @@ class AMPPPO(MultiPPO):
             batch_size = self.storage.num_transitions_per_env * self.storage.num_envs // self.num_mini_batches
             amp_policy_generator = self.amp_storage.feed_forward_generator(total_batches, batch_size)
             amp_expert_generator = self.amp_expert_data.feed_forward_generator(total_batches, batch_size)
+        if self.dwaq and self.is_multi_gpu and self.amp_discriminator is not None:
+            if not self._gmq_compat:
+                raise ValueError("Distributed AMP+DWAQ currently supports only GMQ AMP")
+            ready = torch.tensor(int(amp_policy_generator is not None), device=self.device)
+            min_ready, max_ready = ready.clone(), ready.clone()
+            torch.distributed.all_reduce(min_ready, op=torch.distributed.ReduceOp.MIN)
+            torch.distributed.all_reduce(max_ready, op=torch.distributed.ReduceOp.MAX)
+            if min_ready.item() != max_ready.item():
+                raise RuntimeError("AMP replay readiness differs across ranks")
         for batch in generator:
             original_batch_size = batch.observations.batch_size[0]
 
@@ -338,8 +369,9 @@ class AMPPPO(MultiPPO):
                 else:
                     batch.advantages = batch.advantages.repeat(num_aug, 1)
 
+            actor_observations = getattr(batch, "actor_observations", batch.observations)
             self.actor(
-                batch.observations,
+                actor_observations,
                 masks=batch.masks,
                 hidden_state=batch.hidden_states[0],
                 stochastic_output=True,
@@ -451,6 +483,8 @@ class AMPPPO(MultiPPO):
                 gmq_amp = self._gmq_discriminator_loss(next(amp_policy_generator), next(amp_expert_generator))
                 loss = loss + gmq_amp[0]
             self.optimizer.zero_grad(set_to_none=True)
+            if self.dwaq_optimizer:
+                self.dwaq_optimizer.zero_grad(set_to_none=True)
             loss.backward()
             if self.rnd:
                 self.rnd_optimizer.zero_grad(set_to_none=True)
@@ -458,6 +492,8 @@ class AMPPPO(MultiPPO):
 
             if self.is_multi_gpu:
                 self.reduce_parameters()
+                if self.dwaq and gmq_amp is not None:
+                    self._reduce_gradients(self.amp_discriminator.parameters())
 
             if self._gmq_compat:
                 nn.utils.clip_grad_norm_(list(self.actor.parameters()) + [p for c in self.critics for p in c.parameters()], self.max_grad_norm)
@@ -480,6 +516,8 @@ class AMPPPO(MultiPPO):
                 # Preserve source update order, including its update on normalized states.
                 self.amp_discriminator.update_normalization(policy_state)
                 self.amp_discriminator.update_normalization(expert_state)
+                if self.dwaq and self.is_multi_gpu and self.amp_discriminator.normalize:
+                    self._sync_gmq_normalizer()
             if not self._gmq_compat and amp_policy_generator is not None and amp_expert_generator is not None:
                 if self.disc_update_counter % self.disc_update_decimation == 0:
                     amp_loss, grad_pen_loss, policy_pred, expert_pred = self._update_discriminator(
@@ -505,6 +543,28 @@ class AMPPPO(MultiPPO):
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
 
+        # Estimator update follows PPO: never use a reset observation as the
+        # next-frame reconstruction target for a terminal transition.
+        dwaq_means = {key: 0.0 for key in ("total", "vel", "obs", "dkl")}
+        dwaq_updates = 0
+        if self.dwaq:
+            for batch in self._dwaq_mini_batch_generator():
+                valid = ~batch.terminal_dones.bool().reshape(-1)
+                # Always execute backward/all-reduce on every rank, including an
+                # all-terminal minibatch, so distributed collectives stay aligned.
+                has_valid = bool(valid.any())
+                select = valid if has_valid else torch.arange(batch.observations.batch_size[0], device=self.device) == 0
+                metrics = self.dwaq.compute_loss(batch.observations[select], batch.next_observations[select])
+                objective = metrics["total"] if has_valid else metrics["total"] * 0.0
+                self.dwaq_optimizer.zero_grad(set_to_none=True)
+                objective.backward()
+                if self.is_multi_gpu:
+                    self.reduce_dwaq_parameters()
+                nn.utils.clip_grad_norm_(self.dwaq.parameters(), self.max_grad_norm)
+                self.dwaq_optimizer.step()
+                for key in dwaq_means:
+                    dwaq_means[key] += metrics[key].detach().item() if has_valid else 0.0
+                dwaq_updates += 1
         self.storage.clear()
 
         loss_dict = {
@@ -526,6 +586,9 @@ class AMPPPO(MultiPPO):
             loss_dict["amp_grad_pen"] = (mean_grad_pen_loss / disc_actual_updates).item()
             loss_dict["amp_policy_pred"] = (mean_policy_pred / disc_actual_updates).item()
             loss_dict["amp_expert_pred"] = (mean_expert_pred / disc_actual_updates).item()
+        if self.dwaq and dwaq_updates:
+            for key, value in dwaq_means.items():
+                loss_dict["dwaq_" + key] = value / dwaq_updates
         if self.amp_optimizer is not None:
             loss_dict["amp_learning_rate"] = self.amp_optimizer.param_groups[0]["lr"]
 
@@ -577,6 +640,8 @@ class AMPPPO(MultiPPO):
         self._sync_discriminator_learning_rate()
         self.amp_optimizer.zero_grad(set_to_none=True)
         total_loss.backward()
+        if self.is_multi_gpu:
+            self._reduce_gradients(self.amp_discriminator.parameters())
         nn.utils.clip_grad_norm_(self.amp_discriminator.parameters(), self.max_grad_norm)
         self.amp_optimizer.step()
 

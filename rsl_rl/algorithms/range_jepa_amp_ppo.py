@@ -10,6 +10,7 @@ from copy import deepcopy
 import time
 import inspect
 import json
+import math
 import torch
 from torch import nn
 from tensordict import TensorDict
@@ -24,7 +25,7 @@ from rsl_rl.utils.range_online_profiler import RangeOnlineProfiler
 
 def _model_configuration(perception_cfg):
     cfg = deepcopy(perception_cfg or {})
-    for key in ("num_learning_epochs", "tbptt_steps", "sequence_batch_size", "learning_rate", "max_grad_norm", "weights", "profile_timing", "profile_aux_breakdown", "profile_online_breakdown", "cudnn_benchmark", "history_encode_batch_size"):
+    for key in ("num_learning_epochs", "tbptt_steps", "sequence_batch_size", "learning_rate", "max_grad_norm", "weights", "profile_timing", "profile_aux_breakdown", "profile_online_breakdown", "cudnn_benchmark", "history_encode_batch_size", "depth_huber_beta_m"):
         cfg.pop(key, None)
     model_cfg = cfg.pop("model", {})
     if set(model_cfg) & set(cfg):
@@ -34,6 +35,18 @@ def _model_configuration(perception_cfg):
     if variant == "A0":
         merged.pop("variant", None)
         cls = RangeJEPA
+    elif variant == "H":
+        from rsl_rl.models.range_evidence import RangeEvidenceJEPA
+        cls = RangeEvidenceJEPA
+    elif variant == "CAMP":
+        from rsl_rl.models.range_evidence import RangeEvidenceJEPA
+        terrain = {key: merged.pop(key, default) for key, default in (
+            ("bev_grid_size", 32), ("bev_extent_m", 2.4),
+            ("source_priors", (1., .85, .35)), ("confidence_tau_m", .05))}
+        merged["variant"] = "H"
+        bound = inspect.signature(RangeEvidenceJEPA).bind(**merged)
+        bound.apply_defaults()
+        return {**dict(bound.arguments), **terrain, "variant": "CAMP"}
     elif variant == "G":
         from rsl_rl.models.range_predictive import RangePredictiveJEPA
         cls = RangePredictiveJEPA
@@ -45,7 +58,29 @@ def _model_configuration(perception_cfg):
     return dict(bound.arguments)
 
 
-RAW_RANGE_KEYS = frozenset(("range_obs", "range_map", "range_sim", "range_capture_id", "range_episode_id"))
+def _canonical_perception_contract(configuration):
+    """Legacy image semantics and the disabled H writer have explicit compatibility defaults."""
+    if not isinstance(configuration, dict):
+        raise TypeError("Perception model configuration must be a dictionary.")
+    canonical = deepcopy(configuration)
+    encoding = canonical.setdefault("image_encoding", "depth_valid")
+    if encoding not in ("depth_valid", "depth_elevation", "depth_center"):
+        raise ValueError("Unsupported perception image_encoding.")
+    if canonical.get("variant") in ("H", "CAMP"):
+        objective = canonical.pop("auxiliary_objective", "hybrid")
+        if objective not in ("hybrid", "direct_geometry"):
+            raise ValueError("Unsupported auxiliary_objective.")
+        if objective != "hybrid":
+            canonical["auxiliary_objective"] = objective
+        directional = canonical.setdefault("directional_memory_write", False)
+        if type(directional) is not bool:
+            raise TypeError("directional_memory_write must be bool.")
+    elif "directional_memory_write" in canonical:
+        raise ValueError("Directional memory writing is only supported by the H model.")
+    return json.loads(json.dumps(canonical))
+
+
+RAW_RANGE_KEYS = frozenset(("range_obs", "range_map", "range_sim", "range_capture_id", "range_episode_id", "camp_terrain_targets"))
 
 
 def compact_range_observations(obs: TensorDict, features: torch.Tensor) -> TensorDict:
@@ -182,9 +217,17 @@ class RangeJEPAInferencePolicy(nn.Module):
                     record(fresh_image, obs["range_map"][indices], obs["range_sim"][indices],
                            pre_hidden, indices, self.episode[indices], capture[indices])
             history_kwargs = {}
+            body_observations = None
+            if getattr(self.perception, "requires_body_features", False):
+                body_observations = self.actor.proprioceptive_observations(obs).index_select(0, indices)
+                history_kwargs["body_features"] = self.actor.encode_proprioception(body_observations).detach()
+                if record_indexed is not None:
+                    saved["body_observations"] = body_observations
+                elif record is not None:
+                    raise ValueError("F2 training requires indexed paired capture storage.")
             if self.history is not None:
                 history_ids, history_age, context = self.history.select(indices, capture[indices])
-                history_kwargs = context or {}
+                history_kwargs.update(context or {})
                 if record_indexed is not None:
                     saved["history_ids"] = history_ids
                     saved["history_age"] = history_age
@@ -195,6 +238,8 @@ class RangeJEPAInferencePolicy(nn.Module):
             else:
                 profile.mark("online_cnn")
                 encoded = self.perception.encode(fresh_image)
+                if body_observations is not None:
+                    encoded = self.perception.condition_context(encoded, history_kwargs.pop("body_features"))
                 profile.mark("memory_attention")
                 prediction = self.perception._step_encoded(encoded, pre_hidden, **history_kwargs)
                 if self.history is not None:
@@ -205,7 +250,8 @@ class RangeJEPAInferencePolicy(nn.Module):
             if prediction["features"].shape != (indices.numel(), feature_size):
                 raise ValueError(f"Range perception must produce [fresh,{feature_size}] cached features.")
             if self.history is not None:
-                self.history.append(indices, capture[indices], fresh_image, prediction["history_encoded"])
+                self.history.append(indices, capture[indices], fresh_image, prediction["history_encoded"],
+                                    body_observations=body_observations)
                 if record_indexed is None and self.history.next_chunk % self.history.capacity == 0:
                     self.history.prune()
             self.hidden[indices] = prediction["hidden"].detach()
@@ -253,15 +299,20 @@ class RangeJEPAAMPPPO(AMPPPO):
         for name in ("perception_epochs", "perception_tbptt_steps", "perception_sequence_batch_size"):
             if type(getattr(self, name)) is not int or getattr(self, name) < 1:
                 raise ValueError(f"{name} must be a positive integer.")
-        lr = cfg.pop("learning_rate", 1e-3)
+        self.requested_perception_learning_rate = cfg.pop("learning_rate", None)
+        lr = 1e-3 if self.requested_perception_learning_rate is None else self.requested_perception_learning_rate
+        if isinstance(lr, bool) or not isinstance(lr, (int, float)) or not math.isfinite(lr) or lr <= 0:
+            raise ValueError("Perception learning rate must be finite and positive, or None to inherit on resume.")
         self.perception_max_grad_norm = cfg.pop("max_grad_norm", 1.0)
-        if lr <= 0 or self.perception_max_grad_norm <= 0:
+        if self.perception_max_grad_norm <= 0:
             raise ValueError("Perception learning rate and max_grad_norm must be positive.")
         self.profile_timing = bool(cfg.pop("profile_timing", False))
         self.profile_aux_breakdown = bool(cfg.pop("profile_aux_breakdown", False))
         self.profile_online_breakdown = bool(cfg.pop("profile_online_breakdown", False))
         self._online_profile = RangeOnlineProfiler(self.profile_online_breakdown, self.device)
         self.perception_weights = cfg.pop("weights", None)
+        self.requested_depth_huber_beta_m = cfg.pop("depth_huber_beta_m", None)
+        self.depth_loss_config_source = "legacy_default" if self.requested_depth_huber_beta_m is None else "explicit_launch"
         self.history_encode_batch_size = cfg.pop("history_encode_batch_size", 256)
         if type(self.history_encode_batch_size) is not int or self.history_encode_batch_size < 1:
             raise ValueError("history_encode_batch_size must be a positive integer.")
@@ -269,7 +320,18 @@ class RangeJEPAAMPPPO(AMPPPO):
         if set(model_cfg) & set(cfg):
             raise ValueError("Duplicate perception model configuration keys.")
         self.perception_model_cfg = _model_configuration(perception_cfg)
-        if self.perception_model_cfg.get("variant") == "G":
+        if self.perception_model_cfg.get("variant") == "F2":
+            from rsl_rl.models.range_body import RangeBodyConditionedBEV
+            self.perception = RangeBodyConditionedBEV(**self.perception_model_cfg).to(self.device)
+            if not all(hasattr(self.actor, name) for name in ("proprioceptive_observations", "encode_proprioception")):
+                raise ValueError("F2 requires the PPO-owned RangeBEVActor proprioceptive encoder.")
+        elif self.perception_model_cfg.get("variant") == "CAMP":
+            from rsl_rl.models.camp import CampTerrainMemory
+            self.perception = CampTerrainMemory(**self.perception_model_cfg).to(self.device)
+        elif self.perception_model_cfg.get("variant") == "H":
+            from rsl_rl.models.range_evidence import RangeEvidenceJEPA
+            self.perception = RangeEvidenceJEPA(**self.perception_model_cfg).to(self.device)
+        elif self.perception_model_cfg.get("variant") == "G":
             from rsl_rl.models.range_predictive import RangePredictiveJEPA
             self.perception = RangePredictiveJEPA(**self.perception_model_cfg).to(self.device)
         elif "variant" in self.perception_model_cfg:
@@ -277,6 +339,7 @@ class RangeJEPAAMPPPO(AMPPPO):
             self.perception = RangeExperiment(**self.perception_model_cfg).to(self.device)
         else:
             self.perception = RangeJEPA(**self.perception_model_cfg).to(self.device)
+        self._configure_depth_loss(self.requested_depth_huber_beta_m)
         self.perception_optimizer = torch.optim.Adam(self.perception.parameters(), lr=lr)
         ppo_params = {id(p) for group in self.optimizer.param_groups for p in group["params"]}
         if ppo_params & {id(p) for p in self.perception.parameters()}:
@@ -285,15 +348,38 @@ class RangeJEPAAMPPPO(AMPPPO):
         self._live_policy = RangeJEPAInferencePolicy(self.actor, self.perception)
         self._inference_policy = RangeJEPAInferencePolicy(self.actor, self.perception)
         self.perception_update_count = 0
-        self.last_perception_receipt: dict = {"cudnn_benchmark_requested": self.cudnn_benchmark_requested,
-                                             "cudnn_benchmark_actual": torch.backends.cudnn.benchmark}
+        self.last_perception_receipt: dict = {"image_encoding": getattr(self.perception, "image_encoding", "depth_valid"),
+                                             "cudnn_benchmark_requested": self.cudnn_benchmark_requested,
+                                             "cudnn_benchmark_actual": torch.backends.cudnn.benchmark,
+                                             **self._depth_loss_receipt()}
+
+    def _configure_depth_loss(self, beta_m):
+        if type(self.perception) is not RangeJEPA:
+            if beta_m is not None:
+                raise ValueError("depth_huber_beta_m currently supports only the A0 RangeJEPA criterion.")
+            return
+        self.perception.set_depth_huber_beta_m(beta_m)
+        self.perception_cfg["depth_huber_beta_m"] = self.perception.depth_huber_beta_m
+
+    def _depth_loss_receipt(self):
+        if type(self.perception) is not RangeJEPA:
+            return {}
+        return {"depth_huber_beta_m": self.perception.depth_huber_beta_m,
+                "depth_huber_beta_normalized": self.perception.depth_huber_beta_normalized,
+                "depth_loss_config_source": self.depth_loss_config_source}
+
+    def _record_perception_capture(self, *args):
+        return self.perception_storage.add_indexed(*args)
+
+    def _perception_auxiliary_kwargs(self, batch):
+        return {}
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         if "range_obs" not in obs:
             raise KeyError("Training act requires raw range_obs; only PPO minibatches consume cached features.")
         if not self.profile_online_breakdown:
-            return super().act(self._live_policy.prepare(obs, record_indexed=self.perception_storage.add_indexed))
-        compact = self._live_policy.prepare(obs, record_indexed=self.perception_storage.add_indexed, profile=self._online_profile)
+            return super().act(self._live_policy.prepare(obs, record_indexed=self._record_perception_capture))
+        compact = self._live_policy.prepare(obs, record_indexed=self._record_perception_capture, profile=self._online_profile)
         self._online_profile.mark("parent_act")
         try:
             return super().act(compact)
@@ -347,6 +433,12 @@ class RangeJEPAAMPPPO(AMPPPO):
             self.last_perception_receipt["profile_online_breakdown"] = online_metrics
         return loss
 
+    def _zero_perception_grad(self):
+        self.perception_optimizer.zero_grad(set_to_none=True)
+
+    def _step_perception_optimizer(self):
+        self.perception_optimizer.step()
+
     @torch.inference_mode(False)
     @torch.enable_grad()
     def _update_perception(self):
@@ -359,7 +451,7 @@ class RangeJEPAAMPPPO(AMPPPO):
             torch.distributed.all_reduce(count)
         global_n = float(count.item())
         params = list(self.perception.parameters())
-        names = ("loss", "obs", "codec", "reg", "mem", "full", "range") + tuple(getattr(self.perception, "metric_names", ()))
+        names = ("loss", "obs", "codec", "reg", "mem", "full", "range") + tuple(getattr(self.perception, "metric_names", ())) + tuple(getattr(self, "perception_extra_metric_names", ()))
         # Model-declared names keep collective layout identical on empty ranks.
         # Geometric metrics are diagnostics only, never extra loss weights.
         totals = torch.zeros(len(names), device=self.device, dtype=torch.float64)
@@ -371,7 +463,7 @@ class RangeJEPAAMPPPO(AMPPPO):
             for _ in range(self.perception_epochs):
                 if self._live_policy.history is not None:
                     self._live_policy.history.begin_replay_pass()
-                self.perception_optimizer.zero_grad(set_to_none=True)
+                self._zero_perception_grad()
                 for batch in batches:
                     encode_start = time.perf_counter()
                     if cuda_timing:
@@ -388,12 +480,21 @@ class RangeJEPAAMPPPO(AMPPPO):
                             history_kwargs["temporal_valid"] = pair
                         if batch.history_ids is not None:
                             history_kwargs = self._live_policy.history.replay(
-                                batch.history_ids, batch.history_age, self.perception, self.history_encode_batch_size)
+                                batch.history_ids, batch.history_age, self.perception, self.history_encode_batch_size,
+                                body_encoder=(self.actor.encode_proprioception
+                                              if getattr(self.perception, "requires_body_features", False) else None))
+                        if getattr(self.perception, "requires_body_features", False):
+                            if batch.body_observations is None:
+                                raise ValueError("F2 auxiliary captures lack paired body observations.")
+                            with torch.no_grad():
+                                history_kwargs["body_features"] = self.actor.encode_proprioception(
+                                    batch.body_observations).detach()
                         result = self.perception.auxiliary_loss(
                             batch.observed, batch.mapped, batch.simulated,
                             initial_hidden=batch.initial_hidden, reset=batch.reset, active=batch.active,
                             weights=self.perception_weights,
                             **history_kwargs,
+                            **self._perception_auxiliary_kwargs(batch),
                             **({"profile": profile} if self.profile_aux_breakdown else {}),
                         )
                     # Per-anchor mean × number of anchors; SUM gradients across
@@ -424,7 +525,7 @@ class RangeJEPAAMPPPO(AMPPPO):
                         raise FloatingPointError("Non-finite range-JEPA gradient; no auxiliary Adam step executed.")
                 with profile.phase("clip_adam"):
                     nn.utils.clip_grad_norm_(params, self.perception_max_grad_norm)
-                    self.perception_optimizer.step()
+                    self._step_perception_optimizer()
                 steps += 1
             if self.is_multi_gpu:
                 torch.distributed.all_reduce(totals)
@@ -434,6 +535,7 @@ class RangeJEPAAMPPPO(AMPPPO):
         encode_s = sum(a.elapsed_time(b) / 1000.0 for a, b in encode_events) if cuda_timing else encode_host_s
         self.perception_update_count += steps
         self.last_perception_receipt = {
+            "image_encoding": getattr(self.perception, "image_encoding", "depth_valid"),
             "local_fresh_anchors": local_n, "global_fresh_anchors": int(global_n),
             "auxiliary_optimizer_steps": steps, "full_fresh_passes": steps,
             "anchors_per_local_pass": batches.anchor_count,
@@ -441,6 +543,7 @@ class RangeJEPAAMPPPO(AMPPPO):
             "aux_encode_loss_s": encode_s, "aux_encode_loss_includes_backward": True,
             "aux_encode_loss_timing": "CUDA_events" if cuda_timing else "host_wall_unsynchronized",
             "execution_phase": "after_original_AMPPPO_update", "ppo_uses_cached_features_only": True,
+            **self._depth_loss_receipt(),
         }
         self.perception_storage.clear()
         if self._live_policy.history is not None:
@@ -452,7 +555,8 @@ class RangeJEPAAMPPPO(AMPPPO):
         if self.profile_aux_breakdown:
             # Every actual fresh capture is used once per full auxiliary pass;
             # count true rows from admitted Python metadata, not active.sum().item().
-            profile.count("active_image_rows", local_n * 3 * steps)
+            encoded_views = 1 if getattr(self.perception, "auxiliary_objective", None) == "direct_geometry" else 3
+            profile.count("active_image_rows", local_n * encoded_views * steps)
             breakdown = profile.finish()
             metrics.update({f"range_profile/rank{self.gpu_global_rank}/{key}": value for key, value in breakdown.items()})
             self.last_perception_receipt["profile_aux_breakdown"] = breakdown
@@ -488,39 +592,76 @@ class RangeJEPAAMPPPO(AMPPPO):
                     torch.distributed.broadcast(communication, src=0)
 
     def save(self):
-        return {**super().save(), "perception_state_dict": self.perception.state_dict(),
+        saved = {**super().save(), "perception_state_dict": self.perception.state_dict(),
                 "perception_optimizer_state_dict": self.perception_optimizer.state_dict(),
                 "perception_cfg": deepcopy(self.perception_cfg),
                 "perception_model_cfg": deepcopy(self.perception_model_cfg),
                 "perception_update_count": self.perception_update_count}
+        if type(self.perception) is RangeJEPA:
+            saved["perception_loss_cfg"] = {"version": 1, "depth_huber_beta_m": self.perception.depth_huber_beta_m}
+        return saved
 
     def load(self, loaded_dict, load_cfg=None, strict=True):
         enabled = load_cfg is None or load_cfg.get("perception", load_cfg.get("actor", False))
         if enabled and strict and "perception_state_dict" not in loaded_dict:
             raise KeyError("A complete range-JEPA checkpoint requires perception_state_dict.")
-        if enabled and strict:
-            if "perception_model_cfg" not in loaded_dict:
+        if enabled:
+            if strict and "perception_model_cfg" not in loaded_dict:
                 raise KeyError("Strict range-JEPA resume requires the effective perception_model_cfg contract.")
-            if json.loads(json.dumps(loaded_dict["perception_model_cfg"])) != json.loads(json.dumps(self.perception_model_cfg)):
+            saved_contract = _canonical_perception_contract(loaded_dict.get("perception_model_cfg", {}))
+            current_contract = _canonical_perception_contract(self.perception_model_cfg)
+            # Tensor shapes are equal across encodings; strict=False must not
+            # silently reinterpret a checkpoint's second channel.
+            if saved_contract["image_encoding"] != current_contract["image_encoding"]:
+                raise ValueError("Perception image_encoding differs from checkpoint; explicit cross-encoding transfer is not supported.")
+            if saved_contract.get("directional_memory_write", False) != current_contract.get("directional_memory_write", False):
+                raise ValueError("Perception directional_memory_write differs from checkpoint; explicit writer transfer is not supported.")
+            if strict and saved_contract != current_contract:
                 raise ValueError("Perception model configuration differs from checkpoint (including FOV/normalization).")
+        if enabled and type(self.perception) is RangeJEPA:
+            loss_cfg = loaded_dict.get("perception_loss_cfg")
+            if loss_cfg is not None:
+                if not isinstance(loss_cfg, dict) or type(loss_cfg.get("version")) is not int or loss_cfg["version"] != 1 or "depth_huber_beta_m" not in loss_cfg:
+                    raise ValueError("Unsupported or incomplete perception_loss_cfg.")
+                saved_beta_m = loss_cfg["depth_huber_beta_m"]
+            else:
+                saved_beta_m = loaded_dict.get("perception_cfg", {}).get("depth_huber_beta_m")
+            # None means inherit the saved training criterion, or legacy for an
+            # old checkpoint. A positive launch value is an explicit experiment
+            # override. Strict model/FOV checking above is never relaxed.
+            beta_m = saved_beta_m if self.requested_depth_huber_beta_m is None else self.requested_depth_huber_beta_m
+            self._configure_depth_loss(beta_m)
+            self.depth_loss_config_source = "checkpoint_inherited" if self.requested_depth_huber_beta_m is None else "explicit_launch_override"
+            self.last_perception_receipt.update(self._depth_loss_receipt())
         result = super().load(loaded_dict, load_cfg, strict)
         if enabled and "perception_state_dict" in loaded_dict:
             self.perception.load_state_dict(loaded_dict["perception_state_dict"], strict=strict)
             if load_cfg is None or load_cfg.get("optimizer", False):
                 self.perception_optimizer.load_state_dict(loaded_dict["perception_optimizer_state_dict"])
             self.perception_update_count = loaded_dict.get("perception_update_count", 0)
+        if enabled and self.requested_perception_learning_rate is not None:
+            # Loading Adam restores its saved LR. Honor an explicit experiment
+            # override afterwards, while retaining moments and step counters.
+            for group in self.perception_optimizer.param_groups:
+                group["lr"] = float(self.requested_perception_learning_rate)
+            self.last_perception_receipt["perception_optimizer_learning_rate"] = float(self.requested_perception_learning_rate)
+            self.last_perception_receipt["perception_learning_rate_source"] = "explicit_launch_override_after_optimizer_load"
+            print(f"RangeJEPA perception Adam LR override after resume: {self.requested_perception_learning_rate:g}")
         self._live_policy.clear_memory()
         self._inference_policy.clear_memory()
         self.perception_storage.clear()
         return result
 
-    @staticmethod
-    def construct_algorithm(obs, env, cfg, device):
+    @classmethod
+    def construct_algorithm(cls, obs, env, cfg, device):
         spec = getattr(getattr(env, "unwrapped", env), "range_image_spec", None)
         if spec is not None:
             if not isinstance(spec, dict):
                 raise TypeError("env.range_image_spec must be a plain metadata dict.")
             model_cfg = _model_configuration(cfg["algorithm"].get("perception_cfg"))
+            environment_encoding = spec.get("image_encoding", "depth_valid")
+            if environment_encoding != _canonical_perception_contract(model_cfg)["image_encoding"]:
+                raise ValueError("Environment range image image_encoding differs from perception configuration.")
             for key in ("image_height", "image_width", "vertical_fov", "max_range", "input_normalized"):
                 if key not in spec:
                     raise ValueError(f"env.range_image_spec is missing {key}.")
@@ -531,7 +672,17 @@ class RangeJEPAAMPPPO(AMPPPO):
         feature_size = 512
         if variant == "E":
             feature_size = len(effective["bev_extents"]) * 2 * effective["bev_grid_size"] ** 2
-        elif variant == "F":
+        elif variant in {"F", "F2"}:
             feature_size = len(effective["bev_extents"]) * effective["channels"] * 8 ** 2
+        elif variant in {"H", "CAMP"}:
+            import math
+            feature_size = effective["hidden_size"] + math.prod(effective["context_grid"]) * (effective["channels"] + 1)
+            cfg = deepcopy(cfg)
+            cfg["actor"]["reader_cfg"] = {k: effective[k] for k in (
+                "image_height", "image_width", "channels", "hidden_size", "bank_size",
+                "context_grid", "vertical_fov", "attention_heads")}
+            if variant == "CAMP":
+                cfg["actor"]["terrain_cfg"] = {k: effective[k] for k in (
+                    "bev_grid_size", "bev_extent_m", "source_priors")}
         compact = compact_range_observations(obs, torch.zeros(env.num_envs, feature_size, device=device))
-        return construct_multi_critic_algorithm(RangeJEPAAMPPPO, compact, env, cfg, device, include_amp_obs=True)
+        return construct_multi_critic_algorithm(cls, compact, env, cfg, device, include_amp_obs=True)
