@@ -80,6 +80,7 @@ class AMPPPO(MultiPPO):
             loader_kwargs = {
                 "fk_params": amp_cfg.get("gmq_fk_params"),
                 "height_offset": amp_cfg.get("gmq_height_offset", 0.0),
+                "root_z_offset": amp_cfg.get("gmq_root_z_offset", 0.0),
             }
         self.amp_expert_data = loader(
             device=self.device,

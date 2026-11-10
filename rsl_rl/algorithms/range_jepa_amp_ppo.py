@@ -80,7 +80,7 @@ def _canonical_perception_contract(configuration):
     return json.loads(json.dumps(canonical))
 
 
-RAW_RANGE_KEYS = frozenset(("range_obs", "range_map", "range_sim", "range_capture_id", "range_episode_id", "camp_terrain_targets"))
+RAW_RANGE_KEYS = frozenset(("range_obs", "range_map", "range_sim", "range_capture_id", "range_episode_id", "camp_terrain_targets", "camp_map_domains"))
 
 
 def compact_range_observations(obs: TensorDict, features: torch.Tensor) -> TensorDict:

@@ -7,6 +7,8 @@ from tensordict import TensorDict
 from rsl_rl.models.camp import CampActor, CampTerrainMemory
 from rsl_rl.algorithms.range_jepa_amp_ppo import _model_configuration, compact_range_observations, RangeJEPAInferencePolicy
 from rsl_rl.storage.perception_storage import PerceptionStorage
+from rsl_rl.models.range_direct_objective import _domain_reconstruction
+from rsl_rl.algorithms.camp_amp_ppo import CampAMPPPO
 
 
 class CampModelTests(unittest.TestCase):
@@ -76,17 +78,73 @@ class CampModelTests(unittest.TestCase):
         self.assertEqual(result['mem'].item(), 0.)
         self.assertEqual(result['full'].item(), 0.)
 
+    def test_local_loss_ignores_outside_pixels_without_erasing_full_supervision(self):
+        model = CampTerrainMemory(**self.cfg).eval()
+        target = torch.zeros(2, 2, 8, 16)
+        target[:, 0], target[:, 1] = .05, 1.
+        domain = torch.zeros(2, 1, 8, 16, dtype=torch.bool)
+        domain[..., :8] = True
+        prediction = torch.zeros_like(target, requires_grad=True)
+        with torch.no_grad():
+            prediction[..., 8:] = .2
+        loss = _domain_reconstruction(model, prediction, target, domain)
+        changed = target.clone()
+        changed[..., 8:] = 0.
+        torch.testing.assert_close(loss, _domain_reconstruction(model, prediction, changed, domain), rtol=0, atol=0)
+        loss.sum().backward()
+        self.assertEqual(prediction.grad[..., 8:].count_nonzero().item(), 0)
+        self.assertGreater(prediction.grad[..., :8].abs().sum().item(), 0)
+        self.assertGreater(model._reconstruction(prediction, target).sum().item(),
+                           model._reconstruction(prediction, changed).sum().item())
+
+        labels = torch.zeros(2, 3, 2, 32, 32)
+        labels[:, :, 0], labels[:, :, 1] = -1., 1.
+        body = torch.randn(2, 64)
+        baseline = model.auxiliary_loss(target, target, target, body_features=body, terrain_targets=labels)
+        all_inside = model.auxiliary_loss(target, target, target, body_features=body, terrain_targets=labels,
+                                          map_domains=torch.ones_like(target, dtype=torch.bool))
+        for key in ('obs', 'map_range', 'support', 'range', 'known', 'map_coverage', 'support_brier'):
+            torch.testing.assert_close(all_inside[key], baseline[key], rtol=1e-6, atol=1e-6)
+        outside = model.auxiliary_loss(target, target, target, body_features=body, terrain_targets=labels,
+                                      map_domains=torch.zeros_like(target, dtype=torch.bool))
+        for key in ('map_range', 'support', 'known', 'map_coverage', 'support_brier'):
+            self.assertEqual(outside[key].item(), 0.)
+        torch.testing.assert_close(outside['range'], baseline['range'], rtol=0, atol=0)
+        self.assertTrue(torch.isfinite(outside['loss']))
+
+    def test_map_domains_follow_fresh_capture_selection_and_both_sequence_paths(self):
+        algo = object.__new__(CampAMPPPO)
+        algo.perception_storage = PerceptionStorage()
+        image = torch.ones(3, 2, 8, 16)
+        algo._camp_auxiliary_source = torch.randn(3, 3, 2, 32, 32)
+        algo._camp_map_domains = torch.zeros(3, 2, 8, 16, dtype=torch.bool)
+        algo._camp_map_domains[2] = True
+        expected = algo._camp_map_domains.clone()
+        selected = torch.tensor([2, 0])
+        saved = algo._record_perception_capture(image, image, image, torch.zeros(3, 16), selected,
+                                                torch.zeros(3, dtype=torch.long), torch.zeros(3, dtype=torch.long))
+        algo._camp_map_domains[:] = False
+        torch.testing.assert_close(saved['map_domains'], expected[selected])
+        for batches in (algo.perception_storage.sequence_plan(2, 2),
+                        algo.perception_storage.sequence_batches(2, 2)):
+            for batch in batches:
+                torch.testing.assert_close(batch.map_domains, expected[batch.env_ids])
+        raw = TensorDict({'policy': torch.randn(3, 12), 'camp_map_domains': expected}, batch_size=[3])
+        self.assertNotIn('camp_map_domains', compact_range_observations(raw, torch.zeros(3, 280)))
+
     def test_actor_action_does_not_depend_on_privileged_labels_or_cache_gradients(self):
         reader_cfg = {k: v for k, v in self.cfg.items() if k != 'auxiliary_objective'}
         cache_size = 16 + 8 * 33
         cache = torch.randn(2, cache_size, requires_grad=True)
         obs = TensorDict({'policy': torch.randn(2, 12), 'range_features': cache,
-                          'camp_terrain_targets': torch.randn(2, 3, 2, 32, 32)}, batch_size=[2])
+                          'camp_terrain_targets': torch.randn(2, 3, 2, 32, 32),
+                          'camp_map_domains': torch.ones(2, 2, 8, 16, dtype=torch.bool)}, batch_size=[2])
         actor = CampActor(obs, {'actor': ['policy', 'range_features']}, 'actor', 29,
                           hidden_dims=(32,), obs_normalization=False, reader_cfg=reader_cfg, reader_amp=False)
         a = actor(obs)
         changed = obs.clone()
         changed['camp_terrain_targets'] = torch.full_like(changed['camp_terrain_targets'], 999.)
+        changed['camp_map_domains'][:] = False
         torch.testing.assert_close(a, actor(changed), rtol=0, atol=0)
         a.square().mean().backward()
         self.assertIsNone(cache.grad)

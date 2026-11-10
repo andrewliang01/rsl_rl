@@ -22,6 +22,7 @@ class PerceptionSequenceBatch:
     body_observations: torch.Tensor | None = None
     control_steps: torch.Tensor | None = None
     terrain_targets: torch.Tensor | None = None
+    map_domains: torch.Tensor | None = None
 
 
 class PerceptionStorage:
@@ -137,7 +138,7 @@ class PerceptionStorage:
                 initial_hidden=data["pre_hidden"][index[0]], active=active,
                 # PRE hidden already equals zero at reset. Never reset at arbitrary TBPTT boundaries.
                 reset=torch.zeros_like(active), anchor_count=sum(map(len, seqs)),
-                **{key: data[key][index] for key in ("history_ids", "history_age", "body_observations", "control_steps", "terrain_targets") if key in data},
+                **{key: data[key][index] for key in ("history_ids", "history_age", "body_observations", "control_steps", "terrain_targets", "map_domains") if key in data},
             ))
         if sum(batch.anchor_count for batch in result) != self.num_anchors:
             raise RuntimeError("TBPTT packing lost fresh captures.")
@@ -212,5 +213,5 @@ class PerceptionSequencePlan:
                 initial_hidden=self._gather("pre_hidden", initial, (width,)),
                 active=active, reset=torch.zeros_like(active), anchor_count=sum(map(len, sequences)),
                 **{k: self._gather(k, selectors, (length, width))
-                   for k in ("history_ids", "history_age", "body_observations", "control_steps", "terrain_targets") if k in self.snapshots[0]},
+                   for k in ("history_ids", "history_age", "body_observations", "control_steps", "terrain_targets", "map_domains") if k in self.snapshots[0]},
             )

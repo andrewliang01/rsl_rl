@@ -86,8 +86,20 @@ class CampTerrainMemory(RangeEvidenceJEPA):
         self.metric_names = (*self.metric_names, *self.terrain_metric_names,
                              'terrain_map', 'terrain_full', 'terrain_known', 'terrain_confidence', 'terrain_source')
 
+    def encode(self, image):
+        # Online captures have varying row counts. Autotune the fixed training
+        # batches, without searching a new convolution plan for each capture.
+        if image.is_cuda and not torch.is_grad_enabled() and torch.backends.cudnn.benchmark:
+            with torch.backends.cudnn.flags(
+                enabled=torch.backends.cudnn.enabled, benchmark=False,
+                deterministic=torch.backends.cudnn.deterministic,
+                allow_tf32=torch.backends.cudnn.allow_tf32,
+            ):
+                return super().encode(image)
+        return super().encode(image)
+
     def auxiliary_loss(self, *args, **kwargs):
-        return direct_geometry_loss(self, *args, **kwargs)
+        return direct_geometry_loss(self, *args, batch_time=getattr(self, "batch_auxiliary_time", False), **kwargs)
 
     def terrain_loss(self, output, targets):
         if targets.ndim != 5 or targets.shape[1:] != (3, 2, 32, 32):
@@ -124,11 +136,17 @@ class CampTerrainMemory(RangeEvidenceJEPA):
 class CampActor(RangeEvidenceActor):
     """Spatial terrain features + proprioception -> the 29 joint position actions."""
 
-    def __init__(self, *args, reader_cfg=None, terrain_cfg=None, fast_terrain_read=True, **kwargs):
+    def __init__(self, *args, reader_cfg=None, terrain_cfg=None, fast_terrain_read=True, compile_visual_reader=False, **kwargs):
         if type(fast_terrain_read) is not bool:
             raise TypeError('fast_terrain_read must be bool.')
         super().__init__(*args, reader_cfg=reader_cfg, **kwargs)
         self.fast_terrain_read = fast_terrain_read
+        if type(compile_visual_reader) is not bool:
+            raise TypeError('compile_visual_reader must be bool.')
+        self.compile_visual_reader = compile_visual_reader
+        # A callable, not a registered model wrapper: checkpoint keys and
+        # shared Reader optimizer ownership stay unchanged.
+        object.__setattr__(self, '_compiled_visual_reader', None)
         self.reader = CampTerrainReader(**(reader_cfg or {}), **(terrain_cfg or {}))
         del self.fusion
         self.range_adapter = nn.Identity()
@@ -136,6 +154,14 @@ class CampActor(RangeEvidenceActor):
                                              nn.AdaptiveAvgPool2d((4, 4)), nn.Flatten(), nn.Linear(512, 64), nn.ELU())
 
     def _read_visual(self, cache, prop):
+        if self.compile_visual_reader and cache.is_cuda and torch.is_grad_enabled():
+            if self._compiled_visual_reader is None:
+                object.__setattr__(self, '_compiled_visual_reader', torch.compile(
+                    self._read_visual_eager, mode='default', fullgraph=True, dynamic=False))
+            return self._compiled_visual_reader(cache, prop)
+        return self._read_visual_eager(cache, prop)
+
+    def _read_visual_eager(self, cache, prop):
         with torch.set_grad_enabled(torch.is_grad_enabled() and self.reader_ppo_gradient):
             with torch.autocast(device_type=prop.device.type, dtype=torch.bfloat16,
                                 enabled=self.reader_amp and prop.is_cuda):

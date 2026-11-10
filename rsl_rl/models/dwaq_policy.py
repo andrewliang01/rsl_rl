@@ -18,6 +18,10 @@ class DWAQInferencePolicy(nn.Module):
         data[self.group] = self.estimator.get_actor_observation(observations, deterministic=True)
         return self.actor(data)
 
+    def reset(self, dones: torch.Tensor | None = None) -> None:
+        """Follow the Play policy contract; observation history belongs to the environment."""
+        self.actor.reset(dones)
+
     @property
     def output_std(self):
         """Expose the actor's current action standard deviation to the runner."""

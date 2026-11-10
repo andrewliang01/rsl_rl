@@ -66,9 +66,13 @@ class GMQMotionLoader:
     distribution online to retain the workspace's AMP memory model.
     """
 
-    def __init__(self, device, time_between_frames, motion_files, fk_params=None, height_offset=0.0, **_):
+    def __init__(self, device, time_between_frames, motion_files, fk_params=None, height_offset=0.0,
+                 root_z_offset=0.0, **_):
         self.device = device
         self.time_between_frames = time_between_frames
+        self.root_z_offset = float(root_z_offset)
+        if not np.isfinite(self.root_z_offset):
+            raise ValueError("GMQ root height offset must be finite")
         self.fk_params = FK_PARAMS if fk_params is None else fk_params
         files = [motion_files] if isinstance(motion_files, str) else motion_files
         self.trajectory_files = sorted(
@@ -84,6 +88,10 @@ class GMQMotionLoader:
             dt = float(data["FrameDuration"])
             if a.ndim != 2 or a.shape[1] < 49 or len(a) < 2 or dt <= 0 or not np.isfinite(a).all():
                 raise ValueError(f"Invalid GMQ motion: {path}")
+            # A constant root translation changes neither velocities nor local FK.
+            # Apply it to both reset frames and the packed AMP expert data.
+            if self.root_z_offset:
+                a[:, 2] += self.root_z_offset
             for start in (7, 19, 37, 49):
                 if a.shape[1] >= start + 12:
                     a[:, start : start + 12] = (

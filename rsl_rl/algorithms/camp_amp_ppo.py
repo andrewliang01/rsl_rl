@@ -18,8 +18,11 @@ class CampAMPPPO(RangeEvidenceAMPPPO):
             raise ValueError('CAMP terrain supervision and neural grid metadata differ.')
         return super().construct_algorithm(obs, env, cfg, device)
 
-    def __init__(self, *args, perception_bootstrap=None, **kwargs):
+    def __init__(self, *args, perception_bootstrap=None, batch_auxiliary_time=True, **kwargs):
         super().__init__(*args, **kwargs)
+        if type(batch_auxiliary_time) is not bool:
+            raise TypeError('batch_auxiliary_time must be boolean.')
+        self.perception.batch_auxiliary_time = batch_auxiliary_time
         # Rank-local observations differ, but deployment and checkpoints must
         # use one shared set of Actor/Critic/AMP running statistics.
         modules = [self.actor, *self.critics]
@@ -31,6 +34,7 @@ class CampAMPPPO(RangeEvidenceAMPPPO):
                     normalizer.synchronize_distributed = self.is_multi_gpu
         self.bootstrap_receipt = None
         self._camp_auxiliary_source = None
+        self._camp_map_domains = None
         if perception_bootstrap:
             self.bootstrap_recovery(perception_bootstrap)
 
@@ -45,6 +49,18 @@ class CampAMPPPO(RangeEvidenceAMPPPO):
                 if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
                     for buffer in module.buffers(recurse=False):
                         torch.distributed.broadcast(buffer, src=0)
+
+    def _update_perception(self):
+        # Auxiliary sequence lengths vary after resets. Searching convolution
+        # plans for every new length can cost more than the entire update.
+        if torch.device(self.device).type == 'cuda' and torch.backends.cudnn.benchmark:
+            with torch.backends.cudnn.flags(
+                enabled=torch.backends.cudnn.enabled, benchmark=False,
+                deterministic=torch.backends.cudnn.deterministic,
+                allow_tf32=torch.backends.cudnn.allow_tf32,
+            ):
+                return super()._update_perception()
+        return super()._update_perception()
 
     def update(self):
         result = super().update()
@@ -85,20 +101,28 @@ class CampAMPPPO(RangeEvidenceAMPPPO):
     def act(self, obs):
         if 'camp_terrain_targets' not in obs:
             raise KeyError('CAMP supervised training requires terrain targets outside the Actor input.')
+        if 'camp_map_domains' not in obs:
+            raise KeyError('CAMP supervised training requires capture-aligned local map domains.')
+        domains = obs['camp_map_domains']
+        if domains.dtype != torch.bool or domains.shape != obs['range_obs'].shape:
+            raise ValueError('camp_map_domains must be bool [B,2,H,W], aligned with range_obs.')
         self._camp_auxiliary_source = obs['camp_terrain_targets']
+        self._camp_map_domains = domains
         try:
             return super().act(obs)
         finally:
             self._camp_auxiliary_source = None
+            self._camp_map_domains = None
 
     def _record_perception_capture(self, *args):
         saved = super()._record_perception_capture(*args)
         if saved is not None:
             saved['terrain_targets'] = self._camp_auxiliary_source.detach().index_select(0, args[4])
+            saved['map_domains'] = self._camp_map_domains.detach().index_select(0, args[4])
         return saved
 
     def _perception_auxiliary_kwargs(self, batch):
-        return dict(terrain_targets=batch.terrain_targets)
+        return dict(terrain_targets=batch.terrain_targets, map_domains=batch.map_domains)
 
     def save(self):
         return {**super().save(), 'camp_bootstrap_receipt': self.bootstrap_receipt}
