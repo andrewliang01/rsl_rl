@@ -42,7 +42,7 @@ class TerrainImplicitField(nn.Module):
             nn.SiLU(),
             nn.Linear(channels * 2, channels * 2),
             nn.SiLU(),
-            nn.Linear(channels * 2, 1),
+            nn.Linear(channels * 2, 2),  # 占据与 H 证据覆盖分别监督。
         )
 
     def encode(self, points_m: torch.Tensor, valid: torch.Tensor, age_s: torch.Tensor) -> torch.Tensor:
@@ -76,9 +76,10 @@ class TerrainImplicitField(nn.Module):
         encoded = self.plane_encoder(torch.stack(planes, dim=1).flatten(0, 1))
         return encoded.reshape(batch, len(self.plane_axes), channels, cells, cells)
 
-    def query(self, planes: torch.Tensor, points_m: torch.Tensor) -> torch.Tensor:
+    def query_logits(self, planes: torch.Tensor, points_m: torch.Tensor) -> torch.Tensor:
         '''
-        在 B×Q×3 的当前查询坐标（m）双线性读取三个特征面，输出 B×Q 的占据 logit。
+        在 B×Q×3 的当前查询坐标（m）双线性读取三个特征面。
+        输出 B×Q×2，依次为占据和 H 证据覆盖 logit。
         各坐标应在配置盒内。planes 可复用，所有查询共享同一个占据头。
         '''
         if points_m.ndim != 3 or points_m.shape[0] != planes.shape[0] or points_m.shape[-1] != 3:
@@ -89,7 +90,14 @@ class TerrainImplicitField(nn.Module):
             grid = xyz[..., axes].unsqueeze(2)  # align_corners=False 与编码格心对齐。
             sampled = F.grid_sample(planes[:, index], grid, padding_mode="border", align_corners=False)
             features.append(sampled.squeeze(-1).transpose(1, 2))
-        return self.occupancy_head(torch.cat(features, dim=-1)).squeeze(-1)
+        return self.occupancy_head(torch.cat(features, dim=-1))
+
+    def query(self, planes: torch.Tensor, points_m: torch.Tensor) -> torch.Tensor:
+        '''
+        从已编码扫描窗预测 B×Q 的占据 logits，供几何读出或实际查询。
+        覆盖估计通过 query_logits 的第二个输出读取。
+        '''
+        return self.query_logits(planes, points_m)[..., 0]
 
     def forward(self, points_m: torch.Tensor, valid: torch.Tensor, age_s: torch.Tensor, queries_m: torch.Tensor):
         '''
