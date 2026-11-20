@@ -95,10 +95,12 @@ def voxel_occupancy_loss(
     simulation_target: Optional[torch.Tensor] = None,
     coverage_weight: float = 0.2,
     completion_weight: float = 1.0,
+    completion_mask: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, dict]:
     '''
     计算观测监督损失，补全组额外监督 H 未知且有仿真真值的体素。
     输入 B,2,Z,Y,X 的预测与 B,Z,Y,X 的三态 H、有效掩码和可选布尔 S。
+    可选补全掩码来自独立可见性和仿真有效域，避免把配准漏标当成盲区。
     返回标量总损失和分项，供两组用相同训练和诊断入口。
     '''
     occupancy_logits, coverage_logits = logits.unbind(dim=1)
@@ -109,6 +111,8 @@ def voxel_occupancy_loss(
     total = observed + coverage_weight * coverage
     if simulation_target is not None:
         unknown = (history_target == 0) & volume_valid
+        if completion_mask is not None:
+            unknown &= completion_mask
         completion = _balanced_bce(occupancy_logits, simulation_target, unknown)
         parts["completion"] = completion
         total = total + completion_weight * completion
