@@ -36,7 +36,7 @@ class SphericalRangeHeightmap(nn.Module):
     def __init__(self):
         '''
         初始化共享逐帧编码器、因果 GRU 和足端网格解码器。
-        无构造参数，单帧、五帧和两种分辨率共用同样的参数结构。
+        无构造参数，短窗从一帧自然增长，两种分辨率共用同样的参数结构。
         '''
         super().__init__()
         self.encoder = nn.Sequential(
@@ -64,11 +64,11 @@ class SphericalRangeHeightmap(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         '''
         按从旧到新的顺序编码窗口，使用最后一次 GRU 更新解码。
-        输入 [B,K,2,H,W] 存归一化距离与有效位，帧龄为 [B,K] 秒。
+        输入 [B,K,2,H,W] 存归一化距离与有效位，帧龄为 [B,K] 秒，K 为 1 至 5。
         返回两个 [B,28,20] 张量，分别为米制高程和覆盖 logit。
         '''
-        if range_image.ndim != 5 or range_image.shape[1] not in (1, 5):
-            raise ValueError("range_image 必须包含 1 或 5 帧")
+        if range_image.ndim != 5 or not 1 <= range_image.shape[1] <= 5:
+            raise ValueError("range_image 必须包含 1 至 5 帧")
         if range_image.shape[2:] not in ((2, 16, 96), (2, 32, 192)):
             raise ValueError("每帧需要距离和有效位两个通道，以及 16×96 或 32×192 角格")
         if frame_age_s.shape != range_image.shape[:2]:
